@@ -67,9 +67,29 @@
   }
   #vhead .name { color:var(--fg); }
   #code { flex:1; overflow:auto; margin:0; padding:14px 18px; white-space:pre;
-    tab-size:4; }
+    tab-size:4; -webkit-overflow-scrolling:touch; }
   .placeholder { color:var(--muted); padding:24px; }
   a { color:var(--accent); }
+
+  /* ---- mobile / narrow screens ---- */
+  @media (max-width:720px) {
+    body { font-size:12px; }
+    header { padding:8px 12px; gap:8px; }
+    header h1 { font-size:14px; }
+    .sub { flex-basis:100%; order:3; }
+    #status { margin-left:0; flex-basis:100%; order:4; }
+    #drop { margin:14px; }
+    #drop .big { font-size:16px; }
+
+    main.show { flex-direction:column; }
+    #sidebar {
+      width:auto; min-width:0; max-height:38vh;
+      border-right:none; border-bottom:1px solid var(--border);
+    }
+    #viewer { min-height:0; flex:1; }
+    #code { padding:12px 14px; }
+    .cls { padding:7px 12px; }   /* bigger touch targets */
+  }
 </style>
 </head>
 <body>
