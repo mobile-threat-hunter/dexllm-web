@@ -59,6 +59,14 @@
   }
   .cls:hover { background:#ffffff0a; }
   .cls.sel { background:var(--hl); border-left-color:var(--accent); color:#fff; }
+  .pkg {
+    padding:4px 12px; cursor:pointer; white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; user-select:none;
+  }
+  .pkg:hover { background:#ffffff0a; }
+  .pkg .tw { display:inline-block; width:12px; color:var(--muted); }
+  .pkg .pl { color:#d2a8ff; }
+  .pkg .cnt { color:var(--muted); font-size:11px; margin-left:7px; }
 
   #viewer { flex:1; display:flex; flex-direction:column; min-width:0; }
   #vhead {
@@ -88,7 +96,7 @@
     }
     #viewer { min-height:0; flex:1; }
     #code { padding:12px 14px; }
-    .cls { padding:7px 12px; }   /* bigger touch targets */
+    .cls, .pkg { padding:7px 12px; }   /* bigger touch targets */
   }
 </style>
 </head>
@@ -178,33 +186,98 @@ async function loadFile(file) {
   $("#search").value = ""; $("#search").focus();
 }
 
-// ---- class list + filter ----
+// ---- class list as a path-compressed, lazy package tree ----
 const listEl = $("#classlist"), countEl = $("#count");
+
+function buildTree(classes) {
+  const root = { seg:"", children:new Map(), classes:[], count:0 };
+  for (const desc of classes) {
+    const inner = desc.replace(/^L/, "").replace(/;$/, "");   // com/foo/Bar$Inner
+    const slash = inner.lastIndexOf("/");
+    const pkg = slash >= 0 ? inner.slice(0, slash) : "";
+    const name = slash >= 0 ? inner.slice(slash + 1) : inner;
+    let node = root;
+    if (pkg) for (const seg of pkg.split("/")) {
+      let c = node.children.get(seg);
+      if (!c) { c = { seg, children:new Map(), classes:[], count:0 }; node.children.set(seg, c); }
+      node = c;
+    }
+    node.classes.push({ desc, label:name });
+  }
+  (function count(n){ let t = n.classes.length;
+    for (const c of n.children.values()) t += count(c);
+    return n.count = t; })(root);
+  return root;
+}
+
+// collapse a single-child package chain (com>google>android) into "com.google.android"
+function compress(node) {
+  let label = node.seg, cur = node;
+  while (cur.children.size === 1 && cur.classes.length === 0) {
+    const child = cur.children.values().next().value;
+    label += "." + child.seg; cur = child;
+  }
+  return { label, node:cur };
+}
+
+function appendChildren(node, container, depth, expand) {
+  const pkgs = [...node.children.values()].sort((a,b)=>a.seg.localeCompare(b.seg));
+  for (const p of pkgs) {
+    const { label, node:eff } = compress(p);
+    container.appendChild(makePkgRow(label, eff, depth, expand));
+  }
+  const cs = node.classes.slice().sort((a,b)=>a.label.localeCompare(b.label));
+  for (const c of cs) container.appendChild(makeClassRow(c, depth));
+}
+
+function makePkgRow(label, eff, depth, expand) {
+  const wrap = document.createElement("div");
+  const row = document.createElement("div");
+  row.className = "pkg";
+  row.style.paddingLeft = (8 + depth * 14) + "px";
+  const tw = document.createElement("span"); tw.className = "tw"; tw.textContent = "▶";
+  const pl = document.createElement("span"); pl.className = "pl"; pl.textContent = label;
+  const cnt = document.createElement("span"); cnt.className = "cnt"; cnt.textContent = eff.count;
+  row.append(tw, pl, cnt);
+  const kids = document.createElement("div"); kids.className = "kids"; kids.style.display = "none";
+  let built = false;
+  const toggle = open => {
+    kids.style.display = open ? "block" : "none";
+    tw.textContent = open ? "▼" : "▶";
+    if (open && !built) { appendChildren(eff, kids, depth + 1, expand); built = true; }
+  };
+  row.onclick = () => toggle(kids.style.display === "none");
+  wrap.append(row, kids);
+  if (expand) toggle(true);
+  return wrap;
+}
+
+function makeClassRow(c, depth) {
+  const div = document.createElement("div");
+  div.className = "cls";
+  div.style.paddingLeft = (8 + depth * 14 + 16) + "px";
+  div.textContent = c.label; div.title = c.desc;
+  div.onclick = () => selectClass(c.desc, div);
+  return div;
+}
+
 function renderList(filter) {
-  const f = filter.toLowerCase();
+  const f = filter.toLowerCase().trim();
   const items = f ? allClasses.filter(c => c.toLowerCase().includes(f)) : allClasses;
   countEl.textContent = `${items.length} / ${allClasses.length} classes`;
-  const frag = document.createDocumentFragment();
-  const MAX = 4000;
-  items.slice(0, MAX).forEach(c => {
-    const div = document.createElement("div");
-    div.className = "cls"; div.textContent = c; div.title = c;
-    div.onclick = () => selectClass(c, div);
-    frag.appendChild(div);
-  });
+  // filtered & small → auto-expand so matching classes are visible;
+  // otherwise show collapsed top-level packages.
+  const expand = !!f && items.length <= 1500;
+  const root = buildTree(items);
   listEl.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  appendChildren(root, frag, 0, expand);
   listEl.appendChild(frag);
-  if (items.length > MAX) {
-    const more = document.createElement("div");
-    more.className = "placeholder";
-    more.textContent = `… ${items.length - MAX} more — refine the filter`;
-    listEl.appendChild(more);
-  }
 }
 let searchTimer = null;
 $("#search").addEventListener("input", e => {
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => renderList(e.target.value), 120);
+  searchTimer = setTimeout(() => renderList(e.target.value), 140);
 });
 
 // ---- decompile ----
