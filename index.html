@@ -79,6 +79,15 @@
   .placeholder { color:var(--muted); padding:24px; }
   a { color:var(--accent); }
 
+  /* ---- Java syntax highlight tokens ---- */
+  .tk-com { color:#8b949e; font-style:italic; }   /* comments */
+  .tk-str { color:#a5d6ff; }                       /* "strings" / 'chars' */
+  .tk-num { color:#79c0ff; }                       /* numbers */
+  .tk-key { color:#ff7b72; }                       /* keywords */
+  .tk-typ { color:#ffa657; }                       /* Type / class names */
+  .tk-con { color:#79c0ff; }                       /* CONSTANTS */
+  .tk-ann { color:#d2a8ff; }                       /* @Annotations */
+
   /* ---- mobile / narrow screens ---- */
   @media (max-width:720px) {
     body { font-size:12px; }
@@ -280,6 +289,45 @@ $("#search").addEventListener("input", e => {
   searchTimer = setTimeout(() => renderList(e.target.value), 140);
 });
 
+// ---- lightweight Java syntax highlighter (dependency-free) ----
+const JAVA_KW = new Set(("abstract assert boolean break byte case catch char class const " +
+  "continue default do double else enum extends final finally float for goto if implements " +
+  "import instanceof int interface long native new package private protected public return " +
+  "short static strictfp super switch synchronized this throw throws transient try void " +
+  "volatile while var true false null").split(" "));
+function escHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+const HL_RE = new RegExp([
+  "(\\/\\/[^\\n]*|\\/\\*[\\s\\S]*?\\*\\/)",                                  // 1 comment
+  "(\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*')",                        // 2 string/char
+  "(@[A-Za-z_$][\\w$]*)",                                                    // 3 annotation
+  "(0[xX][\\da-fA-F_]+[lL]?|\\b\\d[\\d_]*\\.?[\\d_]*(?:[eE][+\\-]?\\d+)?[fFdDlL]?)", // 4 number
+  "([A-Za-z_$][\\w$]*)"                                                      // 5 identifier
+].join("|"), "g");
+function highlight(code) {
+  let out = "", last = 0, m;
+  HL_RE.lastIndex = 0;
+  while ((m = HL_RE.exec(code))) {
+    out += escHtml(code.slice(last, m.index));
+    last = HL_RE.lastIndex;
+    const t = m[0];
+    let cls = null;
+    if (m[1]) cls = "tk-com";
+    else if (m[2]) cls = "tk-str";
+    else if (m[3]) cls = "tk-ann";
+    else if (m[4]) cls = "tk-num";
+    else {                                       // identifier
+      if (JAVA_KW.has(t)) cls = "tk-key";
+      else if (t.length > 1 && /^[A-Z][A-Z0-9_]*$/.test(t)) cls = "tk-con";
+      else if (/^[A-Z]/.test(t)) cls = "tk-typ";
+    }
+    out += cls ? `<span class="${cls}">${escHtml(t)}</span>` : escHtml(t);
+  }
+  out += escHtml(code.slice(last));
+  return out;
+}
+
 // ---- decompile ----
 function selectClass(cls, el) {
   if (selectedEl) selectedEl.classList.remove("sel");
@@ -299,7 +347,7 @@ function selectClass(cls, el) {
     }
     const ms = (performance.now() - t0).toFixed(0);
     $("#vmeta").textContent = `${java.length} chars · ${ms}ms`;
-    $("#code").textContent = java || "// (empty — external/abstract class)";
+    $("#code").innerHTML = highlight(java || "// (empty — external/abstract class)");
   }, 0);
 }
 </script>
