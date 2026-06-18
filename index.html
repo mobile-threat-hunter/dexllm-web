@@ -24,6 +24,13 @@
   }
   header h1 { font-size:15px; margin:0; font-weight:600; }
   header h1 span { color:var(--accent); }
+  .ver {
+    font-size:11px; color:var(--muted); text-decoration:none;
+    padding:2px 7px; border:1px solid var(--border); border-radius:10px;
+    font-family:inherit; white-space:nowrap;
+  }
+  .ver:hover { color:var(--accent); border-color:var(--accent); }
+  .ver code { font:inherit; color:var(--fg); }
   .sub { color:var(--muted); font-size:11px; }
   #status { margin-left:auto; font-size:12px; color:var(--muted); }
   #status b { color:var(--fg); }
@@ -115,6 +122,10 @@
 <body>
 <header>
   <h1>dex<span>llm</span></h1>
+  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/48b5ff2"
+     target="_blank" rel="noopener" title="dexllm commit this WASM was built from">
+    v0.1.5-dev · <code>48b5ff2</code>
+  </a>
   <span class="sub">in-browser DEX / APK decompiler · runs entirely on your device (WASM)</span>
   <div id="status">loading engine…</div>
 </header>
