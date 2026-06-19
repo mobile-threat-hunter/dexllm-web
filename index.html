@@ -112,6 +112,48 @@
   .iocpill.domains{border-color:#e3b34155;} .iocpill.onion{border-color:#d2a8ff55;}
   .iocpill.emails{border-color:#56d4dd55;}
 
+  /* ---- right-side global IOC panel ---- */
+  #iocpanel {
+    width:340px; min-width:240px; border-left:1px solid var(--border);
+    background:var(--panel); display:flex; flex-direction:column; min-height:0;
+  }
+  #iocpanel.empty { display:none; }
+  .iocphd {
+    padding:9px 12px; border-bottom:1px solid var(--border); font-size:12px;
+    color:var(--fg); display:flex; align-items:center; gap:8px;
+  }
+  .ipcount {
+    background:#da363333; color:var(--bad); border:1px solid #f8514955;
+    border-radius:9px; padding:0 7px; font-size:11px; font-weight:600;
+  }
+  #iocfilter {
+    margin:8px; padding:6px 9px; background:var(--bg); border:1px solid var(--border);
+    color:var(--fg); border-radius:6px; font:inherit;
+  }
+  #iocfilter:focus { outline:none; border-color:var(--accent); }
+  #iocpanelbody { overflow:auto; flex:1; padding-bottom:8px; }
+  .iocgrp {
+    padding:7px 12px 3px; font-size:10px; text-transform:uppercase;
+    letter-spacing:.05em; position:sticky; top:0; background:var(--panel);
+  }
+  .iocitem {
+    display:flex; align-items:baseline; gap:8px; padding:4px 12px; cursor:pointer;
+    border-left:2px solid transparent;
+  }
+  .iocitem:hover { background:#ffffff0a; border-left-color:var(--accent); }
+  .iocitem .ival { flex:1; word-break:break-all; font-size:12px; }
+  .iocitem .icnt { color:var(--muted); font-size:11px; white-space:nowrap; }
+  .iocitem.urls .ival{color:#f85149;} .iocitem.ips .ival{color:#ffa657;}
+  .iocitem.domains .ival{color:#e3b341;} .iocitem.onion .ival{color:#d2a8ff;}
+  .iocitem.emails .ival{color:#56d4dd;}
+  .isub { background:#0d1117; border-left:2px solid var(--accent); }
+  .isubitem {
+    padding:4px 12px 4px 22px; font-size:11px; color:var(--muted); cursor:pointer;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .isubitem:hover { background:#ffffff0a; color:var(--fg); }
+  .isubhint { padding:2px 12px 4px 22px; font-size:10px; color:var(--muted); }
+
   #viewer { flex:1; display:flex; flex-direction:column; min-width:0; }
   #vhead {
     padding:8px 14px; border-bottom:1px solid var(--border); color:var(--muted);
@@ -153,6 +195,10 @@
     #viewer { min-height:0; flex:1; }
     #code { padding:12px 14px; }
     .cls, .pkg { padding:7px 12px; }   /* bigger touch targets */
+    #iocpanel {
+      width:auto; min-width:0; max-height:34vh; order:5;
+      border-left:none; border-top:1px solid var(--border);
+    }
   }
 </style>
 </head>
@@ -185,6 +231,11 @@
     <div id="iocbar" class="empty"></div>
     <pre id="code"><div class="placeholder">Pick a class on the left to decompile it.</div></pre>
   </div>
+  <div id="iocpanel" class="empty">
+    <div class="iocphd">network indicators <span id="iocpaneln" class="ipcount">0</span></div>
+    <input id="iocfilter" placeholder="filter indicators…" autocomplete="off">
+    <div id="iocpanelbody"></div>
+  </div>
 </main>
 
 <script src="dexllm.js"></script>
@@ -193,6 +244,7 @@ let Module = null, dk = null, allClasses = [], selectedEl = null;
 // classDescriptor -> { urls:Set, ips:Set, domains:Set, emails:Set, onion:Set }
 let classIoc = new Map();
 let iocTotals = null;            // { urls, ips, domains, emails, onion, total }
+let iocIndex = [];               // [{ value, cat, classes:[descriptor,…] }] — for the global panel
 const $ = s => document.querySelector(s);
 const statusEl = $("#status");
 
@@ -269,6 +321,7 @@ function classifyStrings(strings, dexPkgs) {
 // Run the whole pipeline against the loaded dk; populates classIoc + iocTotals.
 function computeIocs(dkInst, descriptors) {
   classIoc = new Map();
+  iocIndex = [];
   const dexPkgs = dexPackagePrefixes(descriptors);
   const sv = dkInst.listStrings();
   const strings = [];
@@ -292,9 +345,11 @@ function computeIocs(dkInst, descriptors) {
   try { perValueClasses = dkInst.xrefStringsToClasses(VS); }
   finally { VS.delete(); }
 
+  iocIndex = [];
   for (let i = 0; i < values.length; i++) {
     const cat = valueCat.get(values[i]);
     const cls = perValueClasses[i] || [];
+    iocIndex.push({ value: values[i], cat, classes: [...cls] });
     for (const cd of cls) {
       let e = classIoc.get(cd);
       if (!e) { e = { urls:new Set(), ips:new Set(), domains:new Set(), emails:new Set(), onion:new Set() }; classIoc.set(cd, e); }
@@ -376,7 +431,9 @@ async function loadFile(file) {
   $("#vname").textContent = "— select a class —"; $("#vmeta").textContent = "";
   $("#iocbar").classList.add("empty"); $("#iocbar").innerHTML = "";
   $("#code").innerHTML = '<div class="placeholder">Pick a class on the left to decompile it.' +
-    (iocTotals && iocTotals.total ? ' Classes that reference a network indicator are marked <span class="ioc-badge">⚑</span>.' : "") + '</div>';
+    (iocTotals && iocTotals.total ? ' Classes that reference a network indicator are marked <span class="ioc-badge">⚑</span>, or click any indicator on the right to jump to it.' : "") + '</div>';
+  $("#iocfilter").value = "";
+  renderIocPanel();
   renderList("");
   $("#search").value = ""; $("#search").focus();
 }
@@ -497,6 +554,11 @@ $("#search").addEventListener("input", e => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => renderList(e.target.value), 140);
 });
+let iocFilterTimer = null;
+$("#iocfilter").addEventListener("input", () => {
+  clearTimeout(iocFilterTimer);
+  iocFilterTimer = setTimeout(renderIocPanel, 120);
+});
 
 // ---- lightweight Java syntax highlighter (dependency-free) ----
 const KW_PRIM = new Set("boolean byte char double float int long short void var".split(" "));
@@ -570,9 +632,71 @@ function renderIocBar(cls) {
   }
 }
 
+// ---- global IOC panel (right): every indicator, click to jump to its class ----
+function renderIocPanel() {
+  const panel = $("#iocpanel"), body = $("#iocpanelbody");
+  if (!iocIndex.length) { panel.classList.add("empty"); body.innerHTML = ""; $("#iocpaneln").textContent = "0"; return; }
+  panel.classList.remove("empty");
+  $("#iocpaneln").textContent = iocIndex.length;
+  const filt = ($("#iocfilter").value || "").toLowerCase().trim();
+  body.innerHTML = "";
+  let shown = 0;
+  for (const cat of IOC_CATS) {
+    const items = iocIndex
+      .filter(x => x.cat === cat && (!filt || x.value.toLowerCase().includes(filt)))
+      .sort((a, b) => a.value.localeCompare(b.value));
+    if (!items.length) continue;
+    const h = document.createElement("div"); h.className = "iocgrp cat-" + cat;
+    h.textContent = `${cat} (${items.length})`; body.appendChild(h);
+    for (const it of items) { body.appendChild(makeIocItem(it)); shown++; }
+  }
+  if (!shown) { const d = document.createElement("div"); d.className = "iocgrp"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); }
+}
+
+function makeIocItem(it) {
+  const wrap = document.createElement("div");
+  const row = document.createElement("div"); row.className = "iocitem " + it.cat;
+  const val = document.createElement("span"); val.className = "ival"; val.textContent = it.value;
+  const cnt = document.createElement("span"); cnt.className = "icnt";
+  const n = it.classes.length;
+  cnt.textContent = n === 0 ? "— no class" : n === 1 ? "→" : "▶ " + n + " classes";
+  row.append(val, cnt);
+  row.title = it.value + (n ? `\n${n} referencing class(es)` : "\n(not tied to a class)");
+  if (n === 1) {
+    row.onclick = () => navigateToClass(it.classes[0]);
+  } else if (n > 1) {
+    const sub = document.createElement("div"); sub.className = "isub"; sub.style.display = "none";
+    const hint = document.createElement("div"); hint.className = "isubhint";
+    hint.textContent = "referenced by — pick one:"; sub.appendChild(hint);
+    for (const cd of it.classes.slice().sort()) {
+      const s = document.createElement("div"); s.className = "isubitem"; s.textContent = cd; s.title = cd;
+      s.onclick = ev => { ev.stopPropagation(); navigateToClass(cd); };
+      sub.appendChild(s);
+    }
+    row.onclick = () => {
+      const open = sub.style.display === "none";
+      sub.style.display = open ? "block" : "none";
+      cnt.textContent = (open ? "▼ " : "▶ ") + n + " classes";
+    };
+    wrap.append(row, sub);
+    return wrap;
+  }
+  wrap.appendChild(row);
+  return wrap;
+}
+
+// Jump to (decompile + reveal) a class by descriptor. Highlights its row in the
+// left tree when that row is currently visible; always shows the code + IOC bar.
+function navigateToClass(desc) {
+  const row = [...listEl.querySelectorAll(".cls")].find(e => e.title === desc);
+  selectClass(desc, row || null);
+  if (row) row.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
 function selectClass(cls, el) {
   if (selectedEl) selectedEl.classList.remove("sel");
-  selectedEl = el; el.classList.add("sel");
+  selectedEl = el || null;
+  if (el) el.classList.add("sel");
   $("#vname").textContent = cls;
   $("#vmeta").textContent = "decompiling…";
   $("#code").textContent = "";
