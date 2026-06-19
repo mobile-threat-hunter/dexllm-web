@@ -205,9 +205,9 @@
 <body>
 <header>
   <h1>dex<span>llm</span></h1>
-  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/441a04b"
+  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/df05888"
      target="_blank" rel="noopener" title="dexllm commit this WASM was built from">
-    v0.1.5 · <code>441a04b</code>
+    v0.1.5 · <code>df05888</code>
   </a>
   <span class="sub">in-browser DEX / APK decompiler · runs entirely on your device (WASM)</span>
   <div id="status">loading engine…</div>
@@ -232,8 +232,8 @@
     <pre id="code"><div class="placeholder">Pick a class on the left to decompile it.</div></pre>
   </div>
   <div id="iocpanel" class="empty">
-    <div class="iocphd">network indicators <span id="iocpaneln" class="ipcount">0</span></div>
-    <input id="iocfilter" placeholder="filter indicators…" autocomplete="off">
+    <div class="iocphd" id="iocphd">indicators</div>
+    <input id="iocfilter" placeholder="filter indicators / APIs / callers…" autocomplete="off">
     <div id="iocpanelbody"></div>
   </div>
 </main>
@@ -245,6 +245,9 @@ let Module = null, dk = null, allClasses = [], selectedEl = null;
 let classIoc = new Map();
 let iocTotals = null;            // { urls, ips, domains, emails, onion, total }
 let iocIndex = [];               // [{ value, cat, classes:[descriptor,…] }] — for the global panel
+let permIndex = [];              // [{ perm, api, callers:[methodDescriptor,…] }] — dangerous-permission callers
+let permTotals = null;           // { perms, apis, callers }
+let dangerMap = null;            // permission -> [pkg.Class#method] (AOSP dangerous slice), fetched once
 const $ = s => document.querySelector(s);
 const statusEl = $("#status");
 
@@ -362,6 +365,46 @@ const iocCountFor = cd => {
   let n = 0; for (const cat of IOC_CATS) n += e[cat].size; return n;
 };
 
+// ---- dangerous-permission callers (dexllm.dangerous_permission_callers) ----
+// Join the AOSP permission→API table against the APK's external method refs,
+// then resolve each used gated API to the methods that call it. Mirrors
+// src/dexllm/dangerous_api.py.
+const descToJava = d => (d.startsWith("L") && d.endsWith(";")) ? d.slice(1, -1).replace(/\//g, ".") : d;
+const classOfMethod = md => md.split("->")[0];   // "Lcls;->m()V" -> "Lcls;"
+
+function computePerms(dkInst) {
+  permIndex = []; permTotals = null;
+  if (!dangerMap) return;
+  // index external method refs by "java.Class#method"
+  const idx = new Map();
+  const refs = dkInst.listExternalMethodRefs();
+  for (let i = 0; i < refs.length; i++) {
+    const r = refs[i];
+    const key = descToJava(r.cls) + "#" + r.name;
+    if (!idx.has(key)) idx.set(key, []);
+    idx.get(key).push(r);                          // {cls, name, proto}
+  }
+  const perms = new Set(), callersAll = new Set();
+  for (const perm of Object.keys(dangerMap)) {
+    for (const api of dangerMap[perm]) {
+      const refsForApi = idx.get(api);
+      if (!refsForApi) continue;
+      const callers = new Set();
+      for (const r of refsForApi) {
+        const desc = r.cls + "->" + r.name + r.proto;
+        const cs = dkInst.findCallSitesToApi(desc);
+        for (let i = 0; i < cs.size(); i++) callers.add(cs.get(i));
+        cs.delete();
+      }
+      if (callers.size) {
+        permIndex.push({ perm, api, callers: [...callers] });
+        perms.add(perm); callers.forEach(c => callersAll.add(c));
+      }
+    }
+  }
+  permTotals = { perms: perms.size, apis: permIndex.length, callers: callersAll.size };
+}
+
 createDexllm().then(m => {
   Module = m;
   statusEl.innerHTML = "engine ready · <b>drop a file</b>";
@@ -421,10 +464,24 @@ async function loadFile(file) {
     computeIocs(dk, descriptors);
   } catch (e) { console.error("IOC extraction failed:", e); iocTotals = null; }
 
+  // dangerous-permission caller mapping (AOSP permission→API table ⋈ used APIs)
+  statusEl.innerHTML = `<b>${file.name}</b> · mapping dangerous-permission APIs…`;
+  permIndex = []; permTotals = null;
+  try {
+    if (!dangerMap) {
+      dangerMap = await fetch("dangerous_perm_api.json").then(r => r.ok ? r.json() : {}).catch(() => ({}));
+    }
+    await new Promise(r => setTimeout(r, 0));
+    computePerms(dk);
+  } catch (e) { console.error("permission mapping failed:", e); permTotals = null; }
+
   const iocPill = (iocTotals && iocTotals.total)
     ? ` · <span class="pill bad" title="distinct network indicators recovered from dex strings">⚑ ${iocTotals.total} IOC${iocTotals.total === 1 ? "" : "s"}</span>`
     : ` · <span class="pill ok">no IOCs</span>`;
-  statusEl.innerHTML = `<b>${file.name}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}${iocPill}`;
+  const permPill = (permTotals && permTotals.perms)
+    ? ` · <span class="pill bad" title="dangerous permissions exercised through real gated-API calls">🔓 ${permTotals.perms} perm${permTotals.perms === 1 ? "" : "s"}</span>`
+    : "";
+  statusEl.innerHTML = `<b>${file.name}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}${iocPill}${permPill}`;
   $("#main").classList.add("show");
   drop.style.display = "none";
   selectedEl = null;
@@ -433,7 +490,7 @@ async function loadFile(file) {
   $("#code").innerHTML = '<div class="placeholder">Pick a class on the left to decompile it.' +
     (iocTotals && iocTotals.total ? ' Classes that reference a network indicator are marked <span class="ioc-badge">⚑</span>, or click any indicator on the right to jump to it.' : "") + '</div>';
   $("#iocfilter").value = "";
-  renderIocPanel();
+  renderPanel();
   renderList("");
   $("#search").value = ""; $("#search").focus();
 }
@@ -557,7 +614,7 @@ $("#search").addEventListener("input", e => {
 let iocFilterTimer = null;
 $("#iocfilter").addEventListener("input", () => {
   clearTimeout(iocFilterTimer);
-  iocFilterTimer = setTimeout(renderIocPanel, 120);
+  iocFilterTimer = setTimeout(renderPanel, 120);
 });
 
 // ---- lightweight Java syntax highlighter (dependency-free) ----
@@ -632,15 +689,19 @@ function renderIocBar(cls) {
   }
 }
 
-// ---- global IOC panel (right): every indicator, click to jump to its class ----
-function renderIocPanel() {
+// ---- right panel: every indicator + dangerous-permission caller, click to jump ----
+function renderPanel() {
   const panel = $("#iocpanel"), body = $("#iocpanelbody");
-  if (!iocIndex.length) { panel.classList.add("empty"); body.innerHTML = ""; $("#iocpaneln").textContent = "0"; return; }
+  if (!iocIndex.length && !permIndex.length) { panel.classList.add("empty"); body.innerHTML = ""; return; }
   panel.classList.remove("empty");
-  $("#iocpaneln").textContent = iocIndex.length;
+  $("#iocphd").innerHTML = "indicators" +
+    (iocIndex.length ? ` <span class="ipcount" title="network indicators">⚑ ${iocIndex.length}</span>` : "") +
+    (permIndex.length ? ` <span class="ipcount" title="dangerous-permission gated-API usages">🔓 ${permIndex.length}</span>` : "");
   const filt = ($("#iocfilter").value || "").toLowerCase().trim();
   body.innerHTML = "";
   let shown = 0;
+
+  // network indicators, grouped by category
   for (const cat of IOC_CATS) {
     const items = iocIndex
       .filter(x => x.cat === cat && (!filt || x.value.toLowerCase().includes(filt)))
@@ -648,35 +709,64 @@ function renderIocPanel() {
     if (!items.length) continue;
     const h = document.createElement("div"); h.className = "iocgrp cat-" + cat;
     h.textContent = `${cat} (${items.length})`; body.appendChild(h);
-    for (const it of items) { body.appendChild(makeIocItem(it)); shown++; }
+    for (const it of items) {
+      body.appendChild(makeNavRow(it.value, it.cat, it.classes.map(c => ({ display: c, cls: c })), "classes"));
+      shown++;
+    }
   }
+
+  // dangerous-permission callers, grouped by permission
+  const prows = permIndex.filter(p => !filt ||
+    p.api.toLowerCase().includes(filt) || p.perm.toLowerCase().includes(filt) ||
+    p.callers.some(c => c.toLowerCase().includes(filt)));
+  if (prows.length) {
+    const byPerm = new Map();
+    for (const p of prows) { if (!byPerm.has(p.perm)) byPerm.set(p.perm, []); byPerm.get(p.perm).push(p); }
+    const sec = document.createElement("div"); sec.className = "permsec";
+    sec.textContent = "🔓 dangerous permissions"; body.appendChild(sec);
+    for (const [perm, rows] of [...byPerm.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      const ph = document.createElement("div"); ph.className = "permhd";
+      ph.textContent = perm.replace(/^android\.permission\./, "") + ` (${rows.length})`;
+      ph.title = perm; body.appendChild(ph);
+      for (const r of rows.sort((a, b) => a.api.localeCompare(b.api))) {
+        const [apiCls, apiMethod] = r.api.split("#");
+        const label = apiCls.split(".").pop() + "#" + apiMethod;
+        // a caller is a method descriptor — navigation target is its class.
+        const targets = r.callers.slice().sort().map(c => ({ display: c, cls: classOfMethod(c) }));
+        body.appendChild(makeNavRow(label, "perm", targets, "callers"));
+        shown++;
+      }
+    }
+  }
+
   if (!shown) { const d = document.createElement("div"); d.className = "iocgrp"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); }
 }
 
-function makeIocItem(it) {
+// One clickable row: a label + N navigation targets. 1 target → jump directly;
+// several → expand a picker so the user chooses which class to open.
+function makeNavRow(label, cat, targets, noun) {
   const wrap = document.createElement("div");
-  const row = document.createElement("div"); row.className = "iocitem " + it.cat;
-  const val = document.createElement("span"); val.className = "ival"; val.textContent = it.value;
+  const row = document.createElement("div"); row.className = "iocitem " + cat;
+  const val = document.createElement("span"); val.className = "ival"; val.textContent = label;
   const cnt = document.createElement("span"); cnt.className = "icnt";
-  const n = it.classes.length;
-  cnt.textContent = n === 0 ? "— no class" : n === 1 ? "→" : "▶ " + n + " classes";
+  const n = targets.length;
+  cnt.textContent = n === 0 ? "— none" : n === 1 ? "→" : "▶ " + n + " " + noun;
   row.append(val, cnt);
-  row.title = it.value + (n ? `\n${n} referencing class(es)` : "\n(not tied to a class)");
+  row.title = label + (n ? `\n${n} ${noun}` : "");
   if (n === 1) {
-    row.onclick = () => navigateToClass(it.classes[0]);
+    row.onclick = () => navigateToClass(targets[0].cls);
   } else if (n > 1) {
     const sub = document.createElement("div"); sub.className = "isub"; sub.style.display = "none";
-    const hint = document.createElement("div"); hint.className = "isubhint";
-    hint.textContent = "referenced by — pick one:"; sub.appendChild(hint);
-    for (const cd of it.classes.slice().sort()) {
-      const s = document.createElement("div"); s.className = "isubitem"; s.textContent = cd; s.title = cd;
-      s.onclick = ev => { ev.stopPropagation(); navigateToClass(cd); };
+    const hint = document.createElement("div"); hint.className = "isubhint"; hint.textContent = "pick one:"; sub.appendChild(hint);
+    for (const t of targets) {
+      const s = document.createElement("div"); s.className = "isubitem"; s.textContent = t.display; s.title = t.display;
+      s.onclick = ev => { ev.stopPropagation(); navigateToClass(t.cls); };
       sub.appendChild(s);
     }
     row.onclick = () => {
       const open = sub.style.display === "none";
       sub.style.display = open ? "block" : "none";
-      cnt.textContent = (open ? "▼ " : "▶ ") + n + " classes";
+      cnt.textContent = (open ? "▼ " : "▶ ") + n + " " + noun;
     };
     wrap.append(row, sub);
     return wrap;
