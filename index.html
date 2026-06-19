@@ -6,7 +6,7 @@
 <title>dexllm — in-browser DEX/APK decompiler</title>
 <style>
   :root {
-    --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#c9d1d9;
+    --bg:#000000; --panel:#0a0a0c; --border:#26262b; --fg:#c9d1d9;
     --muted:#8b949e; --accent:#58a6ff; --ok:#3fb950; --bad:#f85149;
     --hl:#1f6feb33;
   }
@@ -46,6 +46,11 @@
   #drop.drag { border-color:var(--accent); background:var(--hl); color:var(--fg); }
   #drop .big { font-size:20px; color:var(--fg); }
   #drop input { display:none; }
+  #loopvid {
+    width:min(72vw,560px); max-height:46vh; border-radius:14px;
+    border:1px solid var(--border); box-shadow:0 0 60px #000, 0 0 24px #0006;
+    object-fit:cover; background:#000; pointer-events:none; margin-bottom:6px;
+  }
 
   main { flex:1; display:none; min-height:0; }
   main.show { display:flex; }
@@ -83,7 +88,7 @@
   }
   .pkg .ioc-badge { font-weight:500; }
   #iocbar {
-    border-bottom:1px solid var(--border); background:#161b22; padding:0;
+    border-bottom:1px solid var(--border); background:var(--panel); padding:0;
     max-height:30vh; overflow:auto;
   }
   #iocbar.empty { display:none; }
@@ -100,7 +105,7 @@
   .iocrow .vals { display:flex; flex-wrap:wrap; gap:5px; }
   .iocpill {
     font-size:11px; padding:1px 7px; border-radius:10px; word-break:break-all;
-    border:1px solid var(--border); background:#0d1117;
+    border:1px solid var(--border); background:#000;
   }
   .iocpill.copied { outline:1px solid var(--accent); }
   .cat-urls,   .iocpill.urls   { color:#f85149; }
@@ -146,7 +151,7 @@
   .iocitem.urls .ival{color:#f85149;} .iocitem.ips .ival{color:#ffa657;}
   .iocitem.domains .ival{color:#e3b341;} .iocitem.onion .ival{color:#d2a8ff;}
   .iocitem.emails .ival{color:#56d4dd;}
-  .isub { background:#0d1117; border-left:2px solid var(--accent); }
+  .isub { background:#000; border-left:2px solid var(--accent); }
   .isubitem {
     padding:4px 12px 4px 22px; font-size:11px; color:var(--muted); cursor:pointer;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
@@ -205,15 +210,19 @@
 <body>
 <header>
   <h1>dex<span>llm</span></h1>
-  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/df05888"
+  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/5442e38"
      target="_blank" rel="noopener" title="dexllm commit this WASM was built from">
-    v0.1.5 · <code>df05888</code>
+    v0.1.5 · <code>5442e38</code>
   </a>
   <span class="sub">in-browser DEX / APK decompiler · runs entirely on your device (WASM)</span>
   <div id="status">loading engine…</div>
 </header>
 
 <label id="drop" for="file">
+  <video id="loopvid" autoplay muted loop playsinline disablepictureinpicture
+         preload="auto" poster="">
+    <source src="loop.mp4" type="video/mp4">
+  </video>
   <div class="big">⬇ Drop a <b>.apk</b> / <b>.dex</b> / <b>.jar</b> here</div>
   <div>or click to choose a file — nothing is uploaded, decompilation runs locally</div>
   <input id="file" type="file" accept=".apk,.dex,.jar,.zip,application/octet-stream">
