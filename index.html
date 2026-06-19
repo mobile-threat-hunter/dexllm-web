@@ -46,11 +46,14 @@
   #drop.drag { border-color:var(--accent); background:var(--hl); color:var(--fg); }
   #drop .big { font-size:20px; color:var(--fg); }
   #drop input { display:none; }
+  /* looping clip parked in the bottom-right corner — non-interactive overlay */
   #loopvid {
-    width:min(72vw,560px); max-height:46vh; border-radius:14px;
-    border:1px solid var(--border); box-shadow:0 0 60px #000, 0 0 24px #0006;
-    object-fit:cover; background:#000; pointer-events:none; margin-bottom:6px;
+    position:fixed; right:14px; bottom:14px; z-index:50;
+    width:200px; max-width:38vw; aspect-ratio:16/9; border-radius:10px;
+    border:1px solid var(--border); box-shadow:0 4px 18px #000a;
+    object-fit:cover; background:#000; pointer-events:none; opacity:.92;
   }
+  @media (max-width:720px) { #loopvid { width:128px; right:8px; bottom:8px; } }
 
   main { flex:1; display:none; min-height:0; }
   main.show { display:flex; }
@@ -219,14 +222,14 @@
 </header>
 
 <label id="drop" for="file">
-  <video id="loopvid" autoplay muted loop playsinline disablepictureinpicture
-         preload="auto" poster="">
-    <source src="loop.mp4" type="video/mp4">
-  </video>
   <div class="big">⬇ Drop a <b>.apk</b> / <b>.dex</b> / <b>.jar</b> here</div>
   <div>or click to choose a file — nothing is uploaded, decompilation runs locally</div>
   <input id="file" type="file" accept=".apk,.dex,.jar,.zip,application/octet-stream">
 </label>
+
+<video id="loopvid" autoplay muted loop playsinline disablepictureinpicture preload="auto">
+  <source src="loop.mp4" type="video/mp4">
+</video>
 
 <main id="main">
   <div id="sidebar">
