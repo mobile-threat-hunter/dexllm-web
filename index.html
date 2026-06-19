@@ -217,9 +217,9 @@
 <body>
 <header>
   <h1>dex<span>llm</span></h1>
-  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/5442e38"
+  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/593c4ab"
      target="_blank" rel="noopener" title="dexllm commit this WASM was built from">
-    v0.1.5 · <code>5442e38</code>
+    v0.1.5 · <code>593c4ab</code>
   </a>
   <span class="sub">in-browser DEX / APK decompiler · runs entirely on your device (WASM)</span>
   <div id="status">loading engine…</div>
@@ -389,7 +389,18 @@ const iocCountFor = cd => {
 const descToJava = d => (d.startsWith("L") && d.endsWith(";")) ? d.slice(1, -1).replace(/\//g, ".") : d;
 const classOfMethod = md => md.split("->")[0];   // "Lcls;->m()V" -> "Lcls;"
 
-function computePerms(dkInst) {
+// app_only filter (default on, matches dangerous_permission_api_callers): a
+// dangerous-API call from bundled framework / official-library code is library
+// plumbing, not the app's own behaviour — drop those callers. An API whose only
+// callers are framework code is omitted.
+const FRAMEWORK_CALLER_PREFIXES = [
+  "Landroidx/", "Landroid/support/", "Landroid/arch/", "Lkotlin/", "Lkotlinx/",
+  "Ljava/", "Ljavax/", "Ldalvik/", "Lcom/google/android/", "Lcom/google/common/",
+  "Lcom/google/gson/",
+];
+const isFrameworkCaller = desc => FRAMEWORK_CALLER_PREFIXES.some(p => desc.startsWith(p));
+
+function computePerms(dkInst, appOnly = true) {
   permIndex = []; permTotals = null;
   if (!dangerMap) return;
   // index external method refs by "java.Class#method"
@@ -410,7 +421,11 @@ function computePerms(dkInst) {
       for (const r of refsForApi) {
         const desc = r.cls + "->" + r.name + r.proto;
         const cs = dkInst.findCallSitesToApi(desc);
-        for (let i = 0; i < cs.size(); i++) callers.add(cs.get(i));
+        for (let i = 0; i < cs.size(); i++) {
+          const caller = cs.get(i);
+          if (appOnly && isFrameworkCaller(caller)) continue;
+          callers.add(caller);
+        }
         cs.delete();
       }
       if (callers.size) {
