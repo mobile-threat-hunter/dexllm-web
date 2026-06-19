@@ -40,20 +40,24 @@
 
   #drop {
     flex:1; display:flex; align-items:center; justify-content:center;
-    flex-direction:column; gap:10px; margin:24px; border:2px dashed var(--border);
-    border-radius:12px; color:var(--muted); cursor:pointer; text-align:center;
+    cursor:pointer; text-align:center; padding:24px;
   }
-  #drop.drag { border-color:var(--accent); background:var(--hl); color:var(--fg); }
-  #drop .big { font-size:20px; color:var(--fg); }
   #drop input { display:none; }
-  /* looping clip parked in the bottom-right corner — non-interactive overlay */
-  #loopvid {
-    position:fixed; right:16px; bottom:16px; z-index:50;
-    width:380px; max-width:60vw; aspect-ratio:16/9; border-radius:12px;
-    border:1px solid var(--border); box-shadow:0 6px 26px #000c;
-    object-fit:cover; background:#000; pointer-events:none; opacity:1;
+  /* the small drop card — dashed box holding the looping clip + instructions */
+  #dropcard {
+    display:flex; flex-direction:column; align-items:center; gap:10px;
+    padding:18px; border:2px dashed var(--border); border-radius:14px;
+    color:var(--muted); width:max-content; max-width:90vw;
   }
-  @media (max-width:720px) { #loopvid { width:240px; max-width:80vw; right:10px; bottom:10px; } }
+  #drop.drag #dropcard { border-color:var(--accent); background:var(--hl); color:var(--fg); }
+  #dropcard .big { font-size:16px; color:var(--fg); }
+  #dropcard div:last-child { font-size:12px; }
+  #loopvid {
+    width:320px; max-width:78vw; aspect-ratio:16/9; border-radius:10px;
+    border:1px solid var(--border); box-shadow:0 4px 18px #0008;
+    object-fit:cover; background:#000; pointer-events:none;
+  }
+  @media (max-width:720px) { #loopvid { width:260px; } }
 
   main { flex:1; display:none; min-height:0; }
   main.show { display:flex; }
@@ -222,14 +226,15 @@
 </header>
 
 <label id="drop" for="file">
-  <div class="big">⬇ Drop a <b>.apk</b> / <b>.dex</b> / <b>.jar</b> here</div>
-  <div>or click to choose a file — nothing is uploaded, decompilation runs locally</div>
+  <div id="dropcard">
+    <video id="loopvid" autoplay muted loop playsinline disablepictureinpicture preload="auto">
+      <source src="loop.mp4" type="video/mp4">
+    </video>
+    <div class="big">⬇ Drop a <b>.apk</b> / <b>.dex</b> / <b>.jar</b> here</div>
+    <div>or click to choose a file — nothing is uploaded, decompilation runs locally</div>
+  </div>
   <input id="file" type="file" accept=".apk,.dex,.jar,.zip,application/octet-stream">
 </label>
-
-<video id="loopvid" autoplay muted loop playsinline disablepictureinpicture preload="auto">
-  <source src="loop.mp4" type="video/mp4">
-</video>
 
 <main id="main">
   <div id="sidebar">
