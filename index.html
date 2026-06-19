@@ -124,12 +124,17 @@
   .iocpill.domains{border-color:#e3b34155;} .iocpill.onion{border-color:#d2a8ff55;}
   .iocpill.emails{border-color:#56d4dd55;}
 
-  /* ---- right-side global IOC panel ---- */
-  #iocpanel {
+  /* ---- right-side panels: network indicators + dangerous permissions ---- */
+  #rightcol {
     width:340px; min-width:240px; border-left:1px solid var(--border);
-    background:var(--panel); display:flex; flex-direction:column; min-height:0;
+    display:flex; flex-direction:column; min-height:0;
   }
-  #iocpanel.empty { display:none; }
+  .sidepanel {
+    flex:1 1 0; min-height:0; background:var(--panel);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .sidepanel + .sidepanel { border-top:1px solid var(--border); }
+  .sidepanel.empty { display:none; }
   .iocphd {
     padding:9px 12px; border-bottom:1px solid var(--border); font-size:12px;
     color:var(--fg); display:flex; align-items:center; gap:8px;
@@ -138,12 +143,21 @@
     background:#da363333; color:var(--bad); border:1px solid #f8514955;
     border-radius:9px; padding:0 7px; font-size:11px; font-weight:600;
   }
-  #iocfilter {
+  .pfilter {
     margin:8px; padding:6px 9px; background:var(--bg); border:1px solid var(--border);
     color:var(--fg); border-radius:6px; font:inherit;
   }
-  #iocfilter:focus { outline:none; border-color:var(--accent); }
-  #iocpanelbody { overflow:auto; flex:1; padding-bottom:8px; }
+  .pfilter:focus { outline:none; border-color:var(--accent); }
+  .pbody { overflow:auto; flex:1; padding-bottom:8px; }
+  .permsec {
+    padding:8px 12px 4px; font-size:10px; text-transform:uppercase;
+    letter-spacing:.05em; color:var(--bad);
+  }
+  .permhd {
+    padding:5px 12px 2px; font-size:11px; color:#e3b341; font-weight:600;
+    position:sticky; top:0; background:var(--panel);
+  }
+  .iocitem.perm .ival { color:#ffa657; }
   .iocgrp {
     padding:7px 12px 3px; font-size:10px; text-transform:uppercase;
     letter-spacing:.05em; position:sticky; top:0; background:var(--panel);
@@ -174,6 +188,17 @@
   #vhead .name { color:var(--fg); }
   #code { flex:1; overflow:auto; margin:0; padding:14px 18px; white-space:pre;
     tab-size:4; -webkit-overflow-scrolling:touch; }
+  #code .cl { display:block; min-height:1.5em; padding:0 6px; margin:0 -6px;
+    border-left:2px solid transparent; }
+  #code .cl.glow {
+    background:#1f6feb22; border-left-color:var(--accent);
+    animation:lineglow 1.6s ease-out;
+  }
+  @keyframes lineglow {
+    0%   { background:#58a6ffcc; box-shadow:0 0 22px #58a6ffaa; }
+    60%  { background:#1f6feb55; box-shadow:0 0 8px #58a6ff55; }
+    100% { background:#1f6feb22; box-shadow:none; }
+  }
   .placeholder { color:var(--muted); padding:24px; }
   a { color:var(--accent); }
 
@@ -207,8 +232,8 @@
     #viewer { min-height:0; flex:1; }
     #code { padding:12px 14px; }
     .cls, .pkg { padding:7px 12px; }   /* bigger touch targets */
-    #iocpanel {
-      width:auto; min-width:0; max-height:34vh; order:5;
+    #rightcol {
+      width:auto; min-width:0; max-height:42vh; order:5;
       border-left:none; border-top:1px solid var(--border);
     }
   }
@@ -248,10 +273,17 @@
     <div id="iocbar" class="empty"></div>
     <pre id="code"><div class="placeholder">Pick a class on the left to decompile it.</div></pre>
   </div>
-  <div id="iocpanel" class="empty">
-    <div class="iocphd" id="iocphd">indicators</div>
-    <input id="iocfilter" placeholder="filter indicators / APIs / callers…" autocomplete="off">
-    <div id="iocpanelbody"></div>
+  <div id="rightcol">
+    <div id="iocpanel" class="sidepanel empty">
+      <div class="iocphd" id="iocphd">network indicators</div>
+      <input id="iocfilter" class="pfilter" placeholder="filter indicators…" autocomplete="off">
+      <div id="iocpanelbody" class="pbody"></div>
+    </div>
+    <div id="permpanel" class="sidepanel empty">
+      <div class="iocphd" id="permhd2">dangerous permissions</div>
+      <input id="permfilter" class="pfilter" placeholder="filter APIs / callers…" autocomplete="off">
+      <div id="permpanelbody" class="pbody"></div>
+    </div>
   </div>
 </main>
 
@@ -521,8 +553,8 @@ async function loadFile(file) {
   $("#iocbar").classList.add("empty"); $("#iocbar").innerHTML = "";
   $("#code").innerHTML = '<div class="placeholder">Pick a class on the left to decompile it.' +
     (iocTotals && iocTotals.total ? ' Classes that reference a network indicator are marked <span class="ioc-badge">⚑</span>, or click any indicator on the right to jump to it.' : "") + '</div>';
-  $("#iocfilter").value = "";
-  renderPanel();
+  $("#iocfilter").value = ""; $("#permfilter").value = "";
+  renderPanels();
   renderList("");
   $("#search").value = ""; $("#search").focus();
 }
@@ -643,10 +675,14 @@ $("#search").addEventListener("input", e => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => renderList(e.target.value), 140);
 });
-let iocFilterTimer = null;
+let iocFilterTimer = null, permFilterTimer = null;
 $("#iocfilter").addEventListener("input", () => {
   clearTimeout(iocFilterTimer);
-  iocFilterTimer = setTimeout(renderPanel, 120);
+  iocFilterTimer = setTimeout(renderIocPanel, 120);
+});
+$("#permfilter").addEventListener("input", () => {
+  clearTimeout(permFilterTimer);
+  permFilterTimer = setTimeout(renderPermPanel, 120);
 });
 
 // ---- lightweight Java syntax highlighter (dependency-free) ----
@@ -722,18 +758,16 @@ function renderIocBar(cls) {
 }
 
 // ---- right panel: every indicator + dangerous-permission caller, click to jump ----
-function renderPanel() {
-  const panel = $("#iocpanel"), body = $("#iocpanelbody");
-  if (!iocIndex.length && !permIndex.length) { panel.classList.add("empty"); body.innerHTML = ""; return; }
-  panel.classList.remove("empty");
-  $("#iocphd").innerHTML = "indicators" +
-    (iocIndex.length ? ` <span class="ipcount" title="network indicators">⚑ ${iocIndex.length}</span>` : "") +
-    (permIndex.length ? ` <span class="ipcount" title="dangerous-permission gated-API usages">🔓 ${permIndex.length}</span>` : "");
-  const filt = ($("#iocfilter").value || "").toLowerCase().trim();
-  body.innerHTML = "";
-  let shown = 0;
+function renderPanels() { renderIocPanel(); renderPermPanel(); }
 
-  // network indicators, grouped by category
+// network indicators panel (top of the two right panels)
+function renderIocPanel() {
+  const panel = $("#iocpanel"), body = $("#iocpanelbody");
+  if (!iocIndex.length) { panel.classList.add("empty"); body.innerHTML = ""; return; }
+  panel.classList.remove("empty");
+  $("#iocphd").innerHTML = `network indicators <span class="ipcount" title="distinct indicators">⚑ ${iocIndex.length}</span>`;
+  const filt = ($("#iocfilter").value || "").toLowerCase().trim();
+  body.innerHTML = ""; let shown = 0;
   for (const cat of IOC_CATS) {
     const items = iocIndex
       .filter(x => x.cat === cat && (!filt || x.value.toLowerCase().includes(filt)))
@@ -746,36 +780,45 @@ function renderPanel() {
       shown++;
     }
   }
-
-  // dangerous-permission callers, grouped by permission
-  const prows = permIndex.filter(p => !filt ||
-    p.api.toLowerCase().includes(filt) || p.perm.toLowerCase().includes(filt) ||
-    p.callers.some(c => c.toLowerCase().includes(filt)));
-  if (prows.length) {
-    const byPerm = new Map();
-    for (const p of prows) { if (!byPerm.has(p.perm)) byPerm.set(p.perm, []); byPerm.get(p.perm).push(p); }
-    const sec = document.createElement("div"); sec.className = "permsec";
-    sec.textContent = "🔓 dangerous permissions"; body.appendChild(sec);
-    for (const [perm, rows] of [...byPerm.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-      const ph = document.createElement("div"); ph.className = "permhd";
-      ph.textContent = perm.replace(/^android\.permission\./, "") + ` (${rows.length})`;
-      ph.title = perm; body.appendChild(ph);
-      for (const r of rows.sort((a, b) => a.api.localeCompare(b.api))) {
-        const [apiCls, apiMethod] = r.api.split("#");
-        const label = apiCls.split(".").pop() + "#" + apiMethod;
-        // a caller is a method descriptor — navigation target is its class.
-        const targets = r.callers.slice().sort().map(c => ({ display: c, cls: classOfMethod(c) }));
-        body.appendChild(makeNavRow(label, "perm", targets, "callers"));
-        shown++;
-      }
-    }
-  }
-
   if (!shown) { const d = document.createElement("div"); d.className = "iocgrp"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); }
 }
 
+// dangerous-permission callers — separate panel, grouped by permission
+function renderPermPanel() {
+  const panel = $("#permpanel"), body = $("#permpanelbody");
+  if (!permIndex.length) { panel.classList.add("empty"); body.innerHTML = ""; return; }
+  panel.classList.remove("empty");
+  $("#permhd2").innerHTML = `dangerous permissions <span class="ipcount" title="gated-API usages (app code)">🔓 ${permIndex.length}</span>`;
+  const filt = ($("#permfilter").value || "").toLowerCase().trim();
+  body.innerHTML = "";
+  const prows = permIndex.filter(p => !filt ||
+    p.api.toLowerCase().includes(filt) || p.perm.toLowerCase().includes(filt) ||
+    p.callers.some(c => c.toLowerCase().includes(filt)));
+  if (!prows.length) { const d = document.createElement("div"); d.className = "permsec"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); return; }
+  const byPerm = new Map();
+  for (const p of prows) { if (!byPerm.has(p.perm)) byPerm.set(p.perm, []); byPerm.get(p.perm).push(p); }
+  for (const [perm, rows] of [...byPerm.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const ph = document.createElement("div"); ph.className = "permhd";
+    ph.textContent = "🔓 " + perm.replace(/^android\.permission\./, "") + ` (${rows.length})`;
+    ph.title = perm; body.appendChild(ph);
+    for (const r of rows.sort((a, b) => a.api.localeCompare(b.api))) {
+      const [apiCls, apiMethod] = r.api.split("#");
+      const label = apiCls.split(".").pop() + "#" + apiMethod;
+      // each caller is a method descriptor → navigate to its class and glow the
+      // line where this gated API is invoked.
+      const targets = r.callers.slice().sort().map(c => ({
+        display: c, cls: classOfMethod(c),
+        hint: { apiMethod, callerMethod: methodNameOf(c) },
+      }));
+      body.appendChild(makeNavRow(label, "perm", targets, "callers"));
+    }
+  }
+}
+
+const methodNameOf = md => ((md.split("->")[1] || "").split("(")[0]);
+
 // One clickable row: a label + N navigation targets. 1 target → jump directly;
-// several → expand a picker so the user chooses which class to open.
+// several → expand a picker so the user chooses which to open.
 function makeNavRow(label, cat, targets, noun) {
   const wrap = document.createElement("div");
   const row = document.createElement("div"); row.className = "iocitem " + cat;
@@ -786,13 +829,13 @@ function makeNavRow(label, cat, targets, noun) {
   row.append(val, cnt);
   row.title = label + (n ? `\n${n} ${noun}` : "");
   if (n === 1) {
-    row.onclick = () => navigateToClass(targets[0].cls);
+    row.onclick = () => navigateToClass(targets[0].cls, targets[0].hint);
   } else if (n > 1) {
     const sub = document.createElement("div"); sub.className = "isub"; sub.style.display = "none";
     const hint = document.createElement("div"); hint.className = "isubhint"; hint.textContent = "pick one:"; sub.appendChild(hint);
     for (const t of targets) {
       const s = document.createElement("div"); s.className = "isubitem"; s.textContent = t.display; s.title = t.display;
-      s.onclick = ev => { ev.stopPropagation(); navigateToClass(t.cls); };
+      s.onclick = ev => { ev.stopPropagation(); navigateToClass(t.cls, t.hint); };
       sub.appendChild(s);
     }
     row.onclick = () => {
@@ -807,15 +850,15 @@ function makeNavRow(label, cat, targets, noun) {
   return wrap;
 }
 
-// Jump to (decompile + reveal) a class by descriptor. Highlights its row in the
-// left tree when that row is currently visible; always shows the code + IOC bar.
-function navigateToClass(desc) {
+// Jump to a class by descriptor. Reveals/highlights its tree row when visible;
+// always shows the code + IOC bar. `hint` (optional) glows the gated-API line.
+function navigateToClass(desc, hint) {
   const row = [...listEl.querySelectorAll(".cls")].find(e => e.title === desc);
-  selectClass(desc, row || null);
+  selectClass(desc, row || null, hint);
   if (row) row.scrollIntoView({ block: "center", behavior: "smooth" });
 }
 
-function selectClass(cls, el) {
+function selectClass(cls, el, hint) {
   if (selectedEl) selectedEl.classList.remove("sel");
   selectedEl = el || null;
   if (el) el.classList.add("sel");
@@ -835,8 +878,49 @@ function selectClass(cls, el) {
     }
     const ms = (performance.now() - t0).toFixed(0);
     $("#vmeta").textContent = `${java.length} chars · ${ms}ms`;
-    $("#code").innerHTML = highlight(java || "// (empty — external/abstract class)");
+    renderCode(java || "// (empty — external/abstract class)");
+    if (hint) locateAndGlow(hint);
   }, 0);
+}
+
+// Render decompiled Java as individually highlighted lines, so a single line
+// can be scrolled to and glowed.
+function renderCode(text) {
+  const code = $("#code");
+  code.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  for (const line of text.split("\n")) {
+    const d = document.createElement("div"); d.className = "cl";
+    d.innerHTML = highlight(line) || "​";   // zero-width keeps blank-line height
+    frag.appendChild(d);
+  }
+  code.appendChild(frag);
+}
+
+let glowEl = null;
+// Find the line where the gated API is invoked (within the caller method when
+// locatable) and glow it.
+function locateAndGlow(hint) {
+  const lines = [...$("#code").querySelectorAll(".cl")];
+  if (!lines.length) return;
+  const { apiMethod, callerMethod } = hint || {};
+  let callerLine = -1;
+  if (callerMethod && !callerMethod.startsWith("<"))   // skip <init>/<clinit>
+    callerLine = lines.findIndex(l => l.textContent.includes(callerMethod + "("));
+  let target = -1;
+  if (apiMethod) {
+    if (callerLine >= 0)
+      for (let i = callerLine; i < lines.length; i++)
+        if (lines[i].textContent.includes(apiMethod)) { target = i; break; }
+    if (target < 0) target = lines.findIndex(l => l.textContent.includes(apiMethod));
+  }
+  if (target < 0) target = callerLine;
+  if (target < 0) return;
+  if (glowEl) glowEl.classList.remove("glow");
+  glowEl = lines[target];
+  glowEl.classList.remove("glow"); void glowEl.offsetWidth;   // restart animation
+  glowEl.classList.add("glow");
+  glowEl.scrollIntoView({ block: "center", behavior: "smooth" });
 }
 </script>
 </body>
