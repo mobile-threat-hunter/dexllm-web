@@ -188,13 +188,13 @@
   }
   #vhead .name { color:var(--fg); }
   #code { flex:1; overflow:auto; margin:0; padding:14px 18px; white-space:pre;
-    tab-size:4; -webkit-overflow-scrolling:touch; }
-  #code .cl { display:block; min-height:1.5em; padding:0 6px; margin:0 -6px;
-    border-left:2px solid transparent; }
-  #code .cl.glow {
-    background:#1f6feb22; border-left-color:var(--accent);
-    animation:lineglow 1.6s ease-out;
+    tab-size:4; -webkit-overflow-scrolling:touch; position:relative; }
+  /* glowed line: a single absolutely-positioned overlay, no per-line wrappers */
+  #glowline {
+    position:absolute; left:0; right:0; display:none; pointer-events:none;
+    background:#1f6feb22; border-left:2px solid var(--accent);
   }
+  #glowline.on { display:block; animation:lineglow 1.6s ease-out; }
   @keyframes lineglow {
     0%   { background:#58a6ffcc; box-shadow:0 0 22px #58a6ffaa; }
     60%  { background:#1f6feb55; box-shadow:0 0 8px #58a6ff55; }
@@ -304,6 +304,7 @@ let iocTotals = null;            // { urls, ips, domains, emails, onion, total }
 let iocIndex = [];               // [{ value, cat, classes:[descriptor,…] }] — for the global panel
 let permIndex = [];              // [{ perm, api, callers:[methodDescriptor,…] }] — dangerous-permission callers
 let permTotals = null;           // { perms, apis, callers }
+let permPending = false;         // true while the deferred caller analysis runs
 let dangerMap = null;            // permission -> [pkg.Class#method] (AOSP dangerous slice), fetched once
 const $ = s => document.querySelector(s);
 const statusEl = $("#status");
@@ -398,9 +399,13 @@ function computeIocs(dkInst, descriptors) {
   for (const cat of IOC_CATS) iocTotals[cat] = buckets[cat].size;
   if (!values.length) return;
 
-  // batched xref: value -> [classDescriptors]
+  // batched xref: value -> [classDescriptors]. Cap the number cross-referenced
+  // so a string-heavy APK doesn't build a huge Aho-Corasick automaton; extras
+  // are still listed (just without class links). Mirrors ioc.py's xref_limit.
+  const XREF_CAP = 400;
+  const toXref = values.slice(0, XREF_CAP);
   const VS = new Module.VectorString();
-  for (const v of values) VS.push_back(v);
+  for (const v of toXref) VS.push_back(v);
   let perValueClasses;
   try { perValueClasses = dkInst.xrefStringsToClasses(VS); }
   finally { VS.delete(); }
@@ -408,7 +413,7 @@ function computeIocs(dkInst, descriptors) {
   iocIndex = [];
   for (let i = 0; i < values.length; i++) {
     const cat = valueCat.get(values[i]);
-    const cls = perValueClasses[i] || [];
+    const cls = (i < toXref.length && perValueClasses[i]) ? perValueClasses[i] : [];
     iocIndex.push({ value: values[i], cat, classes: [...cls] });
     for (const cd of cls) {
       let e = classIoc.get(cd);
@@ -575,24 +580,12 @@ async function loadFile(file) {
     computeIocs(dk, descriptors);
   } catch (e) { console.error("IOC extraction failed:", e); iocTotals = null; }
 
-  // dangerous-permission caller mapping (AOSP permission→API table ⋈ used APIs)
-  statusEl.innerHTML = `<b>${file.name}</b> · mapping dangerous-permission APIs…`;
-  permIndex = []; permTotals = null;
-  try {
-    if (!dangerMap) {
-      dangerMap = await fetch("dangerous_perm_api.json").then(r => r.ok ? r.json() : {}).catch(() => ({}));
-    }
-    await new Promise(r => setTimeout(r, 0));
-    computePerms(dk);
-  } catch (e) { console.error("permission mapping failed:", e); permTotals = null; }
+  // The heavy dangerous-permission L2 call-site analysis is deferred until AFTER
+  // the class browser is shown (see analyzePerms), so the page isn't blocked.
+  permIndex = []; permTotals = null; permPending = true;
 
-  const iocPill = (iocTotals && iocTotals.total)
-    ? ` · <span class="pill bad" title="distinct network indicators recovered from dex strings">⚑ ${iocTotals.total} IOC${iocTotals.total === 1 ? "" : "s"}</span>`
-    : ` · <span class="pill ok">no IOCs</span>`;
-  const permPill = (permTotals && permTotals.perms)
-    ? ` · <span class="pill bad" title="dangerous permissions exercised through real gated-API calls">🔓 ${permTotals.perms} perm${permTotals.perms === 1 ? "" : "s"}</span>`
-    : "";
-  statusEl.innerHTML = `<b>${file.name}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}${iocPill}${permPill}`;
+  const statusHead = `<b>${file.name}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}`;
+  statusEl.innerHTML = statusHead + statusPills();
   // wait for the outro clip to finish, THEN switch to the class browser
   await transition;
   $("#main").classList.add("show");
@@ -606,6 +599,37 @@ async function loadFile(file) {
   renderPanels();
   renderList("");
   $("#search").value = ""; $("#search").focus();
+  // now run the slow permission analysis in the background and fill its panel
+  setTimeout(() => analyzePerms(statusHead), 30);
+}
+
+// Network-indicator / permission status pills (composed from current totals).
+function statusPills() {
+  const iocPill = (iocTotals && iocTotals.total)
+    ? ` · <span class="pill bad" title="distinct network indicators recovered from dex strings">⚑ ${iocTotals.total} IOC${iocTotals.total === 1 ? "" : "s"}</span>`
+    : ` · <span class="pill ok">no IOCs</span>`;
+  const permPill = permPending
+    ? ` · <span class="pill" style="background:#8b949e22;color:var(--muted)">🔓 analyzing…</span>`
+    : (permTotals && permTotals.perms)
+      ? ` · <span class="pill bad" title="dangerous permissions exercised through real gated-API calls">🔓 ${permTotals.perms} perm${permTotals.perms === 1 ? "" : "s"}</span>`
+      : "";
+  return iocPill + permPill;
+}
+
+// Deferred dangerous-permission caller mapping (the expensive L2 step).
+async function analyzePerms(statusHead) {
+  permIndex = []; permTotals = null; permPending = true;
+  renderPermPanel();
+  try {
+    if (!dangerMap) {
+      dangerMap = await fetch("dangerous_perm_api.json").then(r => r.ok ? r.json() : {}).catch(() => ({}));
+    }
+    await new Promise(r => setTimeout(r, 0));
+    computePerms(dk);
+  } catch (e) { console.error("permission mapping failed:", e); permTotals = null; }
+  permPending = false;
+  renderPermPanel();
+  statusEl.innerHTML = statusHead + statusPills();
 }
 
 // ---- class list as a path-compressed, lazy package tree ----
@@ -836,7 +860,15 @@ function renderIocPanel() {
 // dangerous-permission callers — separate panel, grouped by permission
 function renderPermPanel() {
   const panel = $("#permpanel"), body = $("#permpanelbody");
-  if (!permIndex.length) { panel.classList.add("empty"); body.innerHTML = ""; return; }
+  if (!permIndex.length) {
+    if (permPending) {                       // analysis still running — show progress
+      panel.classList.remove("empty");
+      $("#permhd2").textContent = "dangerous permissions";
+      body.innerHTML = '<div class="permsec" style="color:var(--muted)">analyzing callers…</div>';
+      return;
+    }
+    panel.classList.add("empty"); body.innerHTML = ""; return;
+  }
   panel.classList.remove("empty");
   $("#permhd2").innerHTML = `dangerous permissions <span class="ipcount" title="gated-API usages (app code)">🔓 ${permIndex.length}</span>`;
   const filt = ($("#permfilter").value || "").toLowerCase().trim();
@@ -933,45 +965,45 @@ function selectClass(cls, el, hint) {
   }, 0);
 }
 
-// Render decompiled Java as individually highlighted lines, so a single line
-// can be scrolled to and glowed.
+// Render decompiled Java in a single highlight pass (one innerHTML, no per-line
+// DOM). Raw lines are cached for fast line lookup; the glow uses an overlay.
+let codeLineCache = [];
 function renderCode(text) {
   const code = $("#code");
-  code.innerHTML = "";
-  const frag = document.createDocumentFragment();
-  for (const line of text.split("\n")) {
-    const d = document.createElement("div"); d.className = "cl";
-    d.innerHTML = highlight(line) || "​";   // zero-width keeps blank-line height
-    frag.appendChild(d);
-  }
-  code.appendChild(frag);
+  codeLineCache = text.split("\n");
+  code.innerHTML = highlight(text);
+  const g = document.createElement("div"); g.id = "glowline";
+  code.appendChild(g);
 }
 
-let glowEl = null;
 // Jump to and glow the line matching `hint`:
 //   { needle }        — first line containing `needle` (IoC value)
 //   { needle, scope } — `needle` within method `scope` first (gated-API caller)
 function locateAndGlow(hint) {
-  const lines = [...$("#code").querySelectorAll(".cl")];
+  const lines = codeLineCache;
   if (!lines.length || !hint) return;
   const { needle, scope } = hint;
   let scopeLine = -1;
   if (scope && !scope.startsWith("<"))   // skip <init>/<clinit>
-    scopeLine = lines.findIndex(l => l.textContent.includes(scope + "("));
+    scopeLine = lines.findIndex(l => l.includes(scope + "("));
   let target = -1;
   if (needle) {
     if (scopeLine >= 0)
       for (let i = scopeLine; i < lines.length; i++)
-        if (lines[i].textContent.includes(needle)) { target = i; break; }
-    if (target < 0) target = lines.findIndex(l => l.textContent.includes(needle));
+        if (lines[i].includes(needle)) { target = i; break; }
+    if (target < 0) target = lines.findIndex(l => l.includes(needle));
   }
   if (target < 0) target = scopeLine;
   if (target < 0) return;
-  if (glowEl) glowEl.classList.remove("glow");
-  glowEl = lines[target];
-  glowEl.classList.remove("glow"); void glowEl.offsetWidth;   // restart animation
-  glowEl.classList.add("glow");
-  glowEl.scrollIntoView({ block: "center", behavior: "instant" });
+  const code = $("#code"), g = $("#glowline");
+  if (!g) return;
+  const cs = getComputedStyle(code);
+  const lh = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) * 1.5);
+  const padTop = parseFloat(cs.paddingTop) || 0;
+  const top = padTop + target * lh;
+  g.style.top = top + "px"; g.style.height = lh + "px";
+  g.classList.remove("on"); void g.offsetWidth; g.classList.add("on");   // restart anim
+  code.scrollTop = Math.max(0, top - code.clientHeight / 2 + lh / 2);     // instant center
 }
 </script>
 </body>
