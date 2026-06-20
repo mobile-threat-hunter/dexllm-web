@@ -825,7 +825,8 @@ function renderIocPanel() {
     const h = document.createElement("div"); h.className = "iocgrp cat-" + cat;
     h.textContent = `${cat} (${items.length})`; body.appendChild(h);
     for (const it of items) {
-      body.appendChild(makeNavRow(it.value, it.cat, it.classes.map(c => ({ display: c, cls: c })), "classes"));
+      body.appendChild(makeNavRow(it.value, it.cat,
+        it.classes.map(c => ({ display: c, cls: c, hint: { needle: it.value } })), "classes"));
       shown++;
     }
   }
@@ -857,7 +858,7 @@ function renderPermPanel() {
       // line where this gated API is invoked.
       const targets = r.callers.slice().sort().map(c => ({
         display: c, cls: classOfMethod(c),
-        hint: { apiMethod, callerMethod: methodNameOf(c) },
+        hint: { needle: apiMethod, scope: methodNameOf(c) },
       }));
       body.appendChild(makeNavRow(label, "perm", targets, "callers"));
     }
@@ -904,7 +905,7 @@ function makeNavRow(label, cat, targets, noun) {
 function navigateToClass(desc, hint) {
   const row = [...listEl.querySelectorAll(".cls")].find(e => e.title === desc);
   selectClass(desc, row || null, hint);
-  if (row) row.scrollIntoView({ block: "center", behavior: "smooth" });
+  if (row) row.scrollIntoView({ block: "center", behavior: "instant" });
 }
 
 function selectClass(cls, el, hint) {
@@ -947,29 +948,30 @@ function renderCode(text) {
 }
 
 let glowEl = null;
-// Find the line where the gated API is invoked (within the caller method when
-// locatable) and glow it.
+// Jump to and glow the line matching `hint`:
+//   { needle }        — first line containing `needle` (IoC value)
+//   { needle, scope } — `needle` within method `scope` first (gated-API caller)
 function locateAndGlow(hint) {
   const lines = [...$("#code").querySelectorAll(".cl")];
-  if (!lines.length) return;
-  const { apiMethod, callerMethod } = hint || {};
-  let callerLine = -1;
-  if (callerMethod && !callerMethod.startsWith("<"))   // skip <init>/<clinit>
-    callerLine = lines.findIndex(l => l.textContent.includes(callerMethod + "("));
+  if (!lines.length || !hint) return;
+  const { needle, scope } = hint;
+  let scopeLine = -1;
+  if (scope && !scope.startsWith("<"))   // skip <init>/<clinit>
+    scopeLine = lines.findIndex(l => l.textContent.includes(scope + "("));
   let target = -1;
-  if (apiMethod) {
-    if (callerLine >= 0)
-      for (let i = callerLine; i < lines.length; i++)
-        if (lines[i].textContent.includes(apiMethod)) { target = i; break; }
-    if (target < 0) target = lines.findIndex(l => l.textContent.includes(apiMethod));
+  if (needle) {
+    if (scopeLine >= 0)
+      for (let i = scopeLine; i < lines.length; i++)
+        if (lines[i].textContent.includes(needle)) { target = i; break; }
+    if (target < 0) target = lines.findIndex(l => l.textContent.includes(needle));
   }
-  if (target < 0) target = callerLine;
+  if (target < 0) target = scopeLine;
   if (target < 0) return;
   if (glowEl) glowEl.classList.remove("glow");
   glowEl = lines[target];
   glowEl.classList.remove("glow"); void glowEl.offsetWidth;   // restart animation
   glowEl.classList.add("glow");
-  glowEl.scrollIntoView({ block: "center", behavior: "smooth" });
+  glowEl.scrollIntoView({ block: "center", behavior: "instant" });
 }
 </script>
 </body>
