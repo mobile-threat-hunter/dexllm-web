@@ -189,16 +189,12 @@
   #vhead .name { color:var(--fg); }
   #code { flex:1; overflow:auto; margin:0; padding:14px 18px; white-space:pre;
     tab-size:4; -webkit-overflow-scrolling:touch; position:relative; }
-  /* glowed line: a single absolutely-positioned overlay, no per-line wrappers */
+  /* highlighted line: a single absolutely-positioned overlay, statically colored */
   #glowline {
     position:absolute; left:0; right:0; display:none; pointer-events:none;
-    background:#1f6feb22; border-left:2px solid var(--accent);
+    background:#1f6feb55; border-left:2px solid var(--accent);
   }
-  #glowline.on { display:block; animation:lineglow .9s ease-out; }
-  @keyframes lineglow {   /* background-only flash — cheap to paint (no box-shadow) */
-    0%   { background:#58a6ff99; }
-    100% { background:#1f6feb22; }
-  }
+  #glowline.on { display:block; }
   .placeholder { color:var(--muted); padding:24px; }
   a { color:var(--accent); }
 
@@ -1009,7 +1005,7 @@ function locateAndGlow(hint) {
   const padTop = parseFloat(cs.paddingTop) || 0;
   const top = padTop + target * lh;
   g.style.top = top + "px"; g.style.height = lh + "px";
-  g.classList.remove("on"); void g.offsetWidth; g.classList.add("on");   // restart anim
+  g.classList.add("on");
   code.scrollTop = Math.max(0, top - code.clientHeight / 2 + lh / 2);     // instant center
 }
 </script>
