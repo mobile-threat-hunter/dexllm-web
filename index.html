@@ -488,13 +488,23 @@ drop.addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f) l
 // Outro/transition clip: on drop, swap the looping clip for trans.mp4 (same
 // spot) and play it once. Resolves when it ends (or a safety cap), which is
 // when we reveal the class browser.
+// Both clips play at 1.2× speed.
+const VID_RATE = 1.2;
+(function () {
+  const lv = $("#loopvid");
+  if (!lv) return;
+  const apply = () => { try { lv.playbackRate = VID_RATE; } catch (_) {} };
+  apply(); lv.addEventListener("loadedmetadata", apply); lv.addEventListener("play", apply);
+})();
+
 let transTimer = null;
 function startTransition() {
   const loop = $("#loopvid"), trans = $("#transvid");
   if (loop) loop.style.display = "none";
   trans.style.display = "block";
-  try { trans.currentTime = 0; } catch (_) {}
+  try { trans.currentTime = 0; trans.playbackRate = VID_RATE; } catch (_) {}
   const p = trans.play(); if (p && p.catch) p.catch(() => {});
+  try { trans.playbackRate = VID_RATE; } catch (_) {}
   return new Promise(resolve => {
     let done = false;
     const finish = () => { if (done) return; done = true; clearTimeout(transTimer); resolve(); };
