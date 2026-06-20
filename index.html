@@ -488,9 +488,9 @@ drop.addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f) l
 // Outro/transition clip: on drop, swap the looping clip for trans.mp4 (same
 // spot) and play it once. Resolves when it ends (or a safety cap), which is
 // when we reveal the class browser.
-// Playback speeds: loop clip 1.4×, transition clip 1.6×.
-const VID_RATE = 1.4;
-const TRANS_RATE = 1.6;
+// Playback speeds: loop clip 1.8×, transition clip 2×.
+const VID_RATE = 1.8;
+const TRANS_RATE = 2.0;
 (function () {
   const lv = $("#loopvid");
   if (!lv) return;
