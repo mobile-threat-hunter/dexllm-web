@@ -52,12 +52,13 @@
   #drop.drag #dropcard { border-color:var(--accent); background:var(--hl); color:var(--fg); }
   #dropcard .big { font-size:16px; color:var(--fg); }
   #dropcard div:last-child { font-size:12px; }
-  #loopvid {
+  #loopvid, #transvid {
     width:300px; max-width:72vw; aspect-ratio:1/1; border-radius:10px;
     border:none; box-shadow:none; display:block;
     object-fit:cover; background:#000; pointer-events:none;
   }
-  @media (max-width:720px) { #loopvid { width:220px; } }
+  #transvid { display:none; }   /* shown only as the drop→browse transition */
+  @media (max-width:720px) { #loopvid, #transvid { width:220px; } }
 
   main { flex:1; display:none; min-height:0; }
   main.show { display:flex; }
@@ -254,6 +255,9 @@
   <div id="dropcard">
     <video id="loopvid" autoplay muted loop playsinline disablepictureinpicture preload="auto">
       <source src="loop.mp4" type="video/mp4">
+    </video>
+    <video id="transvid" muted playsinline disablepictureinpicture preload="auto">
+      <source src="trans.mp4" type="video/mp4">
     </video>
     <div class="big">⬇ Drop a <b>.apk</b> / <b>.dex</b> / <b>.jar</b> here</div>
     <div>or click to choose a file — nothing is uploaded, decompilation runs locally</div>
@@ -481,8 +485,35 @@ $("#file").addEventListener("change", e => { if (e.target.files[0]) loadFile(e.t
 ["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("drag"); }));
 drop.addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f) loadFile(f); });
 
+// Outro/transition clip: on drop, swap the looping clip for trans.mp4 (same
+// spot) and play it once. Resolves when it ends (or a safety cap), which is
+// when we reveal the class browser.
+let transTimer = null;
+function startTransition() {
+  const loop = $("#loopvid"), trans = $("#transvid");
+  if (loop) loop.style.display = "none";
+  trans.style.display = "block";
+  try { trans.currentTime = 0; } catch (_) {}
+  const p = trans.play(); if (p && p.catch) p.catch(() => {});
+  return new Promise(resolve => {
+    let done = false;
+    const finish = () => { if (done) return; done = true; clearTimeout(transTimer); resolve(); };
+    trans.onended = finish;
+    trans.onerror = finish;
+    transTimer = setTimeout(finish, 6500);   // never hang the UI
+  });
+}
+function stopTransition() {                    // restore the loop (e.g. on load error)
+  const loop = $("#loopvid"), trans = $("#transvid");
+  clearTimeout(transTimer);
+  try { trans.pause(); } catch (_) {}
+  trans.style.display = "none";
+  if (loop) loop.style.display = "";
+}
+
 async function loadFile(file) {
   if (!Module) { alert("engine still loading…"); return; }
+  const transition = startTransition();   // play the outro clip while we parse
   statusEl.innerHTML = `parsing <b>${file.name}</b>…`;
   const buf = new Uint8Array(await file.arrayBuffer());
   try { Module.FS.writeFile("/input.bin", buf); } catch (_) {
@@ -497,6 +528,7 @@ async function loadFile(file) {
     const msg = (Module.getExceptionMessage && err && err.excPtr != null)
       ? Module.getExceptionMessage(err.excPtr) : err;
     statusEl.innerHTML = `<span class="pill bad">load failed</span> ${msg}`;
+    stopTransition();   // bad file — keep the user on the drop screen
     return;
   }
   const loadMs = (performance.now() - t0).toFixed(0);
@@ -546,6 +578,8 @@ async function loadFile(file) {
     ? ` · <span class="pill bad" title="dangerous permissions exercised through real gated-API calls">🔓 ${permTotals.perms} perm${permTotals.perms === 1 ? "" : "s"}</span>`
     : "";
   statusEl.innerHTML = `<b>${file.name}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}${iocPill}${permPill}`;
+  // wait for the outro clip to finish, THEN switch to the class browser
+  await transition;
   $("#main").classList.add("show");
   drop.style.display = "none";
   selectedEl = null;
