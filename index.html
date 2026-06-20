@@ -225,18 +225,22 @@
     #drop { margin:14px; }
     #drop .big { font-size:16px; }
 
-    main.show { flex-direction:column; }
+    /* stack the three regions and let the page scroll, with each region a
+       fixed height + its own inner scroll, so classes, code and the
+       IoC/permission panels are all reachable on mobile. */
+    main.show { flex-direction:column; overflow-y:auto; }
     #sidebar {
-      width:auto; min-width:0; max-height:38vh;
+      width:auto; min-width:0; flex:none; height:36vh;
       border-right:none; border-bottom:1px solid var(--border);
     }
-    #viewer { min-height:0; flex:1; }
+    #viewer { width:auto; min-height:0; flex:none; height:60vh; }
     #code { padding:12px 14px; }
     .cls, .pkg { padding:7px 12px; }   /* bigger touch targets */
     #rightcol {
-      width:auto; min-width:0; max-height:42vh; order:5;
+      width:auto; min-width:0; flex:none; height:auto; max-height:none; order:5;
       border-left:none; border-top:1px solid var(--border);
     }
+    .sidepanel { flex:none; height:38vh; }   /* each panel fixed + inner scroll */
   }
 </style>
 </head>
