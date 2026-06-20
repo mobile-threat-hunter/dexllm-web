@@ -962,8 +962,8 @@ function selectClass(cls, el, hint) {
       java = "// decompile failed: " + msg;
     }
     const ms = (performance.now() - t0).toFixed(0);
-    $("#vmeta").textContent = `${java.length} chars · ${ms}ms`;
-    renderCode(java || "// (empty — external/abstract class)");
+    const big = renderCode(java || "// (empty — external/abstract class)");
+    $("#vmeta").textContent = `${java.length} chars · ${ms}ms` + (big ? " · plain (large)" : "");
     if (hint) locateAndGlow(hint);
   }, 0);
 }
@@ -974,9 +974,15 @@ let codeLineCache = [];
 function renderCode(text) {
   const code = $("#code");
   codeLineCache = text.split("\n");
-  code.innerHTML = highlight(text);
+  // Syntax highlighting emits one <span> per token — tens of thousands of nodes
+  // for a huge class, which is the real source of lag. Above a size threshold,
+  // render plain escaped text (one text node). The line highlight overlay is
+  // position-based, so jumping still works either way.
+  const big = text.length > 50000 || codeLineCache.length > 2500;
+  code.innerHTML = big ? escHtml(text) : highlight(text);
   const g = document.createElement("div"); g.id = "glowline";
   code.appendChild(g);
+  return big;
 }
 
 // Jump to and glow the line matching `hint`:
