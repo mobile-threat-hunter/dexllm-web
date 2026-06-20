@@ -188,7 +188,8 @@
   }
   #vhead .name { color:var(--fg); }
   #code { flex:1; overflow:auto; margin:0; padding:14px 18px; white-space:pre;
-    tab-size:4; -webkit-overflow-scrolling:touch; position:relative; }
+    tab-size:4; -webkit-overflow-scrolling:touch; position:relative;
+    color:#5ef38c; }   /* single high-contrast color vs the black background */
   /* highlighted line: a single absolutely-positioned overlay, statically colored */
   #glowline {
     position:absolute; left:0; right:0; display:none; pointer-events:none;
@@ -962,8 +963,8 @@ function selectClass(cls, el, hint) {
       java = "// decompile failed: " + msg;
     }
     const ms = (performance.now() - t0).toFixed(0);
-    const big = renderCode(java || "// (empty — external/abstract class)");
-    $("#vmeta").textContent = `${java.length} chars · ${ms}ms` + (big ? " · plain (large)" : "");
+    renderCode(java || "// (empty — external/abstract class)");
+    $("#vmeta").textContent = `${java.length} chars · ${ms}ms`;
     if (hint) locateAndGlow(hint);
   }, 0);
 }
@@ -974,15 +975,11 @@ let codeLineCache = [];
 function renderCode(text) {
   const code = $("#code");
   codeLineCache = text.split("\n");
-  // Syntax highlighting emits one <span> per token — tens of thousands of nodes
-  // for a huge class, which is the real source of lag. Above a size threshold,
-  // render plain escaped text (one text node). The line highlight overlay is
-  // position-based, so jumping still works either way.
-  const big = text.length > 50000 || codeLineCache.length > 2500;
-  code.innerHTML = big ? escHtml(text) : highlight(text);
+  // No syntax highlighting: plain escaped text in one node (fast, no per-token
+  // spans). Code is shown in a single high-contrast color (see #code CSS).
+  code.innerHTML = escHtml(text);
   const g = document.createElement("div"); g.id = "glowline";
   code.appendChild(g);
-  return big;
 }
 
 // Jump to and glow the line matching `hint`:
