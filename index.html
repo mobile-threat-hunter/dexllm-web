@@ -189,7 +189,7 @@
   #vhead .name { color:var(--fg); }
   #code { flex:1; overflow:auto; margin:0; padding:14px 18px; white-space:pre;
     tab-size:4; -webkit-overflow-scrolling:touch; position:relative;
-    color:#5ef38c; }   /* single high-contrast color vs the black background */
+    color:var(--fg); }   /* default fg for punctuation/braces; tokens use .tk-* */
   /* huge classes are split into chunks; offscreen ones skip layout/paint */
   #code .chunk { display:block; content-visibility:auto; }
   /* highlighted line: a single absolutely-positioned overlay, statically colored */
@@ -982,7 +982,8 @@ function selectClass(cls, el, hint) {
     }
     const ms = (performance.now() - t0).toFixed(0);
     renderCode(java || "// (empty — external/abstract class)");
-    $("#vmeta").textContent = `${java.length} chars · ${ms}ms`;
+    $("#vmeta").textContent = `${java.length} chars · ${ms}ms` +
+      (renderCode.plainLarge ? " · plain (large)" : "");
     if (hint) locateAndGlow(hint);
   }, 0);
 }
@@ -995,11 +996,19 @@ function renderCode(text) {
   const code = $("#code");
   codeLineCache = text.split("\n");
   const n = codeLineCache.length;
-  // No syntax highlighting: plain escaped text. For a huge class, split into
-  // content-visibility chunks so the browser only lays out/paints the visible
-  // part (a 3.6M-char class is otherwise one giant text node = jank). Line
-  // height is uniform so the glow overlay (top = line × lineHeight) still aligns.
+  // Two paths:
+  //   <=200k chars → full syntax highlight (highlight() emits .tk-* spans
+  //                  per token; total node count is fine at this size).
+  //   > 200k chars → plain text, split into content-visibility chunks so the
+  //                  browser only lays out/paints the visible chunk. We skip
+  //                  per-token spans here because tens of thousands of nodes
+  //                  on top of chunking is what reintroduces the jank we just
+  //                  fixed (a 3.6M-char class). vmeta gains "· plain (large)".
+  // Line height is uniform either way so the glow overlay (top = line × lh)
+  // stays aligned to the lines reported by codeLineCache.
+  renderCode.plainLarge = false;
   if (text.length > 200000) {
+    renderCode.plainLarge = true;
     const lh = parseFloat(getComputedStyle(code).lineHeight) || 19.5;
     let html = "";
     for (let i = 0; i < n; i += CHUNK_LINES) {
@@ -1009,7 +1018,7 @@ function renderCode(text) {
     }
     code.innerHTML = html;
   } else {
-    code.innerHTML = escHtml(text);
+    code.innerHTML = highlight(text);
   }
   const g = document.createElement("div"); g.id = "glowline";
   code.appendChild(g);
