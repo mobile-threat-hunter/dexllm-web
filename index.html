@@ -245,9 +245,9 @@
 <body>
 <header>
   <h1>dex<span>llm</span></h1>
-  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/593c4ab"
+  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/f2113e4"
      target="_blank" rel="noopener" title="dexllm commit this WASM was built from">
-    v0.1.5 · <code>593c4ab</code>
+    v0.1.5 · <code>f2113e4</code>
   </a>
   <span class="sub">in-browser DEX / APK decompiler · runs entirely on your device (WASM)</span>
   <div id="status">loading engine…</div>
@@ -503,6 +503,16 @@ const TRANS_RATE = 2.0;
   if (!lv) return;
   const apply = () => { try { lv.playbackRate = VID_RATE; } catch (_) {} };
   apply(); lv.addEventListener("loadedmetadata", apply); lv.addEventListener("play", apply);
+  // Recent Chrome ships stricter autoplay (document-user-activation-required)
+  // where even `autoplay muted` is held until a user gesture. Force the play()
+  // call ourselves (muted videos still resolve), and as a last-resort fallback
+  // retry on the first user interaction. iOS/Safari also benefit from the kick.
+  lv.muted = true;                        // make defaultMuted explicit pre-play
+  const kick = () => { const p = lv.play(); if (p && p.catch) p.catch(() => {}); };
+  kick(); lv.addEventListener("loadedmetadata", kick); lv.addEventListener("canplay", kick);
+  const retry = () => { if (lv.paused) kick(); };
+  ["pointerdown","touchstart","keydown","scroll","visibilitychange"].forEach(
+    ev => document.addEventListener(ev, retry, { once: false, passive: true }));
 })();
 
 let transTimer = null;
