@@ -293,7 +293,13 @@
   </div>
 </main>
 
-<script src="dexllm.js"></script>
+<!-- Cache-bust both dexllm.js and dexllm.wasm by the dexllm commit SHA. Keeping
+     the JS+WASM pair consistent matters because a returning visitor whose
+     browser has the old dexllm.js cached but pulls the new dexllm.wasm gets
+     an ABI mismatch and "engine load failed". Bump this when the WASM is
+     rebuilt — it MUST match the version pill above. -->
+<script>window.__DEXLLM_BUILD = "f2113e4";</script>
+<script src="dexllm.js?v=f2113e4"></script>
 <script>
 let Module = null, dk = null, allClasses = [], selectedEl = null;
 // classDescriptor -> { urls:Set, ips:Set, domains:Set, emails:Set, onion:Set }
@@ -480,7 +486,7 @@ function computePerms(dkInst, appOnly = true) {
   permTotals = { perms: perms.size, apis: permIndex.length, callers: callersAll.size };
 }
 
-createDexllm().then(m => {
+createDexllm({ locateFile: (f) => f + "?v=" + window.__DEXLLM_BUILD }).then(m => {
   Module = m;
   statusEl.innerHTML = "engine ready · <b>drop a file</b>";
 }).catch(e => { statusEl.innerHTML = '<span class="pill bad">engine load failed</span>'; console.error(e); });
