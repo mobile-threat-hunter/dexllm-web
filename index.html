@@ -245,9 +245,9 @@
 <body>
 <header>
   <h1>dex<span>llm</span></h1>
-  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/f2113e4"
+  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/7722f34"
      target="_blank" rel="noopener" title="dexllm commit this WASM was built from">
-    v0.1.5 · <code>f2113e4</code>
+    v0.1.6 · <code>7722f34</code>
   </a>
   <span class="sub">in-browser DEX / APK decompiler · runs entirely on your device (WASM)</span>
   <div id="status">loading engine…</div>
@@ -298,8 +298,8 @@
      browser has the old dexllm.js cached but pulls the new dexllm.wasm gets
      an ABI mismatch and "engine load failed". Bump this when the WASM is
      rebuilt — it MUST match the version pill above. -->
-<script>window.__DEXLLM_BUILD = "f2113e4";</script>
-<script src="dexllm.js?v=f2113e4"></script>
+<script>window.__DEXLLM_BUILD = "7722f34";</script>
+<script src="dexllm.js?v=7722f34"></script>
 <script>
 let Module = null, dk = null, allClasses = [], selectedEl = null;
 // classDescriptor -> { urls:Set, ips:Set, domains:Set, emails:Set, onion:Set }
@@ -314,26 +314,76 @@ const $ = s => document.querySelector(s);
 const statusEl = $("#status");
 
 // ---- static network-IOC (C2) extraction ----------------------------------
-// Port of dexllm.ioc.extract_iocs: classify the dex string pool into URLs /
-// IPs / domains / emails / onion addresses, denoise framework package names
-// that look like hosts, then tie each indicator back to its referencing class
-// via the native batched L7 search (xrefStringsToClasses).
+// Port of dexllm.ioc.extract_iocs (src/dexllm/ioc.py). Pipeline:
+//   dk.listValueStrings()                  // const-string + static VALUE_STRING only
+//     -> refang (literal, O(n))            // hxxp:// , [.] , [at] , [dot] , ...
+//     -> bounded regexes                   // URL / IPv4 / email / onion (ReDoS-safe)
+//     -> bare-host candidate + PSL gate    // word-gTLD collisions rejected
+//     -> denoise (dex pkgs + xmlns + RDN)  // residual identifier hosts
+//     -> batched L7 xref to classes        // "where in the code"
+//
+// dexllm proper uses tldextract/PSL; we don't ship a PSL in the browser, so the
+// equivalent gate is a curated `IOC_TLDS` + the `_NONHOST_SUFFIXES` reject set
+// (word-like gTLDs that collide with Java identifiers — `os.name`, `*.support`,
+// codec ids, MIME). A scheme-qualified URL bypasses the gate (`://` proves intent).
 const IOC_CATS = ["urls", "ips", "domains", "emails", "onion"];
+const MAX_SCAN = 65536;            // per-string cap — bounds adversarial-blob cost
+// Per-string scan cap. Real network IOCs are short; an oversized blob is itself a
+// signal, not a host. Bounds worst-case cost on an adversarial APK.
+
+// Defang markers -> their refanged form. LITERAL str.replace only (O(n), ReDoS-
+// immune). Order matters where one marker is a prefix of another (e.g. `[://]`
+// before `[:]` — both contain `[:]` but `[://]` is more specific).
+const DEFANG_PAIRS = [
+  ["[://]", "://"],
+  ["[.]", "."], ["(.)", "."], ["{.}", "."],
+  ["[dot]", "."], ["(dot)", "."], [" dot ", "."],
+  ["[:]", ":"],
+  ["[at]", "@"], ["(at)", "@"], [" at ", "@"],
+  ["hxxps", "https"], ["hxxp", "http"], ["fxp", "ftp"],
+  ["\\", "/"],
+];
+function refang(s) { for (const [m, r] of DEFANG_PAIRS) if (s.indexOf(m) !== -1) s = s.split(m).join(r); return s; }
+
 const RE_URL   = /\b(?:https?|ftp|wss?):\/\/[^\s"'<>\\]+/gi;
-const RE_IPV4  = /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?::\d{1,5})?\b/g;
+// Bounded email — every quantifier capped so a long non-match can't drive
+// catastrophic backtracking (dex value-strings can be huge blobs).
+const RE_EMAIL = /(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,24}\b/g;
+// Dotted-quad IPv4 with negative lookbehind on `digit` / `digit.` and negative
+// lookahead on `.?digit` — rejects a version slice like `1.0.0.0.5` without
+// dropping a valid IP merely followed by a dot.
+const RE_IPV4  = /(?<!\d)(?<!\d\.)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?::\d{1,5})?(?!\.?\d)/g;
 const RE_ONION = /\b[a-z2-7]{16}(?:[a-z2-7]{40})?\.onion\b/gi;
-const RE_EMAIL = /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g;
-const IOC_TLDS = ("com|net|org|io|cn|ru|info|top|xyz|app|me|co|tk|cc|biz|site|online|club|" +
+// Loose bare-host candidate: labels then an alphabetic tail (2-24 chars). The
+// real gate is the curated TLD set + the word-gTLD reject set below. ReDoS-safe.
+const RE_HOST  = /\b(?:[a-z0-9][a-z0-9-]{0,62}\.){1,32}[a-z]{2,24}\b/gi;
+
+// Curated TLD set (substitutes for the bundled PSL in dexllm proper). Kept
+// intentionally wide on word-like ccTLDs and abuse-popular gTLDs.
+const IOC_TLDS = new Set((
+  "com|net|org|io|cn|ru|info|top|xyz|app|me|co|tk|cc|biz|site|online|club|" +
   "vip|pw|su|ws|cm|tv|gg|sh|dev|live|store|shop|fun|click|link|host|space|" +
-  "pro|mobi|asia|uk|de|fr|jp|kr|in|br|us|nl|eu|ir|kz|ua|by|ng|id|vn|th|ph");
-const RE_HOST  = new RegExp("\\b(?:[a-z0-9](?:[a-z0-9\\-]{0,61}[a-z0-9])?\\.)+(?:" + IOC_TLDS + ")\\b", "gi");
+  "pro|mobi|asia|uk|de|fr|jp|kr|in|br|us|nl|eu|ir|kz|ua|by|ng|id|vn|th|ph|" +
+  "ly|icu|ai|cloud|to|ga|cf|ml|gq|pl|tr|hk|tw|sg|au|ca|es|it|se|fi|no|dk|" +
+  "ch|at|be|cz|gr|ro|ua|il|sa|ae|za|mx|ar|cl|pe|edu|gov|mil|int|monster|" +
+  "best|today|world|press|pizza|rest|wtf|loan|trade|date|stream|party|men"
+).split("|"));
+
+// Public suffixes that ARE real TLDs but, in a dex, almost always appear as the
+// tail of a Java identifier path rather than a contacted host (`os.name`,
+// `Matcher.group`, `*.support`, codec ids). A bare-domain candidate ending in
+// one is dropped; a scheme-qualified URL keeps its host regardless. Mirrors
+// ioc.py `_NONHOST_SUFFIXES`.
+const NONHOST_SUFFIXES = new Set([
+  "name", "one", "group", "read", "support", "secure", "info", "run",
+  "google", "ms", "java", "type", "prod", "build", "now", "new", "win",
+  "men", "review", "country", "kim", "mov", "zip", "foo", "bar",
+]);
+
 const RDN_ROOTS = new Set("com org net edu gov mil int".split(" "));
 const PLATFORM_ROOTS = new Set("android androidx java javax kotlin kotlinx dalvik sun junit".split(" "));
 const DROP_ROOTS = new Set([...RDN_ROOTS, ...PLATFORM_ROOTS]);
-// XML-namespace / schema authority hosts. A URI like
-// `http://schemas.android.com/apk/res/android` is an XML namespace identifier
-// (xmlns:android=...), not a network endpoint — dropped from BOTH urls and
-// domains even though urls are otherwise never denoised. Curated, not pattern-based.
+// XML-namespace / schema authority hosts — xmlns identifiers, never contacted.
 const NAMESPACE_HOSTS = new Set([
   "schemas.android.com", "schemas.xmlsoap.org", "schemas.microsoft.com",
   "schemas.openxmlformats.org", "xmlpull.org", "www.xmlpull.org",
@@ -356,29 +406,64 @@ const isPackageLike = (host, pkgs) => {
   const low = host.toLowerCase();
   return NAMESPACE_HOSTS.has(low) || pkgs.has(low) || DROP_ROOTS.has(low.split(".")[0]);
 };
-const hostOf = url => ((url.split("://")[1] || "").split("/")[0].split("?")[0]);
+// Drop userinfo (`user:pass@`) so the real C2 host is extracted, and drop port.
+function hostOf(url) {
+  const rest = url.split("://")[1] || "";
+  let authority = (rest.split("/")[0] || "").split("?")[0].split("#")[0];
+  const at = authority.lastIndexOf("@");
+  if (at !== -1) authority = authority.slice(at + 1);
+  if (authority.startsWith("[") && authority.indexOf("]") !== -1) {
+    return authority.slice(1, authority.indexOf("]")).toLowerCase();
+  }
+  return authority.split(":")[0].toLowerCase();
+}
+// PSL stand-in: host is a registered-domain candidate if its tail is in our TLD
+// set AND not one of the word-gTLDs that collide with Java identifiers in a dex.
+function validDomain(host) {
+  const labels = host.split(".");
+  if (labels.length < 2) return false;
+  const tail = labels[labels.length - 1];
+  if (!IOC_TLDS.has(tail)) return false;
+  if (NONHOST_SUFFIXES.has(tail)) return false;
+  return true;
+}
 
 function classifyStrings(strings, dexPkgs) {
   const b = { urls:new Set(), ips:new Set(), domains:new Set(), emails:new Set(), onion:new Set() };
-  for (const s of strings) {
+  for (const raw of strings) {
+    const capped = raw.length <= MAX_SCAN ? raw : raw.slice(0, MAX_SCAN);
+    const s = refang(capped);
     let m;
-    RE_URL.lastIndex = 0;   while ((m = RE_URL.exec(s))) {
-      const url = m[0].replace(/[.,);]+$/, "");
-      // XML namespace URIs (xmlns=...) are identifiers, not endpoints — drop.
-      if (NAMESPACE_HOSTS.has(hostOf(url).split(":")[0].toLowerCase())) continue;
+    RE_URL.lastIndex = 0;
+    while ((m = RE_URL.exec(s))) {
+      const url = m[0].replace(/[.,);"']+$/, "");
+      if (NAMESPACE_HOSTS.has(hostOf(url))) continue;          // xmlns URI, not a contacted endpoint
       b.urls.add(url);
     }
     RE_ONION.lastIndex = 0; while ((m = RE_ONION.exec(s))) b.onion.add(m[0].toLowerCase());
-    RE_IPV4.lastIndex = 0;  while ((m = RE_IPV4.exec(s)))  b.ips.add(m[0]);
+    RE_IPV4.lastIndex  = 0; while ((m = RE_IPV4.exec(s)))  b.ips.add(m[0]);
     RE_EMAIL.lastIndex = 0; while ((m = RE_EMAIL.exec(s))) b.emails.add(m[0]);
-    RE_HOST.lastIndex = 0;  while ((m = RE_HOST.exec(s)))  {
+    RE_HOST.lastIndex  = 0;
+    while ((m = RE_HOST.exec(s))) {
       const host = m[0].toLowerCase();
-      if (!isPackageLike(host, dexPkgs)) b.domains.add(host);
+      if (host.endsWith(".onion")) continue;                  // its own bucket
+      if (!validDomain(host)) continue;                       // PSL/word-gTLD gate
+      if (isPackageLike(host, dexPkgs)) continue;             // residual identifier
+      b.domains.add(host);
     }
   }
-  for (const u of b.urls) {                                    // a URL's own host is high-confidence
-    const h = hostOf(u).split(":")[0].toLowerCase();
-    if (h.includes(".") && !isPackageLike(h, dexPkgs)) b.domains.add(h);
+  // A URL's own host is high-confidence (scheme proves intent) — fold in, but
+  // skip IP-literal hosts (those are in `ips`) and onion (own category). Bypass
+  // the word-gTLD gate; PSL structure check stays.
+  for (const u of b.urls) {
+    const h = hostOf(u);
+    if (!h.includes(".")) continue;
+    if (h.endsWith(".onion")) continue;
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(h)) continue;
+    const tail = h.split(".").pop();
+    if (!IOC_TLDS.has(tail)) continue;
+    if (isPackageLike(h, dexPkgs)) continue;
+    b.domains.add(h);
   }
   return b;
 }
@@ -388,7 +473,11 @@ function computeIocs(dkInst, descriptors) {
   classIoc = new Map();
   iocIndex = [];
   const dexPkgs = dexPackagePrefixes(descriptors);
-  const sv = dkInst.listStrings();
+  // dexllm 0.1.6+: list_strings was removed (identifier noise — type/method/
+  // field names polluted the IOC feed). list_value_strings yields only the
+  // strings the app loads AS DATA: const-string (0x1a/0x1b) operands + static
+  // VALUE_STRING (0x17) field initializers, MUTF-8 → UTF-8 decoded.
+  const sv = dkInst.listValueStrings();
   const strings = [];
   for (let i = 0; i < sv.size(); i++) strings.push(sv.get(i));
   sv.delete();
@@ -431,17 +520,24 @@ const iocCountFor = cd => {
   let n = 0; for (const cat of IOC_CATS) n += e[cat].size; return n;
 };
 
-// ---- dangerous-permission callers (dexllm.dangerous_permission_callers) ----
-// Join the AOSP permission→API table against the APK's external method refs,
-// then resolve each used gated API to the methods that call it. Mirrors
-// src/dexllm/dangerous_api.py.
+// ---- dangerous-permission callers (dexllm.dangerous_permission_api_callers) ----
+// Port of src/dexllm/dangerous_api.py. Join the AOSP permission→API table against
+// the APK's external method refs, then resolve each used gated API to the methods
+// that call it.
+//
+// dexllm 0.1.6+ ships a SIGNATURE-PRECISE dangerous_perm_api.json (entries are
+// `pkg.Class#method(params)`), so overloads with different permission gates are
+// disambiguated. We mirror dangerous_api.py's matching policy: arity is the
+// primary, parse-robust discriminator; exact simple-type matching is only the
+// tiebreak when a (class, method) has multiple overloads of the same arity. A
+// lone overload (of its arity) matches on name alone, so a signature edge case
+// can never drop a real hit.
 const descToJava = d => (d.startsWith("L") && d.endsWith(";")) ? d.slice(1, -1).replace(/\//g, ".") : d;
 const classOfMethod = md => md.split("->")[0];   // "Lcls;->m()V" -> "Lcls;"
 
-// app_only filter (default on, matches dangerous_permission_api_callers): a
-// dangerous-API call from bundled framework / official-library code is library
-// plumbing, not the app's own behaviour — drop those callers. An API whose only
-// callers are framework code is omitted.
+// Caller prefixes treated as bundled framework / official-library code — a
+// dangerous-API call from here is library plumbing, not app behaviour. Mirrors
+// dangerous_api.py `_FRAMEWORK_CALLER_PREFIXES`.
 const FRAMEWORK_CALLER_PREFIXES = [
   "Landroidx/", "Landroid/support/", "Landroid/arch/", "Lkotlin/", "Lkotlinx/",
   "Ljava/", "Ljavax/", "Ldalvik/", "Lcom/google/android/", "Lcom/google/common/",
@@ -449,25 +545,177 @@ const FRAMEWORK_CALLER_PREFIXES = [
 ];
 const isFrameworkCaller = desc => FRAMEWORK_CALLER_PREFIXES.some(p => desc.startsWith(p));
 
+// ── signature normalisation (mirror of dangerous_api.py) ────────────────────
+// Both sides are reduced to a tuple of SIMPLE type names so a Dalvik proto and
+// a Java/Kotlin source signature compare equal without resolving the dataset's
+// unqualified type names to packages.
+const DALVIK_PRIM = {
+  I:"int", J:"long", Z:"boolean", D:"double", F:"float",
+  B:"byte", S:"short", C:"char", V:"void",
+};
+const KOTLIN_ALIASES = {
+  Int:"int", Long:"long", Short:"short", Byte:"byte", Char:"char",
+  Boolean:"boolean", Float:"float", Double:"double", Unit:"void", Any:"Object",
+};
+const JAVA_MODIFIERS = new Set(["final"]);
+// Strip an annotation (`@Foo`, `@Foo(...)`, `@pkg.Outer.Foo (...)`) — its name
+// may be dotted/qualified, optional non-nested arg list. Done whole so its
+// inner `=`/`,` can't leak into types or be miscounted as a param separator.
+const ANNOTATION_RE = /@[\w.]+\s*(\([^()]*\))?/g;
+
+function simpleName(t) {
+  return t.replace(/\//g, ".").replace(/\$/g, ".").split(".").pop();
+}
+
+// Dalvik proto `(...)ret` -> tuple of simple param type names.
+function dalvikParamTypes(proto) {
+  const o = proto.indexOf("("), c = proto.indexOf(")");
+  if (o < 0 || c < o) return [];
+  const inner = proto.slice(o + 1, c);
+  const out = [];
+  let i = 0;
+  while (i < inner.length) {
+    let dims = 0;
+    while (i < inner.length && inner[i] === "[") { dims++; i++; }
+    if (i >= inner.length) break;
+    const ch = inner[i];
+    if (ch === "L") {
+      const j = inner.indexOf(";", i);
+      if (j < 0) break;
+      out.push(simpleName(inner.slice(i + 1, j)) + "[]".repeat(dims));
+      i = j + 1;
+    } else {
+      out.push((DALVIK_PRIM[ch] || ch) + "[]".repeat(dims));
+      i++;
+    }
+  }
+  return out;
+}
+
+// Split a parameter list on top-level commas (respecting <>, (), [] nesting).
+function splitTopLevel(params) {
+  const parts = [];
+  let depth = 0, cur = "";
+  for (const ch of params) {
+    if (ch === "<" || ch === "(" || ch === "[") depth++;
+    else if (ch === ">" || ch === ")" || ch === "]") depth = Math.max(0, depth - 1);
+    if (ch === "," && depth === 0) { parts.push(cur); cur = ""; }
+    else cur += ch;
+  }
+  if (cur.trim()) parts.push(cur);
+  return parts;
+}
+
+// One param decl -> simple type. Handles Java `Type name`, Kotlin `name: Type`,
+// generics, arrays, varargs. Annotations are already stripped upstream.
+function paramSimple(param) {
+  let p = param.replace(/<.*>/, "").trim();          // erase generics FIRST
+  const dims = (p.match(/\[\]/g) || []).length + (p.indexOf("...") !== -1 ? 1 : 0);
+  p = p.replace(/\[\]/g, " ").replace(/\.\.\./g, " ").trim();
+  let typeStr;
+  if (p.indexOf(":") !== -1) {
+    typeStr = p.split(":").pop().trim();              // Kotlin `name: Type`
+  } else {
+    const toks = p.split(/\s+/).filter(t => t && !JAVA_MODIFIERS.has(t));
+    if (!toks.length) return "";
+    typeStr = toks.length >= 2 ? toks.slice(0, -1).join(" ") : toks[0];
+  }
+  typeStr = typeStr.replace(/\?$/, "").trim();        // Kotlin nullable `String?`
+  const base = simpleName(typeStr);
+  return (KOTLIN_ALIASES[base] || base) + "[]".repeat(dims);
+}
+
+// `pkg.Class#method(params)` -> {cls, name, types | null}. Field/constant
+// entries (no `(...)`) yield types=null and never match a method-call ref.
+function parseApi(entry) {
+  const hash = entry.indexOf("#");
+  if (hash < 0) return { cls: entry, name: "", types: null };
+  let cls = entry.slice(0, hash).replace(/\$/g, ".");
+  const rest = entry.slice(hash + 1);
+  const o = rest.indexOf("("), c = rest.lastIndexOf(")");
+  if (o < 0 || c < o) return { cls, name: rest, types: null };
+  const name = rest.slice(0, o);
+  const params = rest.slice(o + 1, c).replace(ANNOTATION_RE, " ");
+  if (!params.trim()) return { cls, name, types: [] };
+  return { cls, name, types: splitTopLevel(params).map(paramSimple) };
+}
+
+// {(class, method): {arity: #distinct overloads of that arity}}
+// Drives the ambiguity check: a (class, method) with one overload — or one
+// overload of a given arity — needs no signature parsing to disambiguate. Dedup
+// is by FULL signature STRING, not the reduced simple-type tuple (two overloads
+// can reduce to the same tuple, e.g. java.util.Date vs java.sql.Date).
+function buildOverloadIndex(dangerMap) {
+  const seen = new Map();                  // "cls method" -> Set<sig>
+  for (const sigs of Object.values(dangerMap)) {
+    for (const sig of sigs) {
+      const { cls, name, types } = parseApi(sig);
+      if (types === null) continue;
+      const k = cls + " " + name;
+      let s = seen.get(k); if (!s) { s = new Set(); seen.set(k, s); }
+      s.add(sig);
+    }
+  }
+  const out = new Map();
+  for (const [k, sigSet] of seen) {
+    const arity = {};
+    for (const sig of sigSet) {
+      const n = (parseApi(sig).types || []).length;
+      arity[n] = (arity[n] || 0) + 1;
+    }
+    out.set(k, arity);
+  }
+  return out;
+}
+
+// Whether a dex ref realises the dataset signature `types`.
+function refMatches(ref, types, arityMap) {
+  let total = 0;
+  for (const v of Object.values(arityMap)) total += v;
+  if (total <= 1) return true;             // single overload — name match unambiguous
+  const refTypes = dalvikParamTypes(ref.proto);
+  if (refTypes.length !== types.length) return false;
+  if ((arityMap[types.length] || 0) <= 1) return true;   // unique arity in the set
+  return refTypes.join(",") === types.join(",");
+}
+
+// Index APK external method refs by (java_class, method_name). Aliases each
+// `<init>` ref under the class simple name so a dataset constructor entry
+// `Class#SimpleName(...)` matches without rewriting the dataset side.
+function buildExternalIndex(dkInst) {
+  const idx = new Map();
+  const refs = dkInst.listExternalMethodRefs();
+  const add = (cls, name, ref) => {
+    const k = cls + " " + name;
+    let bucket = idx.get(k);
+    if (!bucket) { bucket = []; idx.set(k, bucket); }
+    bucket.push(ref);
+  };
+  for (const r of refs) {
+    const cls = descToJava(r.cls).replace(/\$/g, ".");   // canonicalise inner-class sep
+    add(cls, r.name, r);
+    if (r.name === "<init>") add(cls, cls.split(".").pop(), r);
+  }
+  return idx;
+}
+
 function computePerms(dkInst, appOnly = true) {
   permIndex = []; permTotals = null;
   if (!dangerMap) return;
-  // index external method refs by "java.Class#method"
-  const idx = new Map();
-  const refs = dkInst.listExternalMethodRefs();
-  for (let i = 0; i < refs.length; i++) {
-    const r = refs[i];
-    const key = descToJava(r.cls) + "#" + r.name;
-    if (!idx.has(key)) idx.set(key, []);
-    idx.get(key).push(r);                          // {cls, name, proto}
-  }
+  const idx = buildExternalIndex(dkInst);
+  const overloads = buildOverloadIndex(dangerMap);
   const perms = new Set(), callersAll = new Set();
   for (const perm of Object.keys(dangerMap)) {
-    for (const api of dangerMap[perm]) {
-      const refsForApi = idx.get(api);
-      if (!refsForApi) continue;
+    for (const sig of dangerMap[perm]) {
+      const { cls, name, types } = parseApi(sig);
+      if (types === null) continue;                  // field/constant entry
+      const refs = idx.get(cls + " " + name);
+      if (!refs) continue;
+      const arityMap = overloads.get(cls + " " + name) || {};
+      const matched = refs.filter(r => refMatches(r, types, arityMap));
+      if (!matched.length) continue;
       const callers = new Set();
-      for (const r of refsForApi) {
+      for (const r of matched) {
         const desc = r.cls + "->" + r.name + r.proto;
         const cs = dkInst.findCallSitesToApi(desc);
         for (let i = 0; i < cs.size(); i++) {
@@ -478,7 +726,7 @@ function computePerms(dkInst, appOnly = true) {
         cs.delete();
       }
       if (callers.size) {
-        permIndex.push({ perm, api, callers: [...callers] });
+        permIndex.push({ perm, api: sig, callers: [...callers] });
         perms.add(perm); callers.forEach(c => callersAll.add(c));
       }
     }
