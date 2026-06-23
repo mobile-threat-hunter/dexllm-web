@@ -72,6 +72,32 @@
   }
   #search:focus { outline:none; border-color:var(--accent); }
   #count { padding:0 12px 6px; color:var(--muted); font-size:11px; }
+  /* per-dex tabs: [all] [classes.dex] [classes2.dex] [+dump-1.dex] + "+ dex" */
+  #dexbar {
+    display:none; flex-wrap:wrap; gap:4px; padding:6px 8px; border-bottom:1px solid var(--border);
+    background:var(--panel); align-items:center;
+  }
+  #dexbar.show { display:flex; }
+  .dextab {
+    padding:3px 8px; border:1px solid var(--border); border-radius:11px;
+    background:var(--bg); color:var(--muted); cursor:pointer;
+    font:11px/1.4 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+    white-space:nowrap;
+  }
+  .dextab:hover { background:#ffffff0a; color:var(--fg); }
+  .dextab.sel { background:var(--accent); border-color:var(--accent); color:#000; font-weight:600; }
+  .dextab.dump { border-style:dashed; border-color:var(--bad); color:var(--bad); }
+  .dextab.dump.sel { background:var(--bad); color:#fff; }
+  .dextab.bad { border-color:var(--bad); color:var(--bad); text-decoration:line-through; }
+  .dextab .n { opacity:0.6; margin-left:4px; }
+  #adddex {
+    padding:3px 9px; border:1px dashed var(--border); border-radius:11px;
+    background:transparent; color:var(--muted); cursor:pointer;
+    font:11px/1.4 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+  }
+  #adddex:hover { background:#ffffff0a; color:var(--fg); border-color:var(--accent); }
+  #adddex:disabled { opacity:0.4; cursor:wait; }
+  #adddexfile { display:none; }
   #classlist { overflow:auto; flex:1; }
   .cls {
     padding:4px 12px; cursor:pointer; white-space:nowrap; overflow:hidden;
@@ -270,6 +296,15 @@
 <main id="main">
   <div id="sidebar">
     <input id="search" placeholder="filter classes…" autocomplete="off">
+    <!-- per-dex selector. Tabs appear once an APK is loaded: [all] for the
+         aggregated view (current default), one tab per classes*.dex inside the
+         APK, plus one tab per dumped dex (drag-drop or via "+ dex"). Dumped dexes
+         are loaded with priority (first-wins, mirrors ART when a packer unpacks
+         a decrypted dex), so their classes WIN collisions with the original APK. -->
+    <div id="dexbar">
+      <button id="adddex" type="button" title="Add a runtime-dumped .dex/.apk on top (prefer=true → its classes win collisions)">+ dex</button>
+      <input id="adddexfile" type="file" accept=".dex,.apk,.jar,.zip,application/octet-stream" multiple>
+    </div>
     <div id="count"></div>
     <div id="classlist"></div>
   </div>
@@ -310,6 +345,19 @@ let permIndex = [];              // [{ perm, api, callers:[methodDescriptor,…]
 let permTotals = null;           // { perms, apis, callers }
 let permPending = false;         // true while the deferred caller analysis runs
 let dangerMap = null;            // permission -> [pkg.Class#method] (AOSP dangerous slice), fetched once
+
+// ── multi-source state ──────────────────────────────────────────────────────
+// Track every source the current DexKit was built from so we can rebuild when
+// the user adds a runtime-dumped dex. Sources are loaded in priority order:
+// dumps FIRST, original APK last → ART-style first-wins makes the dumped class
+// win a collision (mirrors the packer-unpack workflow described in
+// dexllm.add_dumped_dexes). vfsBytes lets us reconstruct the DexKit cheaply.
+let originalSource = null;       // {vfs, label} for the initial APK/dex
+let dumpedSources  = [];         // [{vfs, label}, …] in insertion order (first-added wins)
+const vfsBytes = new Map();      // vfs path -> ArrayBuffer (kept so we can rebuild)
+let dexInfo = [];                // per-dex: [{dex_id, name, valid, reason, sourceLabel, dump, count}]
+let selectedDex = "all";         // "all" | <dex_id:number>; class list filter
+let perDexClasses = new Map();   // class descriptor -> dex_id (filled via locateClassDex)
 const $ = s => document.querySelector(s);
 const statusEl = $("#status");
 
@@ -746,6 +794,30 @@ $("#file").addEventListener("change", e => { if (e.target.files[0]) loadFile(e.t
 ["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("drag"); }));
 drop.addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f) loadFile(f); });
 
+// "+ dex" button — runtime-dumped image (a .dex or a zip/apk holding decrypted
+// dexes) is loaded WITH PRIORITY over the original (first-wins → unpacked
+// classes win collisions, mirroring ART after a packer unpacks).
+$("#adddex").addEventListener("click", () => $("#adddexfile").click());
+$("#adddexfile").addEventListener("change", async e => {
+  const files = [...(e.target.files || [])];
+  e.target.value = "";   // reset so picking the same file again re-fires change
+  if (!files.length) return;
+  const btn = $("#adddex");
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = "+ dex …";
+  try { for (const f of files) await addDumpedDex(f); }
+  finally { btn.disabled = false; btn.textContent = orig; }
+});
+// Drag-drop a .dex/.zip directly onto the sidebar dex bar adds it as a dump.
+const dexbarEl = $("#dexbar");
+["dragenter","dragover"].forEach(ev => dexbarEl.addEventListener(ev, e => { e.preventDefault(); dexbarEl.style.outline = "1px dashed var(--accent)"; }));
+["dragleave","drop"].forEach(ev => dexbarEl.addEventListener(ev, e => { e.preventDefault(); dexbarEl.style.outline = ""; }));
+dexbarEl.addEventListener("drop", async e => {
+  if (!originalSource) return;             // ignore drops before the apk is loaded
+  const btn = $("#adddex"); btn.disabled = true; const orig = btn.textContent; btn.textContent = "+ dex …";
+  try { for (const f of e.dataTransfer.files) await addDumpedDex(f); }
+  finally { btn.disabled = false; btn.textContent = orig; }
+});
+
 // Outro/transition clip: on drop, swap the looping clip for trans.mp4 (same
 // spot) and play it once. Resolves when it ends (or a safety cap), which is
 // when we reveal the class browser.
@@ -798,14 +870,21 @@ async function loadFile(file) {
   const transition = startTransition();   // play the outro clip while we parse
   statusEl.innerHTML = `parsing <b>${file.name}</b>…`;
   const buf = new Uint8Array(await file.arrayBuffer());
+  // Fresh load wipes any previously-added dumps; rewriting /input.bin so the
+  // path stays stable lets the rebuild flow (multi-source ctor) reuse it.
+  for (const v of vfsBytes.keys()) { try { Module.FS.unlink(v); } catch (_) {} }
+  vfsBytes.clear();
+  dumpedSources = [];
   try { Module.FS.writeFile("/input.bin", buf); } catch (_) {
     try { Module.FS.unlink("/input.bin"); } catch (_) {} Module.FS.writeFile("/input.bin", buf);
   }
+  vfsBytes.set("/input.bin", buf);
+  selectedDex = "all";
   if (dk) { try { dk.delete(); } catch (_) {} dk = null; }
 
   let t0 = performance.now();
   try {
-    dk = new Module.DexKit("/input.bin");
+    dk = new Module.WasmDexKit("/input.bin");
   } catch (err) {
     const msg = (Module.getExceptionMessage && err && err.excPtr != null)
       ? Module.getExceptionMessage(err.excPtr) : err;
@@ -814,8 +893,91 @@ async function loadFile(file) {
     return;
   }
   const loadMs = (performance.now() - t0).toFixed(0);
+  // Record this source's slot count so we can attribute multi-source verifyReport
+  // entries back to it after a dump is added. Slot count = attempted dexes
+  // (length of verifyReport), NOT dexCount() (which excludes rejected).
+  originalSource = { vfs: "/input.bin", label: file.name, slotCount: dk.verifyReport().length };
 
-  // verifier verdict
+  await processCurrentDk(file.name, loadMs, { firstLoad: true, transition });
+}
+
+// Build a fresh multi-source DexKit over [dumps..., original]. dumps go FIRST
+// so first-wins resolution makes their classes win a collision (mirrors ART
+// after a packer unpack — `add_dumped_dexes(prefer=True)` in dexllm proper).
+// lenient=true so a partially-decrypted dump still loads under ART-structural-
+// equivalent verification.
+function rebuildDk() {
+  if (dk) { try { dk.delete(); } catch (_) {} dk = null; }
+  if (!dumpedSources.length) {
+    dk = new Module.WasmDexKit(originalSource.vfs);
+    return;
+  }
+  const VS = new Module.VectorString();
+  for (const d of dumpedSources) VS.push_back(d.vfs);
+  VS.push_back(originalSource.vfs);
+  try { dk = new Module.WasmDexKit(VS, /*lenient=*/true); }
+  finally { VS.delete(); }
+}
+
+// Add a runtime-dumped .dex (or .apk holding dexes) on top of the current load.
+// The packer-unpack workflow: the dumped image is loaded with priority over
+// the original, so the unpacked class wins a collision (mirrors ART). Updates
+// `dumpedSources`, rebuilds dk, then re-runs IOC + perms via processCurrentDk.
+async function addDumpedDex(file) {
+  if (!Module || !originalSource) { alert("load an APK first"); return; }
+  const buf = new Uint8Array(await file.arrayBuffer());
+  // Stable VFS path so the rebuild can locate it. Numeric suffix tracks
+  // insertion order — UI labels reflect that (dump-1, dump-2, …). Extension is
+  // arbitrary (content-based magic detection), but '.bin' keeps the path
+  // honest for both bare-.dex and apk dumps.
+  const idx = dumpedSources.length + 1;
+  const vfs = `/dump-${idx}.bin`;
+  try { Module.FS.writeFile(vfs, buf); } catch (_) {
+    try { Module.FS.unlink(vfs); } catch (_) {} Module.FS.writeFile(vfs, buf);
+  }
+  vfsBytes.set(vfs, buf);
+
+  // Single-load the dump first to capture its slot count (attempted dexes),
+  // needed for correctly attributing multi-source verifyReport entries back to
+  // each source in the per-dex tab bar. lenient=true so partial decrypts probe.
+  const t0 = performance.now();
+  let slotCount;
+  try {
+    const probe = new Module.WasmDexKit(vfs);
+    slotCount = probe.verifyReport().length;
+    probe.delete();
+  } catch (err) {
+    const msg = (Module.getExceptionMessage && err && err.excPtr != null)
+      ? Module.getExceptionMessage(err.excPtr) : err;
+    statusEl.innerHTML = `<span class="pill bad">dump load failed</span> ${msg}`;
+    try { Module.FS.unlink(vfs); } catch (_) {}
+    vfsBytes.delete(vfs);
+    return;
+  }
+  dumpedSources.push({ vfs, label: file.name, slotCount });
+
+  try {
+    rebuildDk();
+  } catch (err) {
+    const msg = (Module.getExceptionMessage && err && err.excPtr != null)
+      ? Module.getExceptionMessage(err.excPtr) : err;
+    statusEl.innerHTML = `<span class="pill bad">dump load failed</span> ${msg}`;
+    dumpedSources.pop();
+    try { Module.FS.unlink(vfs); } catch (_) {}
+    vfsBytes.delete(vfs);
+    rebuildDk();
+    return;
+  }
+  const loadMs = (performance.now() - t0).toFixed(0);
+  await processCurrentDk(originalSource.label, loadMs, { firstLoad: false });
+}
+
+// Post-load pipeline shared between initial APK load and add-dumped-dex.
+// Recomputes verifier verdict + class list + per-dex placement + IOC + perms,
+// then re-renders the class browser and tabs. On first load, also waits for
+// the outro clip and reveals the main UI.
+async function processCurrentDk(label, loadMs, opts) {
+  // verifier verdict — drives the dexInfo table consumed by the per-dex tabs.
   const rep = dk.verifyReport();
   let nbad = 0; const n = rep.length;
   for (let i = 0; i < n; i++) if (!rep[i].valid) nbad++;
@@ -823,15 +985,27 @@ async function loadFile(file) {
     ? `<span class="pill ok">verified ✓</span>`
     : `<span class="pill bad">${nbad}/${n} dex rejected</span>`;
 
-  // class list
+  // aggregated class list (every dex, first-wins applied for duplicate descriptors)
   const vec = dk.listClasses();
   allClasses = [];
   for (let i = 0; i < vec.size(); i++) allClasses.push(vec.get(i));
   vec.delete();
   allClasses.sort();
 
-  // static network-IOC (C2) extraction — tied back to the referencing classes
-  statusEl.innerHTML = `<b>${file.name}</b> · scanning for network indicators…`;
+  // class → dex_id placement, for the per-dex view filter. locateClassDex is
+  // an in-memory map lookup; cost is dominated by N wasm marshallings (~25-50ms
+  // on a 5k-class app).
+  perDexClasses = new Map();
+  const perDexCount = new Map();
+  for (const c of allClasses) {
+    const did = dk.locateClassDex(c);
+    perDexClasses.set(c, did);
+    perDexCount.set(did, (perDexCount.get(did) || 0) + 1);
+  }
+  dexInfo = buildDexInfo(rep, perDexCount);
+
+  // network-IOC pass over the full corpus (dumps + apk) — first-wins applied.
+  statusEl.innerHTML = `<b>${label}</b> · scanning for network indicators…`;
   classIoc = new Map(); iocTotals = null;
   try {
     const descriptors = allClasses.slice();
@@ -842,27 +1016,104 @@ async function loadFile(file) {
     computeIocs(dk, descriptors);
   } catch (e) { console.error("IOC extraction failed:", e); iocTotals = null; }
 
-  // The heavy dangerous-permission L2 call-site analysis is deferred until AFTER
-  // the class browser is shown (see analyzePerms), so the page isn't blocked.
   permIndex = []; permTotals = null; permPending = true;
 
-  const statusHead = `<b>${file.name}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}`;
+  const dumpPill = dumpedSources.length
+    ? ` · <span class="pill bad" title="runtime-dumped dexes loaded with priority over the original APK">📦 ${dumpedSources.length} dump${dumpedSources.length === 1 ? "" : "s"}</span>`
+    : "";
+  const statusHead = `<b>${label}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}${dumpPill}`;
   statusEl.innerHTML = statusHead + statusPills();
-  // wait for the outro clip to finish, THEN switch to the class browser
-  await transition;
-  $("#main").classList.add("show");
-  drop.style.display = "none";
-  selectedEl = null; currentClass = null; codeLineCache = [];
-  $("#vname").textContent = "— select a class —"; $("#vmeta").textContent = "";
-  $("#iocbar").classList.add("empty"); $("#iocbar").innerHTML = "";
-  $("#code").innerHTML = '<div class="placeholder">Pick a class on the left to decompile it.' +
-    (iocTotals && iocTotals.total ? ' Classes that reference a network indicator are marked <span class="ioc-badge">⚑</span>, or click any indicator on the right to jump to it.' : "") + '</div>';
-  $("#iocfilter").value = ""; $("#permfilter").value = "";
+
+  if (opts && opts.firstLoad) {
+    await opts.transition;
+    $("#main").classList.add("show");
+    drop.style.display = "none";
+    selectedEl = null; currentClass = null; codeLineCache = [];
+    $("#vname").textContent = "— select a class —"; $("#vmeta").textContent = "";
+    $("#iocbar").classList.add("empty"); $("#iocbar").innerHTML = "";
+    $("#code").innerHTML = '<div class="placeholder">Pick a class on the left to decompile it.' +
+      (iocTotals && iocTotals.total ? ' Classes that reference a network indicator are marked <span class="ioc-badge">⚑</span>, or click any indicator on the right to jump to it.' : "") + '</div>';
+    $("#iocfilter").value = ""; $("#permfilter").value = "";
+    $("#search").value = "";
+  }
+  renderDexBar();
   renderPanels();
-  renderList("");
-  $("#search").value = ""; $("#search").focus();
-  // now run the slow permission analysis in the background and fill its panel
+  renderList($("#search").value || "");
+  if (opts && opts.firstLoad) $("#search").focus();
   setTimeout(() => analyzePerms(statusHead), 30);
+}
+
+// Map verifyReport + per-dex class counts into the per-dex tab model.
+// Multi-source verifyReport is one entry PER ATTEMPTED DEX in source-priority
+// order — dumps first, original last (the rebuild contract). We walk it in
+// lockstep with each source's recorded `slotCount` to attribute each entry to
+// its source. A multidex source's entries get a "label · classes*.dex" label so
+// users see both the file they dropped and the in-zip name; a single-dex source
+// shows just the file name.
+function buildDexInfo(rep, perDexCount) {
+  const sources = [...dumpedSources, originalSource];
+  const out = [];
+  let cursor = 0;
+  for (let si = 0; si < sources.length; si++) {
+    const s = sources[si];
+    const isDump = si < dumpedSources.length;
+    const n = s.slotCount || 0;
+    for (let k = 0; k < n && cursor < rep.length; k++) {
+      const r = rep[cursor++];
+      const sourceLabel = n > 1 ? `${s.label} · ${r.name}` : s.label;
+      out.push({
+        dex_id: r.dex_id,
+        name: r.name,
+        valid: r.valid,
+        reason: r.reason,
+        sourceLabel,
+        dump: isDump,
+        count: r.valid ? (perDexCount.get(r.dex_id) || 0) : 0,
+      });
+    }
+  }
+  return out;
+}
+
+// Render the [all] [classes.dex (N)] [classes2.dex (N)] [+ dump-1.dex] tab bar.
+// Hidden until the first APK loads. Clicking a tab updates `selectedDex` and
+// re-renders the class list filtered to that dex.
+function renderDexBar() {
+  const bar = $("#dexbar");
+  if (!dexInfo.length) { bar.classList.remove("show"); return; }
+  bar.classList.add("show");
+  // tear down old tab buttons, keep the "+ dex" control at the end
+  for (const el of [...bar.querySelectorAll(".dextab")]) el.remove();
+  const addBtn = $("#adddex");
+
+  const makeTab = (label, key, opts) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "dextab" + (key === selectedDex ? " sel" : "") + (opts && opts.dump ? " dump" : "") + (opts && opts.bad ? " bad" : "");
+    b.dataset.key = String(key);
+    b.innerHTML = label + (opts && opts.count != null ? ` <span class="n">${opts.count}</span>` : "");
+    if (opts && opts.title) b.title = opts.title;
+    b.addEventListener("click", () => {
+      if (selectedDex === key) return;
+      selectedDex = key;
+      renderDexBar();                        // refresh .sel state
+      renderList($("#search").value || "");  // refilter
+    });
+    bar.insertBefore(b, addBtn);
+    return b;
+  };
+
+  makeTab("all", "all", { count: allClasses.length, title: "every loaded dex, first-wins applied" });
+  for (const d of dexInfo) {
+    if (!d.valid) {
+      makeTab(d.sourceLabel, "x-" + d.dex_id, { bad: true, title: "rejected at load: " + (d.reason || "verification failed") });
+      continue;
+    }
+    const tip = d.dump
+      ? `runtime-dumped dex (dex_id ${d.dex_id}) — its classes win collisions with the original APK`
+      : `dex_id ${d.dex_id} (${d.count} declared classes)`;
+    makeTab(d.sourceLabel, d.dex_id, { count: d.count, dump: d.dump, title: tip });
+  }
 }
 
 // Network-indicator / permission status pills (composed from current totals).
@@ -994,10 +1245,21 @@ function iocTitle(cd) {
 
 function renderList(filter) {
   const f = filter.toLowerCase().trim();
-  const items = f ? allClasses.filter(c => c.toLowerCase().includes(f)) : allClasses;
-  countEl.textContent = `${items.length} / ${allClasses.length} classes`;
-  // filtered & small → auto-expand so matching classes are visible;
-  // otherwise show collapsed top-level packages.
+  // dex-tab filter is applied BEFORE the text filter so the count line reflects
+  // "matches within the selected dex". "all" keeps the aggregated list.
+  let pool = allClasses;
+  if (selectedDex !== "all") {
+    const did = Number(selectedDex);
+    if (Number.isFinite(did)) pool = allClasses.filter(c => perDexClasses.get(c) === did);
+  }
+  const items = f ? pool.filter(c => c.toLowerCase().includes(f)) : pool;
+  const scopeLabel = selectedDex === "all"
+    ? `${allClasses.length} classes`
+    : (() => {
+        const di = dexInfo.find(d => d.dex_id === Number(selectedDex));
+        return `${pool.length} in ${di ? di.sourceLabel : "dex " + selectedDex}`;
+      })();
+  countEl.textContent = f ? `${items.length} / ${scopeLabel}` : scopeLabel;
   const expand = !!f && items.length <= 1500;
   const root = buildTree(items);
   listEl.innerHTML = "";
