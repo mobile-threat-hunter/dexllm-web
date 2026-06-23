@@ -1603,19 +1603,38 @@ function makeNavRow(label, cat, targets, noun, lazy) {
 }
 
 // Lazy xref helper for IoC rows that landed in iocIndex with no precomputed
-// classes (past the up-front XREF_CAP). Calls xrefStringsToClasses on the
-// main-thread aggregated dk for just this one value, then builds the targets
-// list the same shape makeNavRow expects.
+// classes. Two fallback paths:
+//   1. xrefStringsToClasses — same engine as the bulk pass, runs on just this
+//      one value (covers IoCs past the up-front XREF_CAP).
+//   2. findClassesWithStaticValueString — scans every class's static_values
+//      EncodedArray for a VALUE_STRING match. Covers the "ioc is in a static
+//      field initializer only" case that the L7 string-class search NEVER hits
+//      (it searches method code, not class metadata). The typical example:
+//      `BuildConfig.VERSION_NAME = "2.12.9.2"`. Without this, the IP / domain
+//      / URL would forever read "— none" even though the class is right there.
+//
+// Whatever target it finds, the `hint.needle` carries the IoC value itself, so
+// locateAndGlow finds the line containing the literal — including the field
+// declaration line for the static-initializer case.
 function lazyXrefForIoc(value, cat) {
   return async () => {
     if (!dk) return [];
+    // Path 1: method-code xref (Aho-Corasick over const-string operands).
     const VS = new Module.VectorString();
     VS.push_back(value);
     let perValueClasses;
     try { perValueClasses = dk.xrefStringsToClasses(VS); }
     finally { VS.delete(); }
-    const cls = (perValueClasses && perValueClasses[0]) || [];
-    // Also patch classIoc so the per-class badge updates next render.
+    let cls = (perValueClasses && perValueClasses[0]) || [];
+    // Path 2: static-initializer scan when path 1 came back empty.
+    if (!cls.length) {
+      const r = dk.findClassesWithStaticValueString(value);
+      const arr = [];
+      for (let i = 0; i < r.size(); i++) arr.push(r.get(i));
+      r.delete();
+      cls = arr;
+    }
+    // Patch classIoc so the per-class badge updates on next render.
     for (const cd of cls) {
       let e = classIoc.get(cd);
       if (!e) { e = { urls:new Set(), ips:new Set(), domains:new Set(), emails:new Set(), onion:new Set() }; classIoc.set(cd, e); }
