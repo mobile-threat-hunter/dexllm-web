@@ -72,41 +72,41 @@
   }
   #search:focus { outline:none; border-color:var(--accent); }
   #count { padding:0 12px 6px; color:var(--muted); font-size:11px; }
-  /* per-dex tabs — Chrome-style. The bar sits flush with the sidebar's bottom
-     content area; the active tab's background matches that area so it visually
-     "merges" into the class list (no bottom seam). Inactive tabs are slightly
-     dimmer with a top border. The strip scrolls horizontally instead of
-     wrapping so many tabs stay readable in the 380-px sidebar. */
+  /* per-dex tabs — Chrome-style, pinned to the TOP of the workspace just
+     under the header (above the class browser + viewer). Spans the full width
+     of the page; the active tab's background matches the main content area
+     below so it "merges" with no bottom seam. The strip scrolls horizontally
+     instead of wrapping so a many-dex multi-source load stays readable. */
   #dexbar {
-    display:none; align-items:flex-end; gap:0; padding:6px 8px 0;
-    border-bottom:1px solid var(--border); background:var(--panel);
+    display:none; align-items:flex-end; gap:0; padding:6px 12px 0;
+    border-bottom:1px solid var(--border); background:#050507;
     overflow-x:auto; overflow-y:hidden; scrollbar-width:thin;
-    flex:none; min-height:34px;
+    flex:none; min-height:36px;
   }
   #dexbar.show { display:flex; }
   #dexbar::-webkit-scrollbar { height:5px; }
   #dexbar::-webkit-scrollbar-thumb { background:#ffffff14; border-radius:3px; }
   .dextab {
-    flex:none; padding:6px 12px 7px; border:1px solid var(--border);
-    border-radius:8px 8px 0 0; background:var(--panel);
+    flex:none; padding:7px 14px 8px; border:1px solid var(--border);
+    border-radius:9px 9px 0 0; background:#0a0a0c;
     color:var(--muted); cursor:pointer; position:relative;
     font:12px/1.3 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
-    white-space:nowrap; max-width:200px; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; max-width:240px; overflow:hidden; text-overflow:ellipsis;
     bottom:-1px;             /* drop 1px to overlap the bar's bottom border */
     transition: background 120ms, color 120ms;
   }
   .dextab + .dextab { margin-left:-1px; }   /* tabs share a vertical edge */
-  .dextab:hover { background:#ffffff10; color:var(--fg); z-index:1; }
+  .dextab:hover { background:#15151a; color:var(--fg); z-index:1; }
   .dextab.sel {
-    background:var(--panel);                 /* matches sidebar content area */
+    background:var(--bg);                    /* matches main content background */
     color:var(--fg);
-    border-bottom:1px solid var(--panel);    /* hide the seam under the tab */
+    border-bottom:1px solid var(--bg);       /* hide the seam under the tab */
     font-weight:600;
     z-index:2;
-    box-shadow:0 -1px 0 var(--accent) inset; /* a slim accent underline on the tab top edge */
+    box-shadow:0 -2px 0 var(--accent) inset; /* a slim accent underline on the tab top edge */
   }
   .dextab.dump { color:#ff9a8c; }
-  .dextab.dump.sel { color:#ff9a8c; box-shadow:0 -1px 0 var(--bad) inset; }
+  .dextab.dump.sel { color:#ff9a8c; box-shadow:0 -2px 0 var(--bad) inset; }
   .dextab.bad { color:var(--bad); text-decoration:line-through; }
   .dextab .n {
     display:inline-block; margin-left:6px; padding:1px 6px;
@@ -331,18 +331,20 @@
   <input id="file" type="file" accept=".apk,.dex,.jar,.zip,application/octet-stream">
 </label>
 
+<!-- Per-dex tab bar — Chrome-style, sits at the top of the workspace (above
+     the class browser). Tabs appear once an APK is loaded: [all] for the
+     aggregated view, one tab per classes*.dex inside the APK, plus one tab per
+     dumped dex (drag-drop or via "+ dex"). Dumped dexes are loaded with
+     priority (first-wins, mirrors ART when a packer unpacks a decrypted dex),
+     so their classes WIN collisions with the original APK. -->
+<div id="dexbar">
+  <button id="adddex" type="button" title="Add a runtime-dumped .dex/.apk on top (prefer=true → its classes win collisions)">+ dex</button>
+  <input id="adddexfile" type="file" accept=".dex,.apk,.jar,.zip,application/octet-stream" multiple>
+</div>
+
 <main id="main">
   <div id="sidebar">
     <input id="search" placeholder="filter classes…" autocomplete="off">
-    <!-- per-dex selector. Tabs appear once an APK is loaded: [all] for the
-         aggregated view (current default), one tab per classes*.dex inside the
-         APK, plus one tab per dumped dex (drag-drop or via "+ dex"). Dumped dexes
-         are loaded with priority (first-wins, mirrors ART when a packer unpacks
-         a decrypted dex), so their classes WIN collisions with the original APK. -->
-    <div id="dexbar">
-      <button id="adddex" type="button" title="Add a runtime-dumped .dex/.apk on top (prefer=true → its classes win collisions)">+ dex</button>
-      <input id="adddexfile" type="file" accept=".dex,.apk,.jar,.zip,application/octet-stream" multiple>
-    </div>
     <div id="count"></div>
     <div id="classlist"></div>
   </div>
@@ -1491,7 +1493,9 @@ function renderIocPanel() {
     h.textContent = `${cat} (${items.length})`; body.appendChild(h);
     for (const it of items) {
       body.appendChild(makeNavRow(it.value, it.cat,
-        it.classes.map(c => ({ display: c, cls: c, hint: { needle: it.value } })), "classes"));
+        it.classes.map(c => ({ display: c, cls: c, hint: { needle: it.value } })),
+        "classes",
+        it.classes.length ? null : lazyXrefForIoc(it.value, it.cat)));
       shown++;
     }
   }
@@ -1541,8 +1545,13 @@ function renderPermPanel() {
 const methodNameOf = md => ((md.split("->")[1] || "").split("(")[0]);
 
 // One clickable row: a label + N navigation targets. 1 target → jump directly;
-// several → expand a picker so the user chooses which to open.
-function makeNavRow(label, cat, targets, noun) {
+// several → expand a picker so the user chooses which to open. 0 targets →
+// "— none" but STILL clickable: a lazy xref pass runs on-demand to find the
+// referencing class. (computeIocs caps the up-front xref at XREF_CAP to bound
+// Aho-Corasick cost on string-heavy APKs, so high-rank IoCs may legitimately
+// land in `iocIndex` with no precomputed classes — that's what shows up as
+// "none". The lazy fallback uses the same xref path one value at a time.)
+function makeNavRow(label, cat, targets, noun, lazy) {
   const wrap = document.createElement("div");
   const row = document.createElement("div"); row.className = "iocitem " + cat;
   const val = document.createElement("span"); val.className = "ival"; val.textContent = label;
@@ -1568,14 +1577,72 @@ function makeNavRow(label, cat, targets, noun) {
     };
     wrap.append(row, sub);
     return wrap;
+  } else if (lazy) {
+    // No precomputed classes → fall back to a single-value batched xref. Run
+    // it on the FIRST click so the cost only happens when the user actually
+    // needs it; cache the result on `row` to make subsequent clicks instant.
+    row.style.cursor = "pointer";
+    row.onclick = async () => {
+      cnt.textContent = "…";
+      const found = await lazy();
+      if (!found || !found.length) {
+        cnt.textContent = "— no class found";
+        row.onclick = null;     // give up on subsequent clicks
+        return;
+      }
+      // Patch the row with the resolved targets and trigger an immediate click
+      // path: replace this row with a fresh one and re-fire it.
+      const fresh = makeNavRow(label, cat, found, noun);
+      wrap.replaceWith(fresh);
+      // Auto-fire navigation: if 1 target, jump; else expand picker.
+      fresh.querySelector(".iocitem")?.click();
+    };
   }
   wrap.appendChild(row);
   return wrap;
 }
 
+// Lazy xref helper for IoC rows that landed in iocIndex with no precomputed
+// classes (past the up-front XREF_CAP). Calls xrefStringsToClasses on the
+// main-thread aggregated dk for just this one value, then builds the targets
+// list the same shape makeNavRow expects.
+function lazyXrefForIoc(value, cat) {
+  return async () => {
+    if (!dk) return [];
+    const VS = new Module.VectorString();
+    VS.push_back(value);
+    let perValueClasses;
+    try { perValueClasses = dk.xrefStringsToClasses(VS); }
+    finally { VS.delete(); }
+    const cls = (perValueClasses && perValueClasses[0]) || [];
+    // Also patch classIoc so the per-class badge updates next render.
+    for (const cd of cls) {
+      let e = classIoc.get(cd);
+      if (!e) { e = { urls:new Set(), ips:new Set(), domains:new Set(), emails:new Set(), onion:new Set() }; classIoc.set(cd, e); }
+      e[cat].add(value);
+    }
+    return cls.map(c => ({ display: c, cls: c, hint: { needle: value } }));
+  };
+}
+
 // Jump to a class by descriptor. Reveals/highlights its tree row when visible;
 // always shows the code + IOC bar. `hint` (optional) glows the gated-API line.
+//
+// Force-switches to the "all" tab first if the class isn't visible in the
+// current per-dex view. Without this, clicking an IoC/perm row whose class
+// lives in a different dex (e.g. the user is on dex_1 but the indicator is
+// in dex_0) would route decompile through a source-dk that doesn't have the
+// class, returning an empty body and never glowing the line. "all" uses the
+// multi-source dk which sees every class.
 function navigateToClass(desc, hint) {
+  const pool = selectedDex === "all" ? null : dexClasses.get(Number(selectedDex));
+  const inCurrentTab = !pool || pool.includes(desc);
+  if (!inCurrentTab) {
+    selectedDex = "all";
+    currentClass = null; codeLineCache = [];   // bust caches so re-decompile happens
+    renderDexBar();
+    renderList($("#search").value || "");
+  }
   const row = [...listEl.querySelectorAll(".cls")].find(e => e.title === desc);
   selectClass(desc, row || null, hint);
   if (row) row.scrollIntoView({ block: "center", behavior: "instant" });
@@ -1625,7 +1692,12 @@ function selectClass(cls, el, hint) {
     if (hint) locateAndGlow(hint);
   }).catch(err => {
     if (currentClass !== reqClass) return;
-    renderCode("// decompile failed: " + (err.message || err));
+    // err.message is the string the worker's describeError produced. Fall
+    // back to a manual stringify so we never render "[object Object]".
+    const m = (err && err.message) ? String(err.message)
+            : typeof err === "string" ? err
+            : (() => { try { return JSON.stringify(err); } catch (_) { return Object.prototype.toString.call(err); } })();
+    renderCode("// decompile failed: " + m);
     $("#vmeta").textContent = "decompile failed" + dexNote;
   });
 }

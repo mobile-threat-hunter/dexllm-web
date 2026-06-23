@@ -46,11 +46,24 @@ function ensureInit() {
   return initPromise;
 }
 
-function getExceptionMessage(err) {
-  if (err && Module && Module.getExceptionMessage && err.excPtr != null) {
-    try { return Module.getExceptionMessage(err.excPtr); } catch (_) {}
+// Always returns a STRING — never an array or object — so the main thread's
+// `new Error(e.data.error)` never stringifies to "[object Object]". emscripten
+// 6.x's getExceptionMessage returns [type, message]; older versions a plain
+// string. Plain Error / RuntimeError have .message; everything else falls
+// through to JSON.stringify then Object.toString.
+function describeError(err) {
+  if (err == null) return "unknown error";
+  if (Module && Module.getExceptionMessage && err.excPtr != null) {
+    try {
+      const r = Module.getExceptionMessage(err.excPtr);
+      if (Array.isArray(r)) return r.filter(Boolean).join(": ");
+      if (typeof r === "string" && r) return r;
+    } catch (_) {}
   }
-  return err && err.message ? err.message : String(err);
+  if (typeof err === "string") return err;
+  if (err.message) return String(err.message);
+  try { const s = JSON.stringify(err); if (s && s !== "{}") return s; } catch (_) {}
+  return Object.prototype.toString.call(err);
 }
 
 function resetState() {
@@ -116,26 +129,36 @@ function handleDecompile({ cls, sourceIdx }) {
   return useDk.decompileClassJava(cls);
 }
 
-self.onmessage = async (e) => {
-  const msg = e.data;
-  const { id, type } = msg;
-  try {
-    if (type === "init") {
-      // Sync the build SHA used for cache-busting; then proceed to lazy init.
-      BUILD_SHA = msg.buildSha || "";
+// Serialize all messages through a single in-order queue. Each onmessage call
+// pushes a job onto `queue`; the queue resolves jobs one at a time, so a
+// `decompile` posted right after `load` is guaranteed to see `dk != null`. The
+// previous version awaited ensureInit() per-message and let handlers race,
+// which let `handleDecompile` run before `handleLoad` finished writing the
+// VFS file — surfaced as "decompile failed: no source loaded" on the main
+// thread (stringified through new Error → "[object Object]" before the
+// describeError fix in this commit).
+let queue = Promise.resolve();
+self.onmessage = (e) => {
+  queue = queue.then(async () => {
+    const msg = e.data;
+    const { id, type } = msg;
+    try {
+      if (type === "init") {
+        BUILD_SHA = msg.buildSha || "";
+        await ensureInit();
+        self.postMessage({ id, ok: true, result: { ready: true } });
+        return;
+      }
       await ensureInit();
-      self.postMessage({ id, ok: true, result: { ready: true } });
-      return;
+      let result;
+      if (type === "load")          result = await handleLoad(msg);
+      else if (type === "addDump")  result = await handleAddDump(msg);
+      else if (type === "decompile") result = handleDecompile(msg);
+      else if (type === "reset")    { resetState(); result = {}; }
+      else throw new Error("unknown message type: " + type);
+      self.postMessage({ id, ok: true, result });
+    } catch (err) {
+      self.postMessage({ id, ok: false, error: describeError(err) });
     }
-    await ensureInit();
-    let result;
-    if (type === "load")       result = await handleLoad(msg);
-    else if (type === "addDump") result = await handleAddDump(msg);
-    else if (type === "decompile") result = handleDecompile(msg);
-    else if (type === "reset") { resetState(); result = {}; }
-    else throw new Error("unknown message type: " + type);
-    self.postMessage({ id, ok: true, result });
-  } catch (err) {
-    self.postMessage({ id, ok: false, error: getExceptionMessage(err) });
-  }
+  });
 };
