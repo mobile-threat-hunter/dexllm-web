@@ -352,12 +352,22 @@ let dangerMap = null;            // permission -> [pkg.Class#method] (AOSP dange
 // dumps FIRST, original APK last → ART-style first-wins makes the dumped class
 // win a collision (mirrors the packer-unpack workflow described in
 // dexllm.add_dumped_dexes). vfsBytes lets us reconstruct the DexKit cheaply.
-let originalSource = null;       // {vfs, label} for the initial APK/dex
-let dumpedSources  = [];         // [{vfs, label}, …] in insertion order (first-added wins)
+//
+// Each `sources[i]` keeps its own STANDALONE single-source DexKit alive so the
+// per-dex view can decompile the LOSER of a cross-source first-wins collision
+// (e.g. a class present in BOTH the dump and the original — multi-source dk
+// hands you the dump's version, but the user can still inspect the original's
+// version by selecting that tab; this routes the call to originalSource.dk).
+// Within a multidex source, first-wins still applies inside that source's dk —
+// a class declared in both classes.dex and classes2.dex of the SAME apk only
+// decompiles to classes.dex's version (a known, rare limitation).
+let originalSource = null;       // {vfs, label, slotCount, dk, baseDexId}
+let dumpedSources  = [];         // [{vfs, label, slotCount, dk, baseDexId}, …]
 const vfsBytes = new Map();      // vfs path -> ArrayBuffer (kept so we can rebuild)
-let dexInfo = [];                // per-dex: [{dex_id, name, valid, reason, sourceLabel, dump, count}]
+let dexInfo = [];                // per-dex: [{dex_id, name, valid, reason, sourceLabel, dump, count, sourceIdx, localDexId}]
 let selectedDex = "all";         // "all" | <dex_id:number>; class list filter
-let perDexClasses = new Map();   // class descriptor -> dex_id (filled via locateClassDex)
+let dexClasses = new Map();      // dex_id -> [classDescriptor, …] (from listClassesInDex; no dedup)
+let dexIdToSource = new Map();   // dex_id -> source entry (for decompile routing)
 const $ = s => document.querySelector(s);
 const statusEl = $("#status");
 
@@ -874,6 +884,10 @@ async function loadFile(file) {
   // path stays stable lets the rebuild flow (multi-source ctor) reuse it.
   for (const v of vfsBytes.keys()) { try { Module.FS.unlink(v); } catch (_) {} }
   vfsBytes.clear();
+  // Tear down any cached per-source DexKits from the prior load (each owns
+  // a wasm heap allocation that won't be released until .delete()).
+  for (const s of dumpedSources) { try { s.dk && s.dk.delete(); } catch (_) {} }
+  if (originalSource && originalSource.dk) { try { originalSource.dk.delete(); } catch (_) {} }
   dumpedSources = [];
   try { Module.FS.writeFile("/input.bin", buf); } catch (_) {
     try { Module.FS.unlink("/input.bin"); } catch (_) {} Module.FS.writeFile("/input.bin", buf);
@@ -883,8 +897,9 @@ async function loadFile(file) {
   if (dk) { try { dk.delete(); } catch (_) {} dk = null; }
 
   let t0 = performance.now();
+  let standaloneDk;
   try {
-    dk = new Module.WasmDexKit("/input.bin");
+    standaloneDk = new Module.WasmDexKit("/input.bin");
   } catch (err) {
     const msg = (Module.getExceptionMessage && err && err.excPtr != null)
       ? Module.getExceptionMessage(err.excPtr) : err;
@@ -893,10 +908,20 @@ async function loadFile(file) {
     return;
   }
   const loadMs = (performance.now() - t0).toFixed(0);
-  // Record this source's slot count so we can attribute multi-source verifyReport
-  // entries back to it after a dump is added. Slot count = attempted dexes
-  // (length of verifyReport), NOT dexCount() (which excludes rejected).
-  originalSource = { vfs: "/input.bin", label: file.name, slotCount: dk.verifyReport().length };
+  // Keep the standalone single-source DexKit alongside `dk` so the per-dex
+  // tab can route decompile calls to it (lets the user see the LOSER of a
+  // cross-source first-wins collision). slotCount = attempted dexes (length
+  // of verifyReport), NOT dexCount() (which excludes rejected ones).
+  originalSource = {
+    vfs: "/input.bin",
+    label: file.name,
+    slotCount: standaloneDk.verifyReport().length,
+    dk: standaloneDk,
+    baseDexId: 0,    // recomputed by computeBaseDexIds
+  };
+  // No dumps yet → `dk` IS the standalone original. Each source's `dk` is
+  // disjoint from `dk` only when multi-source; when single-source they alias.
+  dk = standaloneDk;
 
   await processCurrentDk(file.name, loadMs, { firstLoad: true, transition });
 }
@@ -905,18 +930,38 @@ async function loadFile(file) {
 // so first-wins resolution makes their classes win a collision (mirrors ART
 // after a packer unpack — `add_dumped_dexes(prefer=True)` in dexllm proper).
 // lenient=true so a partially-decrypted dump still loads under ART-structural-
-// equivalent verification.
+// equivalent verification. The standalone per-source DexKits (kept on each
+// source entry's `.dk`) are NOT replaced — they survive rebuilds so per-dex
+// decompile routing keeps working.
 function rebuildDk() {
-  if (dk) { try { dk.delete(); } catch (_) {} dk = null; }
-  if (!dumpedSources.length) {
-    dk = new Module.WasmDexKit(originalSource.vfs);
-    return;
-  }
+  // Drop only the aggregated multi-source dk (if it doesn't alias a per-source
+  // standalone — the no-dumps case where dk === originalSource.dk).
+  const aliasesOrig = dk === (originalSource && originalSource.dk);
+  if (dk && !aliasesOrig) { try { dk.delete(); } catch (_) {} }
+  dk = null;
+  if (!dumpedSources.length) { dk = originalSource.dk; return; }
   const VS = new Module.VectorString();
   for (const d of dumpedSources) VS.push_back(d.vfs);
   VS.push_back(originalSource.vfs);
   try { dk = new Module.WasmDexKit(VS, /*lenient=*/true); }
   finally { VS.delete(); }
+}
+
+// (Re)compute each source's `baseDexId` (where its dexes start in the multi-
+// source layout) and the `dexIdToSource` map (global dex_id → owning source).
+// Sources are walked in priority order: dumps first, then original. Each
+// source contributes its `slotCount` consecutive dex_ids.
+function computeBaseDexIds() {
+  dexIdToSource = new Map();
+  let cursor = 0;
+  for (let si = 0; si < dumpedSources.length; si++) {
+    const s = dumpedSources[si];
+    s.baseDexId = cursor;
+    for (let k = 0; k < s.slotCount; k++) dexIdToSource.set(cursor + k, s);
+    cursor += s.slotCount;
+  }
+  originalSource.baseDexId = cursor;
+  for (let k = 0; k < originalSource.slotCount; k++) dexIdToSource.set(cursor + k, originalSource);
 }
 
 // Add a runtime-dumped .dex (or .apk holding dexes) on top of the current load.
@@ -937,24 +982,29 @@ async function addDumpedDex(file) {
   }
   vfsBytes.set(vfs, buf);
 
-  // Single-load the dump first to capture its slot count (attempted dexes),
-  // needed for correctly attributing multi-source verifyReport entries back to
-  // each source in the per-dex tab bar. lenient=true so partial decrypts probe.
+  // Single-load the dump as a standalone DexKit, kept ALIVE alongside the
+  // aggregated multi-source dk. The per-dex view routes decompile calls to
+  // this standalone dk when the user picks a tab whose dex belongs to this
+  // dump — that lets them see the dump's version of a class even when a
+  // higher-priority dump (or, in the orig-tab case, the dump itself) wins
+  // the global first-wins. Slot count = verifyReport length (attempted
+  // dexes), not dexCount() (loaded). lenient is implicit for the standalone
+  // — partial decrypts will be lenient-loaded on the multi-source rebuild.
   const t0 = performance.now();
-  let slotCount;
+  let standaloneDk, slotCount;
   try {
-    const probe = new Module.WasmDexKit(vfs);
-    slotCount = probe.verifyReport().length;
-    probe.delete();
+    standaloneDk = new Module.WasmDexKit(vfs);
+    slotCount = standaloneDk.verifyReport().length;
   } catch (err) {
     const msg = (Module.getExceptionMessage && err && err.excPtr != null)
       ? Module.getExceptionMessage(err.excPtr) : err;
     statusEl.innerHTML = `<span class="pill bad">dump load failed</span> ${msg}`;
+    if (standaloneDk) { try { standaloneDk.delete(); } catch (_) {} }
     try { Module.FS.unlink(vfs); } catch (_) {}
     vfsBytes.delete(vfs);
     return;
   }
-  dumpedSources.push({ vfs, label: file.name, slotCount });
+  dumpedSources.push({ vfs, label: file.name, slotCount, dk: standaloneDk, baseDexId: 0 });
 
   try {
     rebuildDk();
@@ -962,7 +1012,8 @@ async function addDumpedDex(file) {
     const msg = (Module.getExceptionMessage && err && err.excPtr != null)
       ? Module.getExceptionMessage(err.excPtr) : err;
     statusEl.innerHTML = `<span class="pill bad">dump load failed</span> ${msg}`;
-    dumpedSources.pop();
+    const popped = dumpedSources.pop();
+    if (popped) { try { popped.dk.delete(); } catch (_) {} }
     try { Module.FS.unlink(vfs); } catch (_) {}
     vfsBytes.delete(vfs);
     rebuildDk();
@@ -985,23 +1036,32 @@ async function processCurrentDk(label, loadMs, opts) {
     ? `<span class="pill ok">verified ✓</span>`
     : `<span class="pill bad">${nbad}/${n} dex rejected</span>`;
 
-  // aggregated class list (every dex, first-wins applied for duplicate descriptors)
-  const vec = dk.listClasses();
-  allClasses = [];
-  for (let i = 0; i < vec.size(); i++) allClasses.push(vec.get(i));
-  vec.delete();
-  allClasses.sort();
-
-  // class → dex_id placement, for the per-dex view filter. locateClassDex is
-  // an in-memory map lookup; cost is dominated by N wasm marshallings (~25-50ms
-  // on a 5k-class app).
-  perDexClasses = new Map();
+  // Per-dex class listing — listClassesInDex returns ALL classes declared in
+  // each specific dex, NOT first-wins-deduped. So a class declared in both a
+  // dump and the original APK appears in BOTH dex tabs. This is the whole point
+  // of the per-dex view ("각 dex마다 있어도 개별 덱스에서는 볼 수 있어야 한다").
+  dexClasses = new Map();
   const perDexCount = new Map();
-  for (const c of allClasses) {
-    const did = dk.locateClassDex(c);
-    perDexClasses.set(c, did);
-    perDexCount.set(did, (perDexCount.get(did) || 0) + 1);
+  for (let did = 0; did < dk.dexCount(); did++) {
+    const v = dk.listClassesInDex(did);
+    const arr = []; for (let i = 0; i < v.size(); i++) arr.push(v.get(i));
+    v.delete();
+    arr.sort();
+    dexClasses.set(did, arr);
+    perDexCount.set(did, arr.length);
   }
+  // Aggregated `allClasses` is the deduped union (sorted) — what the "all" tab
+  // shows. Each class appears once even if multiple dexes declare it; the
+  // global decompile (first-wins) handles the resolution.
+  {
+    const seen = new Set();
+    for (const arr of dexClasses.values()) for (const c of arr) seen.add(c);
+    allClasses = [...seen].sort();
+  }
+
+  // Establish baseDexId per source + global dex_id → source mapping before
+  // buildDexInfo / decompile routing rely on it.
+  computeBaseDexIds();
   dexInfo = buildDexInfo(rep, perDexCount);
 
   // network-IOC pass over the full corpus (dumps + apk) — first-wins applied.
@@ -1069,6 +1129,8 @@ function buildDexInfo(rep, perDexCount) {
         sourceLabel,
         dump: isDump,
         count: r.valid ? (perDexCount.get(r.dex_id) || 0) : 0,
+        sourceIdx: si,
+        localDexId: k,
       });
     }
   }
@@ -1096,6 +1158,10 @@ function renderDexBar() {
     b.addEventListener("click", () => {
       if (selectedDex === key) return;
       selectedDex = key;
+      // Tab switch changes the source the next decompile routes to — bust the
+      // "same class still on screen" cache so a re-click re-decompiles via the
+      // newly-selected source's dk.
+      currentClass = null; codeLineCache = [];
       renderDexBar();                        // refresh .sel state
       renderList($("#search").value || "");  // refilter
     });
@@ -1246,11 +1312,13 @@ function iocTitle(cd) {
 function renderList(filter) {
   const f = filter.toLowerCase().trim();
   // dex-tab filter is applied BEFORE the text filter so the count line reflects
-  // "matches within the selected dex". "all" keeps the aggregated list.
+  // "matches within the selected dex". "all" uses the deduped union; a specific
+  // dex tab uses listClassesInDex's output for THAT dex — so a class declared
+  // in multiple dexes (cross-source overlap) shows up in EACH of its tabs.
   let pool = allClasses;
   if (selectedDex !== "all") {
     const did = Number(selectedDex);
-    if (Number.isFinite(did)) pool = allClasses.filter(c => perDexClasses.get(c) === did);
+    if (Number.isFinite(did)) pool = dexClasses.get(did) || [];
   }
   const items = f ? pool.filter(c => c.toLowerCase().includes(f)) : pool;
   const scopeLabel = selectedDex === "all"
@@ -1480,11 +1548,27 @@ function selectClass(cls, el, hint) {
   $("#vmeta").textContent = "decompiling…";
   $("#code").textContent = "";
   renderIocBar(cls);
-  // let the UI paint before the (synchronous) decompile
+  // Route the decompile call. In "all" mode (and when the selected dex is the
+  // multi-source first-wins winner) we use the aggregated dk. When a specific
+  // dex tab is active, route to that dex's owning SOURCE so cross-source
+  // overlap shows the right version (e.g. the original APK's class when the
+  // user is on the original's tab, even though a dump's version is the global
+  // winner). The source's standalone dk still applies first-wins WITHIN that
+  // source — a known, rare limitation for within-source multidex collisions.
+  let useDk = dk, dexNote = "";
+  if (selectedDex !== "all") {
+    const did = Number(selectedDex);
+    const src = dexIdToSource.get(did);
+    if (src && src.dk) {
+      useDk = src.dk;
+      const di = dexInfo.find(d => d.dex_id === did);
+      if (di) dexNote = ` · from ${di.sourceLabel}`;
+    }
+  }
   setTimeout(() => {
     let t0 = performance.now();
     let java;
-    try { java = dk.decompileClassJava(cls); }
+    try { java = useDk.decompileClassJava(cls); }
     catch (err) {
       const msg = (Module.getExceptionMessage && err && err.excPtr != null)
         ? Module.getExceptionMessage(err.excPtr) : err;
@@ -1492,7 +1576,7 @@ function selectClass(cls, el, hint) {
     }
     const ms = (performance.now() - t0).toFixed(0);
     renderCode(java || "// (empty — external/abstract class)");
-    $("#vmeta").textContent = `${java.length} chars · ${ms}ms` +
+    $("#vmeta").textContent = `${java.length} chars · ${ms}ms${dexNote}` +
       (renderCode.plainLarge ? " · plain (large)" : "");
     if (hint) locateAndGlow(hint);
   }, 0);
