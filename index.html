@@ -2509,27 +2509,59 @@ function isMethodDeclaration(line, name) {
   return /\w\s*$/.test(before);
 }
 
-// Receiver class for a method call on this line, if we can read it off the
-// text. Patterns we handle:
-//   ClassName.method(            → "ClassName" (dotted qualified path OK)
-//   pkg.sub.ClassName.method(    → "pkg.sub.ClassName"
+// Receiver class for a method call on this line. Patterns:
+//   ClassName.method(            → "LClassName;"
+//   pkg.sub.ClassName.method(    → "Lpkg/sub/ClassName;"
 //   this.method(  or  method(    → null (caller is the current class)
-//   var.method(                  → null (variable receiver; can't infer type
-//                                  from one line without a full IR — fall back
-//                                  to currentClass declaration search)
-function receiverClassOf(line, name) {
+//   var.method(                  → look up var's type via inferVariableType
+//                                   (DAD's `vN_M` locals, `pN` params)
+// `lineIdx` is the codeLineCache index of the call line, needed for the
+// variable-receiver scan.
+function receiverClassOf(line, name, lineIdx) {
   const idx = line.indexOf(name + "(");
   if (idx < 0) return null;
   const before = line.slice(0, idx);
-  // Capture trailing "X.Y.Z." dotted-path with at least one Uppercase segment.
   const m = before.match(/([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\.\s*$/);
   if (!m) return null;
   const path = m[1];
-  // Require at least one Uppercase segment OR multiple dotted segments —
-  // distinguishes a class-qualified call from a variable-qualified one.
-  if (!/[A-Z]/.test(path.charAt(0)) && !path.includes(".")) return null;
-  return "L" + path.replace(/\./g, "/") + ";";
+  // Class-qualified call: last segment uppercase OR multi-segment dotted path
+  // whose last segment is uppercase.
+  const lastSeg = path.split(".").pop();
+  if (/^[A-Z]/.test(lastSeg)) return "L" + path.replace(/\./g, "/") + ";";
+  // Variable receiver — infer type via reverse scan.
+  if (lineIdx != null) {
+    const t = inferVariableType(path, lineIdx);
+    if (t) return t;
+  }
+  return null;
 }
+
+// SMALI-BASED CALLEE RESOLUTION
+// Every invoke-* instruction in a method's smali carries the EXACT
+// `Lcls;->name(proto)Ret` of its target — the bytecode answer to "what does
+// this method call?" that no decompile-text inference can match. We render
+// the smali of the enclosing method on demand and parse out the invoke lines
+// whose name matches the clicked token. Cached per method descriptor so a
+// session of clicks inside one method only renders smali once.
+const _smaliInvokesCache = new Map();   // methodDesc → [{descriptor, kind, offset}]
+function smaliInvokesFrom(useDk, methodDesc) {
+  if (_smaliInvokesCache.has(methodDesc)) return _smaliInvokesCache.get(methodDesc);
+  let smali;
+  try { smali = useDk.renderMethodSmali(methodDesc); }
+  catch (_) { _smaliInvokesCache.set(methodDesc, []); return []; }
+  const invokes = [];
+  // Each line looks like
+  //   `<offset>: invoke-<kind> {regs}, Lcls;->name(proto)Ret`
+  // We grab the target after the last `, ` per line.
+  const RE = /^\s*(?:0x[0-9a-f]+\s*:\s*)?invoke-([a-z\/-]+)\s*\{[^}]*\}\s*,\s*(L[\w\/$]+;->[^\s(]+\([^)]*\)[^\s]+)/i;
+  for (const line of smali.split("\n")) {
+    const m = line.match(RE);
+    if (m) invokes.push({ kind: m[1], descriptor: m[2] });
+  }
+  _smaliInvokesCache.set(methodDesc, invokes);
+  return invokes;
+}
+function clearSmaliCacheForClass(/* cls */) { _smaliInvokesCache.clear(); }
 
 const methodOfDescriptor = (md) => ((md.split("->")[1] || "").split("("))[0];
 
@@ -2653,25 +2685,145 @@ function showCallersFor(cls, name, anchor) {
 //   - Else, search WITHIN the current class for the method declaration.
 //   - In Isolated mode: only navigate if the target class is loaded in the
 //     active dex; otherwise show a small toast saying "not in this dex".
-function navigateToCalleeMethod(currentCls, name, line) {
-  const recv = receiverClassOf(line, name);
-  const target = recv || currentCls;
-  if (viewMode === "isolated") {
-    const iso = isolated.get(selectedDex);
-    if (iso && iso.classes && !iso.classes.includes(target)) {
-      flashToast("'" + name + "' target not in this dex");
-      return;
+// Find the enclosing method name by walking back from `lineIdx` looking for
+// a method-header line. We then resolve the full descriptor via
+// listClassMethods, since DAD's text emits only the simple name.
+function findEnclosingMethodName(lineIdx) {
+  for (let i = lineIdx; i >= 0; i--) {
+    const line = codeLineCache[i];
+    if (!line) continue;
+    if (!/^\s*(public|private|protected|static|final|abstract|synchronized|native)\b/.test(line)) continue;
+    if (!line.includes("(")) continue;
+    // Capture `name(` — the LAST identifier before `(` is the method name
+    // (a return type may precede it; we want the closest to `(` ).
+    const open = line.indexOf("(");
+    const before = line.slice(0, open);
+    const m = before.match(/([a-zA-Z_$<][\w$<>]*)\s*$/);
+    if (m) return m[1];
+  }
+  return null;
+}
+function findEnclosingMethodDescriptor(cls, lineIdx, useDk) {
+  const mname = findEnclosingMethodName(lineIdx);
+  if (!mname) return null;
+  const ms = useDk.listClassMethods(cls);
+  let desc = null;
+  for (let i = 0; i < ms.size(); i++) {
+    const md = ms.get(i);
+    if (md.indexOf("->" + mname + "(") > 0) { desc = md; break; }
+  }
+  ms.delete();
+  return desc;
+}
+
+// Ask dexkit: among all methods named `calleeName`, which ones are actually
+// invoked from `callerDesc`? Each invoke in dex bytecode names its target by
+// method_idx (class + name + proto), so this is the ground-truth answer that
+// `v0_1 = new Pkg.Cls(); v0_1.x()` -style text-only inference can't reach.
+// Returns the matching callee descriptors. For names with many same-named
+// methods across the dex (e.g. toString), this still terminates quickly
+// because most candidates' callers don't include our caller.
+function findCalleesFromMethod(useDk, callerDesc, calleeName) {
+  const cands = useDk.findMethodsByName(calleeName, "equals", "", false);
+  const out = [];
+  for (let i = 0; i < cands.size(); i++) {
+    const candDesc = cands.get(i).descriptor;
+    let cs;
+    try { cs = useDk.findCallSitesToApi(candDesc); }
+    catch (_) { continue; }
+    for (let j = 0; j < cs.size(); j++) {
+      if (cs.get(j) === callerDesc) { out.push(candDesc); break; }
     }
-  } else if (recv) {
-    // In Runtime, verify the class is actually loaded somewhere (cheap check).
-    if (dk.locateClassDex(target) < 0) {
-      // Class isn't loaded — silently fall back to a same-class search so the
-      // user still gets something useful (the local declaration if it exists).
-      navigateToClass(currentCls, { needle: name, scope: name });
+    cs.delete();
+  }
+  cands.delete();
+  return out;
+}
+
+function navigateToCalleeMethod(currentCls, name, line, lineIdx) {
+  const useDk = activeQueryDk();
+  // 1) SMALI path — the dex-bytecode-faithful answer. Find the enclosing
+  //    method, render its smali, look for invoke-* lines whose method name
+  //    matches the clicked token. Each invoke carries Lcls;->name(proto)Ret.
+  const callerDesc = findEnclosingMethodDescriptor(currentCls, lineIdx, useDk);
+  if (callerDesc) {
+    const invokes = smaliInvokesFrom(useDk, callerDesc);
+    const matches = invokes.filter(iv => {
+      const after = iv.descriptor.indexOf("->");
+      if (after < 0) return false;
+      const rest = iv.descriptor.slice(after + 2);
+      const open = rest.indexOf("(");
+      return open > 0 && rest.slice(0, open) === name;
+    });
+    if (matches.length === 1) {
+      const targetCls = matches[0].descriptor.split("->")[0];
+      return _navigateAfterClassCheck(targetCls, name);
+    }
+    if (matches.length > 1) {
+      // Multiple invokes of methods named `name` from this caller — e.g.
+      // `obj.equals(x)` and `other.equals(y)`. Surface a picker.
+      showCalleePicker(matches.map(iv => iv.descriptor), name);
       return;
     }
   }
-  navigateToClass(target, { needle: name, scope: name });
+  // 2) Receiver text fallback when smali resolution found nothing (e.g.
+  //    inlined method, abstract method, native, or text-only references).
+  const recv = receiverClassOf(line, name, lineIdx);
+  if (recv && /^L[\w\/$]+;$/.test(recv)) {
+    return _navigateAfterClassCheck(recv, name);
+  }
+  // 3) Last resort: same-class declaration search.
+  return _navigateAfterClassCheck(currentCls, name);
+}
+
+// Picker — reuses the callers popup chrome. Each item navigates to the
+// chosen overload / receiver class.
+function showCalleePicker(descriptors, name) {
+  const pop = $("#callerpop");
+  $("#callerpop-method").textContent = name;
+  const body = $("#callerpop-body");
+  body.innerHTML = "";
+  pop.classList.add("show");
+  // Anchor near the current selection; recenter at the cursor's last
+  // mouse position approximated by the viewer's top-left.
+  const viewer = $("#viewer").getBoundingClientRect();
+  pop.style.left = Math.max(12, viewer.left + 40) + "px";
+  pop.style.top  = Math.max(80, viewer.top + 60) + "px";
+  const head = document.createElement("div");
+  head.className = "callerpop-empty";
+  head.style.color = "var(--fg-3)";
+  head.textContent = "pick one:";
+  body.appendChild(head);
+  for (const desc of descriptors) {
+    const item = document.createElement("div");
+    item.className = "callerpop-item";
+    item.textContent = desc;
+    item.title = desc;
+    const targetCls = desc.split("->")[0];
+    item.onclick = () => {
+      pop.classList.remove("show");
+      _navigateAfterClassCheck(targetCls, name);
+    };
+    body.appendChild(item);
+  }
+}
+
+function _navigateAfterClassCheck(targetCls, name) {
+  if (viewMode === "isolated") {
+    const iso = isolated.get(selectedDex);
+    if (iso && iso.classes && !iso.classes.includes(targetCls)) {
+      flashToast("'" + name + "' target not in this dex");
+      return;
+    }
+  } else {
+    if (dk.locateClassDex(targetCls) < 0 && targetCls !== currentClass) {
+      // Target class isn't loaded in any source — silently fall back to a
+      // same-class search so the user still gets something useful.
+      navigateToClass(currentClass, { needle: name, scope: name });
+      return;
+    }
+  }
+  navigateToClass(targetCls, { needle: name, scope: name });
 }
 
 // Brief floating toast for inline navigation failures (mainly Isolated's
@@ -2703,7 +2855,7 @@ $("#code").addEventListener("click", (e) => {
   if (isMethodDeclaration(info.line, name)) {
     showCallersFor(currentClass, name, target);
   } else {
-    navigateToCalleeMethod(currentClass, name, info.line);
+    navigateToCalleeMethod(currentClass, name, info.line, info.idx);
   }
 });
 
