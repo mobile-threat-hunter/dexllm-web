@@ -1450,6 +1450,10 @@ function setMode(newMode) {
     ensureIsolated();
     activateStandaloneTab(selectedDex);
   } else {
+    // Runtime has only the [all] tab. Force-snap selection back to it so a
+    // user that was on dex_1 in standalone doesn't end up on a now-invisible
+    // tab key after the switch.
+    selectedDex = "all";
     if (runtimePanelSnap) restorePanels(runtimePanelSnap);
     statusEl.innerHTML = runtimeStatusHead || statusEl.innerHTML;
   }
@@ -1502,10 +1506,22 @@ function renderDexBar() {
     return b;
   };
 
+  // Runtime mode = the ART-running aggregate view. Only one tab — there is no
+  // meaningful per-dex split when classes have already been merged with
+  // first-wins resolution. Per-dex inspection lives in Standalone.
   if (viewMode === "runtime") {
-    makeTab(`<span class="ico">▦</span>all`, "all",
-      { count: allClasses.length, title: "every loaded dex, first-wins applied (runtime mode)" });
+    const dumpCount = dumpedSources.length;
+    const dumpHint = dumpCount ? ` <span class="n" style="background:#da363344;color:#ff9a8c">+${dumpCount} dump${dumpCount === 1 ? "" : "s"}</span>` : "";
+    const baseLabel = originalSource ? escAttr(originalSource.label) : "all";
+    makeTab(`<span class="ico">▦</span>${baseLabel}${dumpHint}`, "all", {
+      count: allClasses.length,
+      title: `Runtime view — the APK's classes*.dex loaded in order` +
+             (dumpCount ? `, then ${dumpCount} dumped dex(es) patched on top (their classes win collisions, mirroring ART after a packer unpack)` : "") +
+             `. Switch to Standalone to inspect each dex in isolation.`,
+    });
+    return;
   }
+  // Standalone: one tab per loaded dex, no aggregate.
   for (const d of dexInfo) {
     const icon = d.dump ? "📦" : "📄";
     const labelHtml = `<span class="ico">${icon}</span>` + escAttr(d.sourceLabel);
@@ -1514,8 +1530,8 @@ function renderDexBar() {
       continue;
     }
     const tip = d.dump
-      ? `runtime-dumped dex (dex_id ${d.dex_id}) — its classes win collisions with the original APK in runtime mode`
-      : `dex_id ${d.dex_id} (${d.count} declared classes)`;
+      ? `runtime-dumped dex (dex_id ${d.dex_id}) — inspected in isolation`
+      : `dex_id ${d.dex_id} (${d.count} declared classes) — inspected in isolation`;
     makeTab(labelHtml, d.dex_id, { count: d.count, dump: d.dump, title: tip });
   }
 }
