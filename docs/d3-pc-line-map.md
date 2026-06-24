@@ -3,6 +3,10 @@
 **Status:** spec / design — not yet implemented.
 **Target repo:** `mobile-threat-hunter/dex-analyzer-for-llm` (the dexllm core).
 **Consumer:** dexllm-web (this repo), bucket D-3 in [`docs/xref.md`](xref.md).
+**Tracking:** [dexllm#1](https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/issues/1).
+**Revision history:** v2 (2026-06-24) — three corrections from design review applied.
+See [§ Design-review corrections](#design-review-corrections) at the bottom for
+what changed vs. the v1 draft and why.
 
 The xref subsystem currently has 8 of 16 JEB/jadx-parity gaps implementable
 with existing dexkit primitives (bucket A — landed). Bucket D's only entry is
@@ -64,93 +68,157 @@ already used in `RawIns::branch_target` for "N/A" — consistent.
 
 ### Step 2 — set `source_byte_off` at IR construction time
 
-Files: `native/dad_cpp/opcode_ins.cpp` (the 229 handlers), `instruction.cpp`,
-`basic_blocks.cpp`.
+File: `native/dad_cpp/basic_blocks.cpp` — **single stamp site**.
 
-Each `OpcodeHandler` already receives the `RawIns` (or its decoded form) it's
-processing — that's where IR nodes are created. At each construction site:
+Every dex instruction is funneled through `DispatchInstruction(const RawIns& ri, …)`
+([`instruction_dispatch.cpp:131`](../../dex-analyzer-for-llm/blob/master/native/dad_cpp/instruction_dispatch.cpp))
+which returns one `IRFormPtr` per instruction. `BuildNodeFromBlock`
+([`basic_blocks.cpp:544`](../../dex-analyzer-for-llm/blob/master/native/dad_cpp/basic_blocks.cpp))
+takes that return value and pushes it into the block's `lins` vector. That
+push is the canonical "statement-level IR node was just created" event — one
+stamp there covers every IR node that the Writer / JSONWriter ever sees:
 
 ```cpp
-// Before (existing):
-auto node = std::make_shared<NewInstance>(...);
+// basic_blocks.cpp:544 — before
+IRFormPtr ir = DispatchInstruction(ri, vmap, gen_ret, payload, exception_type);
+if (ir) lins.push_back(std::move(ir));
 
-// After:
-auto node = std::make_shared<NewInstance>(...);
-node->source_byte_off = ins.byte_off;
+// after
+IRFormPtr ir = DispatchInstruction(ri, vmap, gen_ret, payload, exception_type);
+if (ir) {
+    ir->source_byte_off = ri.byte_off;          // ← single LoC
+    lins.push_back(std::move(ir));
+}
 ```
 
-For nodes created inside structural transforms (e.g. `ShortCircuitStruct` in
-`control_flow.cpp` synthesizes a wrap node from existing IR), the wrap
-inherits the source offset of its first child — same intuition as
-`Interval::ComputeEnd` picking the max-num content member.
+The opcode handlers in `opcode_ins.cpp` (`AssignConst`, `AssignBinaryExp`,
+etc.) receive decoded register strings, NOT the `RawIns` — they can't stamp
+themselves even if we wanted them to. The funnel is the only place with both
+the IR pointer and the original `RawIns`. **This is what makes Step 2 a
+single line rather than ~200.**
 
-For nodes that genuinely correspond to nothing in the dex (NopExpression
-emitted for a removed dead block, structural braces), leave the default
-`UINT32_MAX`.
+For nodes created later by structural transforms (`ShortCircuitStruct` wraps
+in `control_flow.cpp`, `IfStruct` follow-block synthesis), inheritance is
+explicit: the wrap copies `source_byte_off` from its first content child.
+Add this in the same handful of `MakeNode<T>` call sites — bounded list,
+all in `control_flow.cpp`.
 
-**Mechanical scope:** ~200 sites across `opcode_ins.cpp`. Each is a 1-line
-addition. Recommend a sed-style first pass + manual review.
+For genuinely synthetic nodes (NopExpression for a DCE'd block, structural
+braces) the default `UINT32_MAX` sentinel stays.
+
+**Sub-statement granularity** — if a future consumer wants per-token offsets
+(`a + b * c` as 3 dex ops on one Java line), THAT is when per-handler
+stamping in `opcode_ins.cpp` becomes necessary. Until then: YAGNI; the
+single-stamp design covers the user-mental-model first-anchor-wins
+semantics in Step 3.
 
 ### Step 3 — Writer records the map during emit
 
-File: `native/dad_cpp/writer.cpp`
+File: `native/dad_cpp/writer.cpp` + `include/writer.h`.
 
-The Writer already maintains `out_` (the output buffer). Add a parallel
-`pc_map_` and a `current_line()` helper:
+The Writer's output is `std::ostringstream buffer_` (not a `std::string out_`),
+and every emit goes through one chokepoint:
+
+```cpp
+// writer.h:64
+void Write(std::string_view s) { buffer_ << s; }
+```
+
+That's the natural place to count newlines. For the IR-side hook, the
+statement-level entry point is `Writer::VisitIns(const IRFormPtr& ins)`
+([`writer.cpp:1053`](../../dex-analyzer-for-llm/blob/master/native/dad_cpp/writer.cpp)).
+Every `lins[i]` traverses this method; the inner `visit_X(...)` virtuals
+receive decomposed pieces (`IRForm* lhs`, `int64_t literal`) that don't
+carry `source_byte_off`. **Single record hook, single line-count hook:**
 
 ```cpp
 class Writer {
-public:
-    // ... existing state ...
-
-    // D-3 — populated as side-effect of WriteMethod. Each entry maps a Java
-    // source line (1-based) to the dex bytecode offset of the originating
-    // instruction. Lines with no underlying RawIns (closing braces, blank
-    // separators) get UINT32_MAX; the consumer renders those as "—".
-    std::vector<std::pair<uint32_t /* line */, uint32_t /* byte_off */>>
+    std::ostringstream buffer_;
+    uint32_t current_line_ = 1;
+    // Lines with no underlying RawIns (closing braces, blank separators)
+    // simply don't appear in pc_map_; the consumer treats absence as null.
+    std::vector<std::pair<uint32_t /*1-based line*/, uint32_t /*byte_off*/>>
         pc_map_;
 
-private:
-    uint32_t current_line_ = 1;
-
-    void emit_newline() {
-        out_ += '\n';
-        ++current_line_;
-    }
-
-    // Stamp current_line_ → ir->source_byte_off into pc_map_. Called from
-    // each visit_X just before the first emit for that node.
-    void record_line(const IRForm* ir) {
-        if (!ir || ir->source_byte_off == UINT32_MAX) return;
-        if (!pc_map_.empty() && pc_map_.back().first == current_line_) return;
-        pc_map_.emplace_back(current_line_, ir->source_byte_off);
+    void Write(std::string_view s) {
+        for (char c : s) if (c == '\n') ++current_line_;
+        buffer_ << s;
     }
 };
+
+void Writer::VisitIns(const IRFormPtr& ins) {
+    if (ins && ins->source_byte_off != UINT32_MAX
+        && (pc_map_.empty() || pc_map_.back().first != current_line_)) {
+        pc_map_.emplace_back(current_line_, ins->source_byte_off);
+    }
+    // ... existing dispatch (unchanged)
+}
 ```
 
-Every `visit_X(X* ir)` calls `record_line(ir)` at the start. The check
-"don't push if same line already recorded" preserves the first-anchor-wins
-semantics (matches user mental model: line N belongs to its FIRST observable
-dex op).
+The "don't push if same line already recorded" check preserves
+first-anchor-wins semantics — matches the user mental model: line N belongs
+to its FIRST observable dex op.
 
-### Step 4 — JSONWriter records the same map (AST variant)
+(The `writer.h` header has a stale comment at the top describing a
+"dynamic_cast" dispatch design from a previous iteration; the actual
+implementation is `WriterImpl : public Visitor` at `writer.cpp:103`. Worth
+fixing in the same PR but unrelated to D-3.)
 
-File: `native/dad_cpp/dast.cpp`
+### Step 4 — JSONWriter records the same map (AST sidechannel)
 
-Same pattern as Step 3 but written into the AST tree as a node-level `pc`
-field (each statement-level AST node gets `pc: 0xNN | null`).
+File: `native/dad_cpp/dast.cpp`.
 
-DAST output format extends from:
-```json
-{ "kind": "MethodInvocation", "target": ..., "args": [...] }
+⚠️ **This is NOT an in-node field.** DAD's AST is a nested-list form mirroring
+androguard's `process(doAST=True)` output:
+
+```cpp
+// dast.cpp:230
+return AV::Arr({AV::Str("ExpressionStatement"), std::move(expr)});
+//             ["ExpressionStatement", expr]
 ```
-to:
-```json
-{ "kind": "MethodInvocation", "target": ..., "args": [...], "pc": 18 }
+
+Adding an inline `pc` element would shift every downstream index access by
+one and break the "AstValue JSON tree models DAD's nested lists/tuples"
+invariant (CLAUDE.md, dexllm root) — the 90–95% e2e parity vs androguard
+`process(doAST=True)` is explicitly an asserted property. CLAUDE.md
+Behavioral §5 ("don't silently break a documented principle") makes
+node-inline a non-starter without an explicit divergence decision.
+
+**Solution: sidechannel map**, same shape as Step 3 but emitted into the AST
+result alongside the AST itself, not into the AST node bodies:
+
+```cpp
+// dast.cpp — JSONWriter
+struct AstResult {
+    AstValue ast;
+    std::vector<std::pair<uint32_t /*ast_stmt_seq*/, uint32_t /*byte_off*/>>
+        pc_map;
+};
+
+class JSONWriter {
+    uint32_t stmt_seq_ = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> pc_map_;
+};
+
+// Single hook — every statement-form AST node passes through ins_to_stmt.
+AstValue JSONWriter::ins_to_stmt(IRForm* op, bool is_ctor) {
+    if (op && op->source_byte_off != UINT32_MAX) {
+        pc_map_.emplace_back(stmt_seq_, op->source_byte_off);
+    }
+    ++stmt_seq_;
+    // ... existing transform (unchanged — AST shape is NOT modified)
+}
 ```
 
-`pc` is integer or `null`. AST consumers that don't need the offset ignore
-the field (forward-compatible).
+The pybind11 / wasm bindings expose `pc_map` as a separate field of the
+returned dict, mirroring the text-side `DecompileMethodWithPcMap` shape.
+
+`ast_stmt_seq` is the index of the statement-form AST node within the
+method's flattened statement sequence (depth-first pre-order). Consumers
+walking the AST keep an independent counter; matching is by sequence index,
+not by tree position. If a future consumer needs richer mapping
+(stmt → multiple sub-expression offsets), upgrade to
+`vector<pair<seq, vector<byte_off>>>` then. YAGNI.
 
 ### Step 5 — new public API on `Decompiler`
 
@@ -303,17 +371,17 @@ Verify with `/dexkit-bench` before/after — must not regress >2%.
 | Step | LoC | Risk |
 |---|---|---|
 | 1. `IRForm` field | 1 | trivial |
-| 2. Plumb through opcode handlers | ~200 (~1 line × 200 sites) | mechanical |
-| 3. Writer pc_map | ~30 | low — pure addition |
-| 4. JSONWriter pc field | ~40 | low — pure addition |
+| 2. Single stamp at dispatch funnel + control_flow inheritance | ~5 | trivial — bounded sites |
+| 3. Writer pc_map (Write chokepoint + VisitIns hook) | ~30 | low |
+| 4. JSONWriter pc_map sidechannel (ins_to_stmt hook) | ~30 | low — AST tree unchanged |
 | 5. `DecompileMethodWithPcMap` API | ~20 | low |
 | 6. pybind11 binding | ~15 | low |
 | 7. WASM binding (downstream) | ~15 | low |
 | 8. dexllm-web smali pane UI | ~150 | medium — UI layout, scroll math |
 | Tests | ~100 | — |
-| **Total** | **~570** | one PR per repo |
+| **Total** | **~365** | one PR per repo |
 
-One dexllm PR (Steps 1–6, ~410 LoC + 100 LoC tests), one dexllm-web PR
+One dexllm PR (Steps 1–6, ~100 LoC + ~100 LoC tests), one dexllm-web PR
 (Steps 7–8, ~165 LoC). Sequencing: dexllm first, then dexllm-web after the
 new wasm artifact is in.
 
@@ -357,7 +425,56 @@ text emission.
 ---
 
 **Next steps (when this lands):**
-- Open a dexllm tracking issue with this doc linked.
+- Open a dexllm tracking issue with this doc linked. → done:
+  [dexllm#1](https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/issues/1)
 - File the dexllm PR for Steps 1–6.
 - After merge + version bump, file the dexllm-web PR for Steps 7–8.
 - Update `docs/xref.md` to move D-3 from the "blocked" bucket to "landed".
+
+---
+
+## Design-review corrections
+
+The v1 draft of this spec (commit `a2337b2`) had three concrete errors that
+a follow-up design review against the actual dexllm source caught. All
+three were verified in code before the v2 rewrite landed:
+
+### v1 error 1 — Step 2 was claimed to need ~200 sites
+
+v1 said "each opcode handler receives the RawIns, ~200 sites × 1 line each
+in `opcode_ins.cpp`". This was wrong — handlers like `AssignConst` /
+`AssignBinaryExp` receive decoded register strings, not `RawIns`. Every
+instruction funnels through `DispatchInstruction(const RawIns& ri, …)` →
+`BuildNodeFromBlock`'s single `lins.push_back(...)` site. v2 replaces the
+200-site plan with one stamp at the funnel + a handful of inheritance copies
+in `control_flow.cpp` for structural-transform wraps. **LoC: 200 → ~5.**
+
+### v1 error 2 — Step 3 mechanism described a hypothetical Writer
+
+v1 wrote `out_ += '\n'` / `emit_newline()`. Actual Writer state is
+`std::ostringstream buffer_` + a single `Write(std::string_view)` chokepoint
+at `writer.h:64`. v1 also said "every visit_X calls record_line" — but the
+visit_X virtuals receive decomposed pieces (`IRForm* lhs`, `int64_t literal`)
+that don't carry `source_byte_off`. The correct hook is the statement-level
+funnel `Writer::VisitIns(const IRFormPtr&)` at `writer.cpp:1053`. v2
+rewritten accordingly.
+
+### v1 error 3 — Step 4 inline `pc` field broke AST parity
+
+v1 proposed adding `pc` as an object field on AST nodes. DAD's AST is a
+nested-list form (`["ExpressionStatement", expr]`, `dast.cpp:230`) mirroring
+androguard's `process(doAST=True)` to within 90–95% — inlining `pc` would
+shift element indices and break the documented invariant. CLAUDE.md
+Behavioral §5 ("don't silently break a documented principle") makes that a
+mandatory-stop. v2 moves the AST offsets to a sidechannel map (same shape
+as the Writer's `pc_map`), keyed by AST-statement sequence index. AST tree
+shape is unchanged.
+
+### What didn't change
+
+- The core idea (stamp on IR construction, harvest at emit time, parity-
+  neutral metadata) is sound.
+- Steps 5/6/7/8 (public APIs, bindings, UI consumer) stand.
+- Acceptance criteria + risk analysis stand.
+- Open questions stand; #2 (AST `null` vs `0`) became moot after error 3's
+  fix — sidechannel maps have no node-side ambiguity.
