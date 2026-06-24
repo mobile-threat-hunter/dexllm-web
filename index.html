@@ -100,18 +100,10 @@
     background:linear-gradient(90deg, transparent, rgba(107,161,255,0.18) 18%, rgba(107,161,255,0.22) 50%, rgba(107,161,255,0.18) 82%, transparent);
     pointer-events:none; opacity:0.55;
   }
-  header h1 {
-    font-size:15px; margin:0; font-weight:600; letter-spacing:-0.015em;
-    font-family:var(--f-ui);
-    background:linear-gradient(180deg, #f4f6fb 0%, #aab0bc 100%);
-    -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
-    text-shadow:0 1px 0 rgba(0,0,0,0.6);
-  }
-  header h1 span {
-    background:linear-gradient(180deg, var(--brand) 0%, var(--brand-3) 100%);
-    -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
-    filter:drop-shadow(0 0 12px rgba(107,161,255,0.28));
-  }
+  /* Logo kept in its original form — body's monospace + accent span,
+     no gradient text-clip or halo. The user prefers the simple wordmark. */
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header h1 span { color:var(--accent); }
   .ver {
     font:500 11px/1 var(--f-ui); color:var(--fg-3); text-decoration:none;
     padding:4px 10px; border-radius:999px; white-space:nowrap;
