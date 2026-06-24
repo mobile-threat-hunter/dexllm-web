@@ -1531,6 +1531,7 @@ async function addIsolatedDex(file) {
       valid: true,
       reason: "",
       sourceLabel: label,
+      tabLabel: dexFileName(r.name, baseLabel),
       dump: true,
       count: classes.length,
       sourceIdx: -1,
@@ -1669,7 +1670,8 @@ function buildDexInfo(rep, perDexCount) {
         name: r.name,
         valid: r.valid,
         reason: r.reason,
-        sourceLabel,
+        sourceLabel,                   // verbose ("foo.apk · classes.dex") for status / meta
+        tabLabel: dexFileName(r.name, s.label),  // concise for the Isolated tab strip
         dump: isDump,
         count: r.valid ? (perDexCount.get(r.dex_id) || 0) : 0,
         sourceIdx: si,
@@ -1678,6 +1680,15 @@ function buildDexInfo(rep, perDexCount) {
     }
   }
   return out;
+}
+
+// "classes.dex" / "classes2.dex" come straight from the verifyReport entries
+// of a zip source — those are the parsed dex filenames the user wants on the
+// tab. For a bare-.dex source, r.name is a vfs path like "/input.bin" which
+// would read as noise on a tab; fall back to the source file's display name.
+function dexFileName(rName, sourceLabel) {
+  if (rName && !rName.startsWith("/") && /\.dex$/i.test(rName)) return rName;
+  return sourceLabel;
 }
 
 // Sync the mode toggle's pill state to viewMode. Show the toggle only after
@@ -1941,17 +1952,22 @@ function renderDexBar() {
     });
     return;
   }
-  // Isolated: one tab per loaded dex, no aggregate.
+  // Isolated: one tab per loaded dex, no aggregate. Tab text uses the parsed
+  // dex filename (`classes.dex`, `classes2.dex`, or the user's original .dex
+  // file name) — concise on the strip. The full source context lives in the
+  // tooltip and in the meta line under the viewer header.
   for (const d of dexInfo) {
     const icon = d.dump ? "📦" : "📄";
-    const labelHtml = `<span class="ico">${icon}</span>` + escAttr(d.sourceLabel);
+    const tab = d.tabLabel || d.sourceLabel;
+    const labelHtml = `<span class="ico">${icon}</span>` + escAttr(tab);
     if (!d.valid) {
       makeTab(labelHtml, "x-" + d.dex_id, { bad: true, title: "rejected at load: " + (d.reason || "verification failed") });
       continue;
     }
+    const fullCtx = (d.sourceLabel && d.sourceLabel !== tab) ? `${d.sourceLabel} — ` : "";
     const tip = d.dump
-      ? `runtime-dumped dex (dex_id ${d.dex_id}) — inspected in isolation`
-      : `dex_id ${d.dex_id} (${d.count} declared classes) — inspected in isolation`;
+      ? `${fullCtx}runtime-dumped dex (dex_id ${d.dex_id}) — inspected in isolation`
+      : `${fullCtx}dex_id ${d.dex_id} (${d.count} declared classes) — inspected in isolation`;
     makeTab(labelHtml, d.dex_id, { count: d.count, dump: d.dump, title: tip });
   }
 }
