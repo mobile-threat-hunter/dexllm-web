@@ -563,11 +563,13 @@
   #code .tk-typ,
   #code .tk-var,
   #code .tk-con,
+  #code .tk-str,
   #code .tk-ide { cursor:pointer; }
   #code .tk-fun:hover,
   #code .tk-typ:hover,
   #code .tk-var:hover,
   #code .tk-con:hover,
+  #code .tk-str:hover,
   #code .tk-ide:hover { text-decoration:underline; text-underline-offset:2px; }
 
   /* Floating callers popup. Pinned with position:fixed near the clicked token.
@@ -1401,6 +1403,7 @@ async function loadFile(file) {
   vfsBytes.add("/input.bin");
   selectedDex = "all";
   if (dk) { try { dk.delete(); } catch (_) {} dk = null; }
+  clearSymbolIndex();
 
   let t0 = performance.now();
   try {
@@ -2591,7 +2594,16 @@ const methodOfDescriptor = (md) => ((md.split("->")[1] || "").split("("))[0];
 // stays hidden one hop away. We use this pattern to expand the chain.
 function isSyntheticAccessor(desc) {
   const name = methodOfDescriptor(desc);
-  return /^access\$\d+$/.test(name);
+  const cls = desc.split("->")[0];
+  // Original access$NNN — javac/dexer outer-inner accessor.
+  if (/^access\$\d+$/.test(name)) return true;
+  // D8/R8 lambda factory classes — `Lpkg/.../$$Lambda$Outer$Inner;` or
+  // `Lpkg/.../-$$Lambda$Outer$Inner;` or `Lpkg/.../...$$ExternalSyntheticLambda*;`.
+  if (/\$\$Lambda\$|\$\$ExternalSyntheticLambda/.test(cls)) return true;
+  // Kotlin compiler synthetic lambda methods: `methodName$lambda$N` /
+  // `lambda$methodName$N` / `$lambda$N`.
+  if (/^(lambda\$.+\$\d+|\$lambda\$\d+|.+\$lambda\$\d+)$/.test(name)) return true;
+  return false;
 }
 
 // Expand callers transitively through synthetic-accessor chains so the popup
@@ -2642,6 +2654,7 @@ function showCallersFor(cls, name, anchor) {
     ? (cls.match(/\/([A-Za-z_$][\w$]*);$/) || ["", ""])[1]
     : null;
   const pop = $("#callerpop");
+  detachCallTreeToggle(pop);
   $("#callerpop-method").textContent = isCtor ? (simpleCls + " — new sites") : name;
   const body = $("#callerpop-body");
   body.innerHTML = '<div class="callerpop-empty">searching…</div>';
@@ -2696,35 +2709,52 @@ function showCallersFor(cls, name, anchor) {
       // (desc, offset) pair — if both a direct and an accessor-routed hit
       // reach the same site, keep the direct one's metadata.
     }
-    body.innerHTML = "";
-    for (const c of records) {
-      const item = document.createElement("div");
-      item.className = "callerpop-item";
-      const chainNote = c.chain.length
-        ? `<span style="color:var(--fg-3);font:11px var(--f-ui);margin-left:6px">via ${c.chain.map(methodOfDescriptor).join(" → ")}</span>`
-        : "";
-      // Occurrence suffix: only shown when the caller has >1 invocations of
-      // the target. Offset is the dex bytecode address (smali "0x12") —
-      // unambiguous identifier of the specific invoke instruction.
-      const occNote = c.totalOcc > 1
-        ? `<span style="color:var(--fg-3);font:11px var(--f-ui);margin-left:6px">× ${c.occurrence} of ${c.totalOcc}${c.offset >= 0 ? " @ 0x" + c.offset.toString(16) : ""}</span>`
-        : "";
-      item.innerHTML = escAttr(c.desc) + chainNote + occNote;
-      item.title = (c.chain.length ? `${c.desc}\nreached via accessor chain: ${c.chain.join(" → ")}` : c.desc)
-                 + (c.totalOcc > 1 ? `\noccurrence ${c.occurrence} of ${c.totalOcc} (bytecode offset 0x${c.offset.toString(16)})` : "");
-      const callerCls = c.desc.split("->")[0];
-      const callerMethod = methodOfDescriptor(c.desc);
-      item.onclick = () => {
-        pop.classList.remove("show");
-        const needle = c.chain.length
-          ? methodOfDescriptor(c.chain[0])
-          : (isCtor ? simpleCls : name);
-        // occurrence: skip the first (occurrence-1) matches so the glow
-        // lands on the right `needle(` instance in the caller's body.
-        navigateToClass(callerCls, { needle, scope: callerMethod, occurrence: c.occurrence });
-      };
-      body.appendChild(item);
-    }
+    const renderFlat = () => {
+      body.innerHTML = "";
+      for (const c of records) {
+        const item = document.createElement("div");
+        item.className = "callerpop-item";
+        const chainNote = c.chain.length
+          ? `<span style="color:var(--fg-3);font:11px var(--f-ui);margin-left:6px">via ${c.chain.map(methodOfDescriptor).join(" → ")}</span>`
+          : "";
+        // Occurrence suffix: only shown when the caller has >1 invocations of
+        // the target. Offset is the dex bytecode address (smali "0x12") —
+        // unambiguous identifier of the specific invoke instruction.
+        const occNote = c.totalOcc > 1
+          ? `<span style="color:var(--fg-3);font:11px var(--f-ui);margin-left:6px">× ${c.occurrence} of ${c.totalOcc}${c.offset >= 0 ? " @ 0x" + c.offset.toString(16) : ""}</span>`
+          : "";
+        const callerCls = c.desc.split("->")[0];
+        const ext = isExternalClass(useDk, callerCls) ? externalBadgeHtml() : "";
+        item.innerHTML = ext + escAttr(c.desc) + chainNote + occNote;
+        item.title = (c.chain.length ? `${c.desc}\nreached via accessor chain: ${c.chain.join(" → ")}` : c.desc)
+                   + (c.totalOcc > 1 ? `\noccurrence ${c.occurrence} of ${c.totalOcc} (bytecode offset 0x${c.offset.toString(16)})` : "");
+        const callerMethod = methodOfDescriptor(c.desc);
+        item.onclick = () => {
+          pop.classList.remove("show");
+          const needle = c.chain.length
+            ? methodOfDescriptor(c.chain[0])
+            : (isCtor ? simpleCls : name);
+          // occurrence: skip the first (occurrence-1) matches so the glow
+          // lands on the right `needle(` instance in the caller's body.
+          navigateToClass(callerCls, { needle, scope: callerMethod, occurrence: c.occurrence });
+        };
+        body.appendChild(item);
+      }
+    };
+    renderFlat();
+    // Mount the "↑ tree" toggle — only meaningful when there's >0 callers.
+    attachCallTreeToggle(pop, body, () => {
+      // Build tree from the flat record set (overloads + offsets collapsed
+      // to unique caller descriptors).
+      const roots = [...new Set(overloads)];
+      const tree = buildCallerTree(useDk, roots, 3);
+      // Replace the root nodes with the target itself for context.
+      const head = document.createElement("div");
+      head.style.cssText = "padding:6px 10px;color:var(--fg-3);font:11px var(--f-ui)";
+      head.textContent = `tree depth-capped at 3 · cycles marked`;
+      body.appendChild(head);
+      renderCallerTree(tree, body, useDk);
+    }, renderFlat);
   }, 30);
 }
 
@@ -2815,9 +2845,10 @@ function showFieldXrefFor(cls, fieldName, anchor) {
         for (const desc of list) {
           const item = document.createElement("div");
           item.className = "callerpop-item";
-          item.textContent = desc;
-          item.title = desc;
           const targetCls = desc.split("->")[0];
+          const ext = isExternalClass(useDk, targetCls) ? externalBadgeHtml() : "";
+          item.innerHTML = ext + escAttr(desc);
+          item.title = desc;
           const targetMethod = methodOfDescriptor(desc);
           item.onclick = () => {
             pop.classList.remove("show");
@@ -2904,6 +2935,410 @@ function navigateToFieldDeclFromUsage(currentCls, lineIdx, fieldName) {
   // Multiple — picker (same chrome as callee picker).
   showCalleePicker(matches, fieldName);
 }
+
+// ── Shared row helpers (framework markers, call graph) ────────────────────
+// External-class detection — a row whose target class isn't loaded in any
+// dex is a framework / external reference. We tag those visually so the
+// user knows a "callee" or "super" sits outside the analyzed code.
+function isExternalClass(useDk, cls) {
+  if (!useDk || !cls) return false;
+  try { return useDk.locateClassDex(cls) < 0; } catch (_) { return false; }
+}
+function externalBadgeHtml() {
+  return '<span style="color:var(--fg-3);font:10px var(--f-ui);margin-right:6px;padding:0 4px;border:1px solid var(--bd-1);border-radius:3px">ext</span>';
+}
+
+// ── Call-graph expansion ────────────────────────────────────────────────────
+// Recursive caller walk from a starting method descriptor. Depth-capped and
+// cycle-safe. Returns a tree of `{desc, children: [...]}` with each call
+// site grouped under its caller (synthetic accessor expansion handled by
+// the same resolveTransitiveCallers helper).
+function buildCallerTree(useDk, rootDescs, maxDepth = 3) {
+  const seen = new Set();
+  const visit = (desc, depth) => {
+    if (seen.has(desc)) return { desc, children: [], cycle: true };
+    seen.add(desc);
+    if (depth >= maxDepth) return { desc, children: [], depthCapped: true };
+    let records;
+    try { records = resolveTransitiveCallers(useDk, [desc]); }
+    catch (_) { records = []; }
+    const children = records.map(r => visit(r.desc, depth + 1));
+    seen.delete(desc);
+    return { desc, children };
+  };
+  return rootDescs.map(d => visit(d, 0));
+}
+
+function renderCallerTree(tree, body, useDk, indent = 0) {
+  for (const node of tree) {
+    const row = document.createElement("div");
+    row.style.cssText = "padding:2px 10px;cursor:pointer;font:12px var(--f-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+    row.style.paddingLeft = (10 + indent * 14) + "px";
+    const cls = node.desc.split("->")[0];
+    const ext = isExternalClass(useDk, cls) ? externalBadgeHtml() : "";
+    const tag = node.cycle ? ' <span style="color:var(--fg-3);font-size:10px">(cycle)</span>'
+              : node.depthCapped ? ' <span style="color:var(--fg-3);font-size:10px">(depth cap)</span>'
+              : node.children.length ? ` <span style="color:var(--fg-3);font-size:10px">↑ ${node.children.length}</span>`
+              : '';
+    row.innerHTML = ext + escAttr(node.desc) + tag;
+    row.title = node.desc;
+    row.onclick = (e) => {
+      e.stopPropagation();
+      $("#callerpop").classList.remove("show");
+      const c = node.desc.split("->")[0];
+      const name = (node.desc.split("->")[1] || "").split("(")[0];
+      navigateToClass(c, { needle: name, scope: name });
+    };
+    body.appendChild(row);
+    if (node.children.length) renderCallerTree(node.children, body, useDk, indent + 1);
+  }
+}
+
+// Mount a "↑ tree" toggle in the existing caller popup. When the popup is
+// open with a flat list, the user can click "show tree" to swap in the
+// recursive view; clicking again restores the flat list.
+function attachCallTreeToggle(pop, body, buildTree, buildFlat) {
+  if (pop._treeBtn) return;
+  const btn = document.createElement("div");
+  btn.style.cssText = "padding:4px 10px;color:var(--fg-3);font:11px var(--f-ui);text-align:right;cursor:pointer;border-bottom:1px solid var(--bd-1)";
+  btn.textContent = "↑ tree";
+  let asTree = false;
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    asTree = !asTree;
+    btn.textContent = asTree ? "↩ flat" : "↑ tree";
+    body.innerHTML = "";
+    if (asTree) buildTree(); else buildFlat();
+  };
+  pop.insertBefore(btn, body);
+  pop._treeBtn = btn;
+}
+function detachCallTreeToggle(pop) {
+  if (pop._treeBtn) { pop._treeBtn.remove(); pop._treeBtn = null; }
+}
+
+// ── Type hierarchy + reference xref ────────────────────────────────────────
+// Bucket A from docs/xref.md: clicking a TYPE token (a `tk-typ` that isn't
+// `new X(...)` and isn't a ctor declaration) opens a popup with:
+//   ↑ extends + implements (from getClassSuperAndInterfaces)
+//   ↓ subclasses (findClassesBySuperclass + findClassesImplementing)
+//   methods returning this type / methods with this type as param
+//     / fields of this type           (from findTypeReferences)
+// Body-level uses (instanceof / check-cast / new) are deferred — would need
+// per-method smali walk; the signature-level coverage above already nails
+// the JEB/jadx "Find references" common case.
+
+// Resolve a clicked type token text → full `Lpkg/sub/Cls;` descriptor.
+// Walks the source line backward collecting lowercase pkg segments before
+// the clicked token, then verifies the candidate is a real loaded class.
+// Falls back to a name-suffix lookup with picker.
+function resolveTypeDescriptor(line, tokenText, tokenIdx, useDk) {
+  // Collect pkg path: zero-or-more `lower\.lower\.…\.` before the clicked
+  // uppercase token. e.g. `a2dp.Vol.AppChooser` → ["a2dp", "Vol"] for the
+  // pkg, AppChooser is the leaf (capital A — Vol stays since it's the host
+  // app's casing).
+  let scan = tokenIdx;
+  const parts = [];
+  // First the leaf
+  parts.unshift(tokenText);
+  while (scan > 0 && line[scan - 1] === ".") {
+    let p = scan - 2;
+    while (p >= 0 && /[\w$]/.test(line[p])) p--;
+    const seg = line.slice(p + 1, scan - 1);
+    if (!/^[A-Za-z_$][\w$]*$/.test(seg)) break;
+    parts.unshift(seg);
+    scan = p + 1;
+  }
+  if (parts.length > 1) {
+    const desc = "L" + parts.join("/") + ";";
+    if (useDk.locateClassDex(desc) >= 0) return desc;
+  }
+  // Single token: try same package as current class, then suffix-search.
+  if (currentClass) {
+    const pkg = currentClass.replace(/[^\/]+;$/, "");      // "Lpkg/sub/"
+    const desc = pkg + tokenText + ";";
+    if (useDk.locateClassDex(desc) >= 0) return desc;
+  }
+  const cands = useDk.findClassesByName("/" + tokenText + ";", "ends_with", false);
+  if (cands.size() === 1) {
+    const d = cands.get(0).descriptor; cands.delete(); return d;
+  }
+  if (cands.size() > 1) {
+    const arr = [];
+    for (let i = 0; i < cands.size(); i++) arr.push(cands.get(i).descriptor);
+    cands.delete();
+    // Surface a picker — caller will get back the choice asynchronously.
+    return { ambiguous: arr };
+  }
+  cands.delete();
+  return null;
+}
+
+// Render the type-hierarchy popup for class `cls`.
+function showTypeHierarchyFor(cls, anchor) {
+  const simpleCls = (cls.match(/\/?([A-Za-z_$][\w$]*);$/) || ["", cls])[1];
+  const pop = $("#callerpop");
+  $("#callerpop-method").textContent = simpleCls + " — type xref";
+  const body = $("#callerpop-body");
+  body.innerHTML = '<div class="callerpop-empty">searching…</div>';
+  pop.classList.add("show");
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = Math.max(12, Math.min(window.innerWidth - 520, r.left)) + "px";
+  pop.style.top = (r.bottom + 6) + "px";
+  setTimeout(() => {
+    if (!pop.classList.contains("show")) return;
+    const useDk = activeQueryDk();
+    let hier = { super: "", interfaces: [] };
+    try { hier = useDk.getClassSuperAndInterfaces(cls); } catch (_) {}
+    // Subtypes — extends-equals (concrete subclass) + implements-equals (interface implementors).
+    const subs = new Set();
+    try { const v = useDk.findClassesBySuperclass(cls); for (let i = 0; i < v.size(); i++) subs.add(v.get(i)); v.delete(); } catch (_) {}
+    try { const v = useDk.findClassesImplementing(cls);  for (let i = 0; i < v.size(); i++) subs.add(v.get(i)); v.delete(); } catch (_) {}
+    let refs = { fields: [], methodsReturning: [], methodsWithParam: [] };
+    try { refs = useDk.findTypeReferences(cls); } catch (_) {}
+    body.innerHTML = "";
+    const head = document.createElement("div");
+    head.style.cssText = "padding:6px 10px;color:var(--fg-3);font:11px var(--f-ui);border-bottom:1px solid var(--bd-1);word-break:break-all";
+    head.textContent = cls;
+    body.appendChild(head);
+    const section = (label, rows, hintBuilder) => {
+      const sec = document.createElement("div");
+      sec.style.cssText = "padding:6px 10px 2px;color:var(--fg-3);font:11px var(--f-ui);text-transform:uppercase;letter-spacing:0.3px";
+      sec.textContent = `${label} · ${rows.length}`;
+      body.appendChild(sec);
+      if (!rows.length) {
+        const e = document.createElement("div");
+        e.className = "callerpop-empty"; e.style.padding = "2px 18px"; e.textContent = "none";
+        body.appendChild(e); return;
+      }
+      for (const desc of rows) {
+        const item = document.createElement("div");
+        item.className = "callerpop-item";
+        // For type rows the descriptor IS the class; for method/field rows
+        // we split. Both cases land on the declaring class for the ext check.
+        const declCls = desc.includes("->") ? desc.split("->")[0] : desc;
+        const ext = isExternalClass(useDk, declCls) ? externalBadgeHtml() : "";
+        item.innerHTML = ext + escAttr(desc);
+        item.title = desc;
+        item.onclick = () => {
+          pop.classList.remove("show");
+          const h = hintBuilder(desc);
+          navigateToClass(h.cls, h.hint);
+        };
+        body.appendChild(item);
+      }
+    };
+    // Super + interfaces (↑) — single-item rows each.
+    const upRows = [];
+    if (hier && hier.super) upRows.push(hier.super);
+    for (const ifc of (hier?.interfaces || [])) upRows.push(ifc);
+    section("↑ extends / implements", upRows, desc => ({
+      cls: desc, hint: { needle: (desc.match(/\/?([A-Za-z_$][\w$]*);$/) || [, ""])[1], scope: null }
+    }));
+    section("↓ subtypes", [...subs].sort(), desc => ({
+      cls: desc, hint: { needle: (desc.match(/\/?([A-Za-z_$][\w$]*);$/) || [, ""])[1], scope: null }
+    }));
+    section("Fields of this type", refs.fields || [], desc => {
+      const c = desc.split("->")[0];
+      const fldName = (desc.split("->")[1] || "").split(":")[0];
+      return { cls: c, hint: { needle: fldName, scope: null } };
+    });
+    section("Methods returning this type", refs.methodsReturning || [], desc => {
+      const c = desc.split("->")[0];
+      const mName = (desc.split("->")[1] || "").split("(")[0];
+      return { cls: c, hint: { needle: mName, scope: mName } };
+    });
+    section("Methods with this type as param", refs.methodsWithParam || [], desc => {
+      const c = desc.split("->")[0];
+      const mName = (desc.split("->")[1] || "").split("(")[0];
+      return { cls: c, hint: { needle: mName, scope: mName } };
+    });
+  }, 30);
+}
+
+// ── String xref ────────────────────────────────────────────────────────────
+// Click on a `.tk-str` string literal → popup with every method that uses
+// that exact const-string. dexkit's BatchFindMethodsUsingStrings is the
+// Aho-Corasick engine behind the existing IoC pipeline; wrapping it as a
+// one-string query gives the JEB/jadx "Find usages of string literal" UX.
+function showStringXrefFor(rawToken, anchor) {
+  // Strip surrounding quotes + unescape simple Java escapes.
+  let value = rawToken;
+  if (value.length >= 2 && (value[0] === '"' || value[0] === "'")) {
+    value = value.slice(1, -1);
+    value = value.replace(/\\(.)/g, (_, c) => c === "n" ? "\n" : c === "t" ? "\t" : c === "r" ? "\r" : c);
+  }
+  const pop = $("#callerpop");
+  $("#callerpop-method").textContent = `"${value.length > 40 ? value.slice(0, 40) + "…" : value}" — string xref`;
+  const body = $("#callerpop-body");
+  body.innerHTML = '<div class="callerpop-empty">searching…</div>';
+  pop.classList.add("show");
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = Math.max(12, Math.min(window.innerWidth - 520, r.left)) + "px";
+  pop.style.top = (r.bottom + 6) + "px";
+  setTimeout(() => {
+    if (!pop.classList.contains("show")) return;
+    const useDk = activeQueryDk();
+    let methods;
+    try { methods = useDk.findMethodsUsingString(value); }
+    catch (_) { body.innerHTML = '<div class="callerpop-empty">xref unavailable</div>'; return; }
+    const arr = [];
+    for (let i = 0; i < methods.size(); i++) arr.push(methods.get(i));
+    methods.delete();
+    if (!arr.length) {
+      body.innerHTML = '<div class="callerpop-empty">no methods reference this string</div>';
+      return;
+    }
+    body.innerHTML = "";
+    const head = document.createElement("div");
+    head.style.cssText = "padding:6px 10px;color:var(--fg-3);font:11px var(--f-ui);border-bottom:1px solid var(--bd-1);word-break:break-all";
+    head.textContent = value.length > 200 ? value.slice(0, 200) + "…" : value;
+    body.appendChild(head);
+    for (const desc of arr) {
+      const item = document.createElement("div");
+      item.className = "callerpop-item";
+      const targetCls = desc.split("->")[0];
+      const ext = isExternalClass(useDk, targetCls) ? externalBadgeHtml() : "";
+      item.innerHTML = ext + escAttr(desc);
+      item.title = desc;
+      const mName = (desc.split("->")[1] || "").split("(")[0];
+      item.onclick = () => {
+        pop.classList.remove("show");
+        // Glow the string literal inside the method.
+        navigateToClass(targetCls, { needle: rawToken, scope: mName });
+      };
+      body.appendChild(item);
+    }
+  }, 30);
+}
+
+// ── Global symbol search ───────────────────────────────────────────────────
+// Ctrl+P / `/` opens a modal with a text input. Searches classes + methods +
+// fields by name (substring, case-insensitive). Results stream in via a
+// debounced redraw. The full corpus comes from listAllMethodDescriptors +
+// listAllFieldDescriptors + listClasses — one WASM call each, cached.
+let _symbolIndex = null;
+function ensureSymbolIndex() {
+  if (_symbolIndex) return _symbolIndex;
+  const useDk = activeQueryDk();
+  const classes = [], methods = [], fields = [];
+  try {
+    const v = useDk.listClasses();
+    for (let i = 0; i < v.size(); i++) classes.push(v.get(i)); v.delete();
+  } catch (_) {}
+  try {
+    const v = useDk.listAllMethodDescriptors();
+    for (let i = 0; i < v.size(); i++) methods.push(v.get(i)); v.delete();
+  } catch (_) {}
+  try {
+    const v = useDk.listAllFieldDescriptors();
+    for (let i = 0; i < v.size(); i++) fields.push(v.get(i)); v.delete();
+  } catch (_) {}
+  _symbolIndex = { classes, methods, fields };
+  return _symbolIndex;
+}
+function clearSymbolIndex() { _symbolIndex = null; }
+
+function openSymbolSearch() {
+  let modal = $("#symsearch");
+  if (!modal) {
+    modal = document.createElement("div");
+    modal.id = "symsearch";
+    modal.style.cssText = "position:fixed;top:80px;left:50%;transform:translateX(-50%);width:640px;max-height:60vh;background:var(--bg-1);border:1px solid var(--bd-1);border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.4);z-index:60;display:flex;flex-direction:column;font:13px var(--f-ui)";
+    modal.innerHTML = `
+      <input id="symsearch-input" placeholder="search class / method / field…" style="background:transparent;border:0;border-bottom:1px solid var(--bd-1);color:var(--fg);padding:10px 12px;font:14px var(--f-mono);outline:none">
+      <div id="symsearch-list" style="overflow-y:auto;padding:4px 0;flex:1"></div>
+      <div style="border-top:1px solid var(--bd-1);padding:4px 10px;color:var(--fg-3);font-size:11px">↑↓ navigate · ↵ open · esc close</div>
+    `;
+    document.body.appendChild(modal);
+    const input = modal.querySelector("#symsearch-input");
+    const list  = modal.querySelector("#symsearch-list");
+    let selected = 0, lastResults = [];
+    const render = () => {
+      const q = input.value.trim().toLowerCase();
+      if (!q) { list.innerHTML = '<div style="padding:8px 12px;color:var(--fg-3)">start typing…</div>'; lastResults = []; return; }
+      const idx = ensureSymbolIndex();
+      // Score: exact match > prefix > contains; cap at 200 results.
+      const score = (s) => {
+        const lo = s.toLowerCase();
+        if (lo === q) return 0;
+        const i = lo.indexOf(q);
+        return i < 0 ? Infinity : (i === 0 ? 1 : 2 + i);
+      };
+      const collect = (arr, kind) => {
+        const out = [];
+        for (const desc of arr) {
+          const sc = score(desc);
+          if (sc < Infinity) out.push({ desc, kind, sc });
+          if (out.length > 600) break;
+        }
+        return out;
+      };
+      const all = [
+        ...collect(idx.classes, "class"),
+        ...collect(idx.methods, "method"),
+        ...collect(idx.fields,  "field")
+      ].sort((a, b) => a.sc - b.sc || a.desc.length - b.desc.length).slice(0, 200);
+      lastResults = all;
+      selected = 0;
+      list.innerHTML = "";
+      if (!all.length) { list.innerHTML = '<div style="padding:8px 12px;color:var(--fg-3)">no matches</div>'; return; }
+      all.forEach((r, i) => {
+        const row = document.createElement("div");
+        row.dataset.idx = i;
+        row.style.cssText = "padding:4px 12px;cursor:pointer;font:12px var(--f-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+        if (i === 0) row.style.background = "rgba(255,255,255,0.06)";
+        row.innerHTML = `<span style="color:var(--fg-3);display:inline-block;width:48px">${r.kind}</span>${escAttr(r.desc)}`;
+        row.onmouseenter = () => { selectRow(i); };
+        row.onclick = () => openSymbol(r);
+        list.appendChild(row);
+      });
+    };
+    const selectRow = (i) => {
+      const rows = list.querySelectorAll("[data-idx]");
+      if (rows[selected]) rows[selected].style.background = "";
+      selected = Math.max(0, Math.min(rows.length - 1, i));
+      if (rows[selected]) { rows[selected].style.background = "rgba(255,255,255,0.06)"; rows[selected].scrollIntoView({ block: "nearest" }); }
+    };
+    const openSymbol = (r) => {
+      modal.style.display = "none";
+      if (r.kind === "class") {
+        navigateToClass(r.desc, null);
+      } else if (r.kind === "method") {
+        const c = r.desc.split("->")[0];
+        const name = (r.desc.split("->")[1] || "").split("(")[0];
+        navigateToClass(c, { needle: name, scope: name });
+      } else {
+        const c = r.desc.split("->")[0];
+        const name = (r.desc.split("->")[1] || "").split(":")[0];
+        navigateToClass(c, { needle: name, scope: null });
+      }
+    };
+    let renderTimer = 0;
+    input.addEventListener("input", () => { clearTimeout(renderTimer); renderTimer = setTimeout(render, 80); });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown") { e.preventDefault(); selectRow(selected + 1); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); selectRow(selected - 1); }
+      else if (e.key === "Enter") { e.preventDefault(); if (lastResults[selected]) openSymbol(lastResults[selected]); }
+      else if (e.key === "Escape") { modal.style.display = "none"; }
+    });
+    modal._render = render;
+  }
+  modal.style.display = "flex";
+  const input = modal.querySelector("#symsearch-input");
+  input.value = ""; input.focus();
+  modal.querySelector("#symsearch-list").innerHTML = '<div style="padding:8px 12px;color:var(--fg-3)">start typing…</div>';
+}
+document.addEventListener("keydown", (e) => {
+  // Ctrl+P / Cmd+P opens; ignore inside text inputs.
+  const tag = (e.target?.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea") return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "p") {
+    e.preventDefault();
+    if (!dk) return;
+    openSymbolSearch();
+  }
+});
 
 // Navigate to the declaration of `name(` referenced as a call on `line`.
 //   - If the receiver is a class explicit in the text (ClassName.method), jump
@@ -3210,9 +3645,18 @@ $("#code").addEventListener("click", (e) => {
     }
     return;
   }
-  // Type tokens: two contexts of interest.
+  // String literals: click → list of methods referencing that exact string.
+  const strT = e.target.closest(".tk-str");
+  if (strT) {
+    e.stopPropagation();
+    showStringXrefFor(strT.textContent, strT);
+    return;
+  }
+  // Type tokens: three contexts of interest.
   //   - `new pkg.X(` → jump to X's constructor (existing)
   //   - `public ClassName(args)` declaration line → callers of <init> popup
+  //   - anything else (declaration site of a field of type X / cast / etc.)
+  //     → type hierarchy + reference xref popup
   const typT = e.target.closest(".tk-typ");
   if (typT) {
     const info = getLineForElement(typT);
@@ -3220,7 +3664,8 @@ $("#code").addEventListener("click", (e) => {
     const tokenText = typT.textContent;
     let tokenIdx = info.line.indexOf(tokenText);
     if (tokenIdx < 0) return;
-    // Walk repeated occurrences looking for either context.
+    // Walk repeated occurrences looking for ctor contexts first.
+    let firstIdx = tokenIdx;
     while (tokenIdx >= 0) {
       if (isNewCtorContext(info.line, tokenIdx, tokenText.length)) {
         e.stopPropagation();
@@ -3234,6 +3679,17 @@ $("#code").addEventListener("click", (e) => {
       }
       tokenIdx = info.line.indexOf(tokenText, tokenIdx + 1);
     }
+    // Fallback: type-hierarchy / reference popup. Resolve the token to a
+    // full class descriptor and surface the unified xref.
+    const useDk = activeQueryDk();
+    const resolved = resolveTypeDescriptor(info.line, tokenText, firstIdx, useDk);
+    if (typeof resolved === "string") {
+      e.stopPropagation();
+      showTypeHierarchyFor(resolved, typT);
+    } else if (resolved && resolved.ambiguous) {
+      e.stopPropagation();
+      showCalleePicker(resolved.ambiguous, tokenText);
+    }
   }
 });
 
@@ -3242,7 +3698,7 @@ document.addEventListener("click", (e) => {
   const pop = $("#callerpop");
   if (!pop.classList.contains("show")) return;
   if (pop.contains(e.target)) return;
-  if (e.target.closest(".tk-fun, .tk-var, .tk-con, .tk-ide")) return;   // re-click on an identifier token rebuilds
+  if (e.target.closest(".tk-fun, .tk-typ, .tk-var, .tk-con, .tk-str, .tk-ide")) return;   // re-click on any clickable token rebuilds
   pop.classList.remove("show");
 }, true);
 document.addEventListener("keydown", (e) => {
