@@ -554,9 +554,13 @@
   #glowline.on { display:block; }
   /* Method tokens get a soft cursor + hover underline so they read as clickable.
      `.tk-fun` is the lowercase-name-followed-by-`(` class from highlight();
-     clicks open a callers popup (declaration) or jump to the declaration (call). */
-  #code .tk-fun { cursor:pointer; }
-  #code .tk-fun:hover { text-decoration:underline; text-underline-offset:2px; }
+     clicks open a callers popup (declaration) or jump to the declaration (call).
+     `.tk-typ` (Uppercase identifiers) is clickable too — used for the
+     `new X(...)` constructor-jump path. */
+  #code .tk-fun,
+  #code .tk-typ { cursor:pointer; }
+  #code .tk-fun:hover,
+  #code .tk-typ:hover { text-decoration:underline; text-underline-offset:2px; }
 
   /* Floating callers popup. Pinned with position:fixed near the clicked token.
      Closes on Escape, click outside, or selectClass. */
@@ -2706,11 +2710,20 @@ function findEnclosingMethodName(lineIdx) {
 function findEnclosingMethodDescriptor(cls, lineIdx, useDk) {
   const mname = findEnclosingMethodName(lineIdx);
   if (!mname) return null;
+  // DAD writes constructors using the class simple name; dex/dexkit names
+  // them `<init>`. Same for static initializers (DAD: "static", dex: `<clinit>`).
+  // Build a list of candidate dex-side names to match the visible source name.
+  const simpleCls = (cls.match(/\/?([A-Za-z_$][\w$]*);$/) || ["", ""])[1];
+  const candidates = [mname];
+  if (mname === simpleCls) candidates.push("<init>");
+  if (mname === "static")  candidates.push("<clinit>");
   const ms = useDk.listClassMethods(cls);
   let desc = null;
-  for (let i = 0; i < ms.size(); i++) {
+  for (let i = 0; i < ms.size() && !desc; i++) {
     const md = ms.get(i);
-    if (md.indexOf("->" + mname + "(") > 0) { desc = md; break; }
+    for (const cn of candidates) {
+      if (md.indexOf("->" + cn + "(") > 0) { desc = md; break; }
+    }
   }
   ms.delete();
   return desc;
@@ -2842,20 +2855,107 @@ function flashToast(msg) {
   }, 1800);
 }
 
-// Click delegation on #code: route to caller popup or callee navigation
-// depending on whether the clicked .tk-fun token is a declaration or a call.
+// True when the clicked `.tk-typ` token is the FINAL class-name segment of a
+// `new <pkg>.<Class>(` constructor invocation — i.e. the immediately-next
+// non-space char is `(`. Without that constraint clicking a package segment
+// like `Vol` in `new a2dp.Vol.AppChooser$1(...)` would wrongly try to resolve
+// `Vol` itself. The clicked token also needs `new ...` before it with only a
+// (possibly empty) dotted package path between.
+function isNewCtorContext(line, tokenIdx, tokenLen) {
+  const before = line.slice(0, tokenIdx);
+  if (!/\bnew\s+(?:[A-Za-z_$][\w$]*\.)*$/.test(before)) return false;
+  const after = line.slice(tokenIdx + tokenLen);
+  return /^\s*\(/.test(after);
+}
+
+// `new X(...)` jump: parse the enclosing method's smali for invoke-direct
+// on `<init>` whose target class's simple-name (or trailing inner-class
+// segment) matches the clicked token, then navigate to that class. DAD emits
+// constructors as `public ClassName(args)` in source — so the scope literally
+// is the simple class name, and locateAndGlow lands on the constructor line.
+function navigateToConstructor(name, lineIdx, anchor) {
+  const useDk = activeQueryDk();
+  const callerDesc = findEnclosingMethodDescriptor(currentClass, lineIdx, useDk);
+  if (!callerDesc) {
+    flashToast("'" + name + "' constructor target not resolvable");
+    return;
+  }
+  const invokes = smaliInvokesFrom(useDk, callerDesc);
+  // Filter: invoke-direct on <init> whose receiver class's simple name
+  // matches. Inner classes encode as "Outer$Inner;" — accept either the full
+  // simple-name match or a trailing "$Name" segment.
+  const matches = invokes.filter(iv => {
+    const arrow = iv.descriptor.indexOf("->");
+    if (arrow < 0) return false;
+    const rest = iv.descriptor.slice(arrow + 2);
+    const openP = rest.indexOf("(");
+    if (openP < 0 || rest.slice(0, openP) !== "<init>") return false;
+    const cls = iv.descriptor.slice(0, arrow);             // "Lpkg/Outer$Inner;"
+    const m = cls.match(/\/?([A-Za-z_$][\w$]*);$/);
+    if (!m) return false;
+    const simple = m[1];                                    // "Outer$Inner"
+    return simple === name || simple.endsWith("$" + name);
+  });
+  if (matches.length === 1) {
+    const targetCls = matches[0].descriptor.split("->")[0];
+    return _navigateAfterClassCheck(targetCls, name);
+  }
+  if (matches.length > 1) {
+    showCalleePicker(matches.map(iv => iv.descriptor), name);
+    return;
+  }
+  // Last resort: ask dexkit for any class whose name ends with /Name; and let
+  // the user pick. Useful if smali rendering missed the invoke (rare).
+  const cands = useDk.findClassesByName("/" + name + ";", "ends_with", false);
+  const arr = [];
+  for (let i = 0; i < cands.size(); i++) arr.push(cands.get(i).descriptor);
+  cands.delete();
+  if (arr.length === 1) return _navigateAfterClassCheck(arr[0], name);
+  if (arr.length > 1) {
+    showCalleePicker(arr.map(d => d + "-><init>(...)"), name);
+    return;
+  }
+  flashToast("'" + name + "' constructor not found");
+}
+
+// Click delegation on #code: route to caller popup, callee navigation, or
+// constructor jump depending on the clicked token's class + line context.
 $("#code").addEventListener("click", (e) => {
-  const target = e.target.closest(".tk-fun");
-  if (!target) return;
   if (!currentClass) return;
-  e.stopPropagation();
-  const name = target.textContent;
-  const info = getLineForElement(target);
-  if (!info) return;
-  if (isMethodDeclaration(info.line, name)) {
-    showCallersFor(currentClass, name, target);
-  } else {
-    navigateToCalleeMethod(currentClass, name, info.line, info.idx);
+  // Method tokens: declaration → callers popup; call site → callee jump.
+  const funT = e.target.closest(".tk-fun");
+  if (funT) {
+    e.stopPropagation();
+    const name = funT.textContent;
+    const info = getLineForElement(funT);
+    if (!info) return;
+    if (isMethodDeclaration(info.line, name)) {
+      showCallersFor(currentClass, name, funT);
+    } else {
+      navigateToCalleeMethod(currentClass, name, info.line, info.idx);
+    }
+    return;
+  }
+  // Type tokens: only meaningful in `new X(...)` context for now.
+  const typT = e.target.closest(".tk-typ");
+  if (typT) {
+    const info = getLineForElement(typT);
+    if (!info) return;
+    const tokenText = typT.textContent;
+    // Find THIS token's position on the line. A type name may legitimately
+    // recur (`Foo v = new Foo(`), so search for the rect-aligned occurrence
+    // — fall back to the first occurrence if rect math is unavailable.
+    let tokenIdx = info.line.indexOf(tokenText);
+    if (tokenIdx < 0) return;
+    // Walk forward through repeated occurrences when the current one doesn't
+    // satisfy isNewCtorContext but a later one might.
+    while (tokenIdx >= 0) {
+      if (isNewCtorContext(info.line, tokenIdx, tokenText.length)) break;
+      tokenIdx = info.line.indexOf(tokenText, tokenIdx + 1);
+    }
+    if (tokenIdx < 0) return;
+    e.stopPropagation();
+    navigateToConstructor(tokenText, info.idx, typT);
   }
 });
 
