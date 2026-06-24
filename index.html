@@ -1372,6 +1372,11 @@ function stopTransition() {                    // restore the loop (e.g. on load
 
 async function loadFile(file) {
   if (!Module) { alert("engine still loading…"); return; }
+  // History entries from the previous APK reference classes that aren't
+  // loaded here. Clear the URL hash via replaceState (the entries stay in
+  // browser history but popstate's `dexEntryExists` check filters them out).
+  try { history.replaceState(null, "", location.pathname + location.search); }
+  catch (_) {}
   const transition = startTransition();   // play the outro clip while we parse
   statusEl.innerHTML = `parsing <b>${file.name}</b>…`;
   const buf = new Uint8Array(await file.arrayBuffer());
@@ -3045,6 +3050,69 @@ function navigateToClass(desc, hint) {
 }
 
 let currentClass = null;
+// ── Browser back/forward navigation ───────────────────────────────────────
+// Every class switch becomes a history entry so the back / forward buttons
+// (and Alt-←, mouse "back" thumb button, swipe gestures on touch) walk the
+// user's navigation chain. The URL hash carries the current class descriptor
+// so a refresh stays put if the same APK is re-dropped (we don't auto-load
+// the file, but selectClass on the previous hash re-decompiles the spot).
+//
+// Suppress flag prevents the popstate handler — which calls selectClass to
+// restore the previous class — from itself pushing a NEW history entry on
+// top of the one we're restoring (which would invert back into forward,
+// trapping the user).
+let _historySuppress = false;
+function pushNavState(hint) {
+  if (_historySuppress) return;
+  if (!currentClass) return;
+  const state = {
+    type: "cls",
+    cls: currentClass,
+    hint: hint || null,
+    viewMode,
+    selectedDex,
+  };
+  // location.hash carries the class descriptor for refresh / share. The
+  // `#L...;` form survives URL encoding (no `&` or `=` collisions).
+  try { history.pushState(state, "", "#" + encodeURIComponent(currentClass)); }
+  catch (_) { /* iframe / sandboxed contexts may refuse; just don't add history */ }
+}
+window.addEventListener("popstate", (e) => {
+  const state = e.state;
+  if (!state || state.type !== "cls") return;
+  if (!Module || !dk) return;        // file not loaded yet — nothing to restore
+  _historySuppress = true;
+  try {
+    // Restore mode first (so tab routing + iso dk lookups land on the right
+    // universe before selectClass kicks off a decompile).
+    if (state.viewMode && state.viewMode !== viewMode) {
+      setMode(state.viewMode);
+    }
+    // Restore the per-dex tab when in Isolated.
+    if (state.viewMode === "isolated" && state.selectedDex !== selectedDex) {
+      const key = state.selectedDex;
+      const dexEntryExists = isolated.has(key)
+        || dexInfo.some(d => d.dex_id === key && d.valid);
+      if (dexEntryExists) {
+        selectedDex = key;
+        currentClass = null; codeLineCache = [];
+        renderDexBar();
+        renderList($("#search").value || "");
+        if (isolated.has(key)) activateIsolatedTab(key);
+        renderPanels();
+      }
+    }
+    // Navigate to the class. If same class as currently shown, just re-glow.
+    if (state.cls === currentClass) {
+      if (state.hint) locateAndGlow(state.hint);
+    } else {
+      navigateToClass(state.cls, state.hint);
+    }
+  } finally {
+    _historySuppress = false;
+  }
+});
+
 function selectClass(cls, el, hint) {
   // Dismiss any open callers popup — its anchor token is about to be replaced.
   const pop = document.getElementById("callerpop");
@@ -3059,6 +3127,7 @@ function selectClass(cls, el, hint) {
     return;
   }
   currentClass = cls;
+  pushNavState(hint);
   $("#vname").textContent = cls;
   $("#vmeta").innerHTML = '<span class="spin"></span>decompiling…';
   $("#code").textContent = "";
