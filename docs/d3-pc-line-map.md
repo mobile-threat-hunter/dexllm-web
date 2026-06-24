@@ -4,9 +4,12 @@
 **Target repo:** `mobile-threat-hunter/dex-analyzer-for-llm` (the dexllm core).
 **Consumer:** dexllm-web (this repo), bucket D-3 in [`docs/xref.md`](xref.md).
 **Tracking:** [dexllm#1](https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/issues/1).
-**Revision history:** v2 (2026-06-24) — three corrections from design review applied.
+**Revision history:**
+- v3 (2026-06-24) — Finding A (conditional/loop/switch headers bypass VisitIns),
+  B (no wrap-inheritance needed), C (AST sidechannel key definition).
+- v2 (2026-06-24) — three corrections from design review applied.
 See [§ Design-review corrections](#design-review-corrections) at the bottom for
-what changed vs. the v1 draft and why.
+diff history.
 
 The xref subsystem currently has 8 of 16 JEB/jadx-parity gaps implementable
 with existing dexkit primitives (bucket A — landed). Bucket D's only entry is
@@ -76,7 +79,8 @@ which returns one `IRFormPtr` per instruction. `BuildNodeFromBlock`
 ([`basic_blocks.cpp:544`](../../dex-analyzer-for-llm/blob/master/native/dad_cpp/basic_blocks.cpp))
 takes that return value and pushes it into the block's `lins` vector. That
 push is the canonical "statement-level IR node was just created" event — one
-stamp there covers every IR node that the Writer / JSONWriter ever sees:
+stamp there covers every leaf IR node that the Writer / JSONWriter ever
+sees, including the operands inside short-circuit `Condition` wraps:
 
 ```cpp
 // basic_blocks.cpp:544 — before
@@ -97,11 +101,25 @@ themselves even if we wanted them to. The funnel is the only place with both
 the IR pointer and the original `RawIns`. **This is what makes Step 2 a
 single line rather than ~200.**
 
-For nodes created later by structural transforms (`ShortCircuitStruct` wraps
-in `control_flow.cpp`, `IfStruct` follow-block synthesis), inheritance is
-explicit: the wrap copies `source_byte_off` from its first content child.
-Add this in the same handful of `MakeNode<T>` call sites — bounded list,
-all in `control_flow.cpp`.
+**No wrap-inheritance needed.** Structural wraps (`Condition` from
+`ShortCircuitStruct`, `LoopBlock`'s `cond_node`, etc.) don't carry their own
+offset; they expose `get_ins()` which concats their child IRs' `get_ins()`
+([`basic_blocks.cpp:306`](../../dex-analyzer-for-llm/blob/master/native/dad_cpp/basic_blocks.cpp#L306)):
+
+```cpp
+std::vector<IRFormPtr> Condition::get_ins() const {
+    auto a = cond1->get_ins();
+    auto b = cond2->get_ins();
+    a.insert(a.end(), std::make_move_iterator(b.begin()),
+             std::make_move_iterator(b.end()));
+    return a;
+}
+```
+
+Step 3's conditional/loop/switch header hooks pull the offset from
+`get_ins().back()` (the rightmost dispatch-stamped leaf) instead of relying
+on a wrap-level field. Simpler than the v2 wrap-inheritance plan and works
+for short-circuit chains of arbitrary depth.
 
 For genuinely synthetic nodes (NopExpression for a DCE'd block, structural
 braces) the default `UINT32_MAX` sentinel stays.
@@ -112,31 +130,47 @@ stamping in `opcode_ins.cpp` becomes necessary. Until then: YAGNI; the
 single-stamp design covers the user-mental-model first-anchor-wins
 semantics in Step 3.
 
-### Step 3 — Writer records the map during emit
+### Step 3 — Writer records the map at every emit chokepoint
 
 File: `native/dad_cpp/writer.cpp` + `include/writer.h`.
 
-The Writer's output is `std::ostringstream buffer_` (not a `std::string out_`),
-and every emit goes through one chokepoint:
+The Writer's output is `std::ostringstream buffer_` ([`writer.h:79`](https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/blob/master/native/dad_cpp/include/writer.h#L79)),
+and every text emit goes through one method ([`writer.h:64`](https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/blob/master/native/dad_cpp/include/writer.h#L64)):
 
 ```cpp
-// writer.h:64
 void Write(std::string_view s) { buffer_ << s; }
 ```
 
-That's the natural place to count newlines. For the IR-side hook, the
-statement-level entry point is `Writer::VisitIns(const IRFormPtr& ins)`
-([`writer.cpp:1053`](../../dex-analyzer-for-llm/blob/master/native/dad_cpp/writer.cpp)).
-Every `lins[i]` traverses this method; the inner `visit_X(...)` virtuals
-receive decomposed pieces (`IRForm* lhs`, `int64_t literal`) that don't
-carry `source_byte_off`. **Single record hook, single line-count hook:**
+That's the natural place to count newlines. Each `'\n'` bumps
+`current_line_`. The map is harvested into the result alongside the text.
+
+For IR → line recording, **there is NOT a single chokepoint** — that was a
+v2 error. The Writer emits statements via two distinct paths:
+
+| Emit path | Where the IR is observed | Hook needed |
+|---|---|---|
+| `EmitStatement` / `EmitReturn` / `EmitThrow` (regular stmt lists) | `for (auto& ins : …) VisitIns(ins)` ([`writer.cpp:794/808/812`](https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/blob/master/native/dad_cpp/writer.cpp#L794)) | `VisitIns` — ✓ statement chokepoint |
+| `EmitIf` (`if (` header) | `cond->visit_cond(wi)` ([`writer.cpp:826/848/879`](https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/blob/master/native/dad_cpp/writer.cpp#L826)) | Header hook |
+| `EmitLoop` (`while (` / `} while (` headers) | `loop->visit_cond(wi)` / `latch_cond->visit_cond(wi)` ([`writer.cpp:909-969`](https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/blob/master/native/dad_cpp/writer.cpp#L909)) | Header hook |
+| `EmitSwitch` (`switch (` header) | `lins.back()->Accept(wi)` ([`writer.cpp:981`](https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/blob/master/native/dad_cpp/writer.cpp#L981)) | Header hook |
+
+The header paths call `visit_cond(...)` / `Accept(...)` directly on the
+condition's operand IR — bypassing `VisitIns`. Without a header hook, the
+`if (...)` / `while (...)` / `switch (...)` / `} while (...)` lines get
+**zero pc_map entries**. Those are exactly the lines D-3 most needs to
+pinpoint — short-circuit conditions packed on one line are the headline
+motivation case.
+
+**Implementation:** `record_line(off)` helper called from FOUR sites.
+Header sites pull the offset from `CondBlock::get_ins().back()->source_byte_off`
+(the rightmost leaf, dispatch-stamped per Step 2; for short-circuit
+`Condition` wraps this transparently reaches into the chain via the concat
+in `Condition::get_ins()` quoted above).
 
 ```cpp
 class Writer {
     std::ostringstream buffer_;
     uint32_t current_line_ = 1;
-    // Lines with no underlying RawIns (closing braces, blank separators)
-    // simply don't appear in pc_map_; the consumer treats absence as null.
     std::vector<std::pair<uint32_t /*1-based line*/, uint32_t /*byte_off*/>>
         pc_map_;
 
@@ -144,20 +178,68 @@ class Writer {
         for (char c : s) if (c == '\n') ++current_line_;
         buffer_ << s;
     }
+
+    // First-anchor-wins per line; absence of a line in the map = consumer
+    // renders no offset (closing braces, blank separators).
+    void record_line(uint32_t off) {
+        if (off == UINT32_MAX) return;
+        if (pc_map_.empty() || pc_map_.back().first != current_line_) {
+            pc_map_.emplace_back(current_line_, off);
+        }
+    }
+
+    // Helper that pulls the rightmost stamped leaf offset from a condition
+    // expression — `Condition::get_ins()` already concats both arms, and
+    // every leaf was stamped at dispatch (Step 2).
+    static uint32_t back_offset(const IRFormPtr& ir) {
+        if (!ir) return UINT32_MAX;
+        auto ins = ir->get_ins();
+        if (ins.empty()) return ir->source_byte_off;
+        return ins.back()->source_byte_off;
+    }
 };
 
 void Writer::VisitIns(const IRFormPtr& ins) {
-    if (ins && ins->source_byte_off != UINT32_MAX
-        && (pc_map_.empty() || pc_map_.back().first != current_line_)) {
-        pc_map_.emplace_back(current_line_, ins->source_byte_off);
-    }
+    if (ins) record_line(ins->source_byte_off);
     // ... existing dispatch (unchanged)
+}
+
+// EmitIf — three sites where the header is written (the two early-exit
+// patterns + the normal `if (` path).
+void Writer::EmitIf(CondBlock* cond) {
+    // ... existing branch decisions ...
+    record_line(back_offset(cond->get_ins().empty()
+                              ? nullptr
+                              : cond->get_ins().back()));   // ← header line
+    Write("if (");
+    cond->visit_cond(wi);
+    Write(") {\n");
+    // ... rest unchanged
+}
+
+// EmitLoop — pretest (`while (`) + posttest (`} while (`) + endless
+// (`while(true)`) — only the first two have a meaningful operand offset;
+// `while(true)` has no condition IR (default UINT32_MAX → no-op).
+void Writer::EmitLoop(LoopBlock* loop) {
+    // pretest path
+    record_line(back_offset_of_cond(loop));
+    Write("while (");
+    loop->visit_cond(wi);
+    // ... posttest mirrors via latch_cond
+}
+
+// EmitSwitch
+void Writer::EmitSwitch(SwitchBlock* sw) {
+    record_line(lins.back()->source_byte_off);
+    Write("switch (");
+    lins.back()->Accept(wi);
+    // ... rest unchanged
 }
 ```
 
-The "don't push if same line already recorded" check preserves
-first-anchor-wins semantics — matches the user mental model: line N belongs
-to its FIRST observable dex op.
+The exact placement is "immediately before the `Write("if (");`/
+`Write("while (");`/`Write("switch (");`" so the recorded line is the
+header line and not whatever the previous statement ended at.
 
 (The `writer.h` header has a stale comment at the top describing a
 "dynamic_cast" dispatch design from a previous iteration; the actual
@@ -184,14 +266,27 @@ invariant (CLAUDE.md, dexllm root) — the 90–95% e2e parity vs androguard
 Behavioral §5 ("don't silently break a documented principle") makes
 node-inline a non-starter without an explicit divergence decision.
 
-**Solution: sidechannel map**, same shape as Step 3 but emitted into the AST
-result alongside the AST itself, not into the AST node bodies:
+**Solution: sidechannel map keyed by an explicit `node_id`**, written into
+the AST result alongside the AST tree itself. The AST tree's nested-list
+shape is unchanged — we just emit a parallel `pc_map: [(node_id, byte_off)]`
+list, with each AST statement node carrying a fresh integer `node_id` as
+its FIRST list element (replacing the kind string with a `[node_id, kind, …]`
+prefix is one option but again breaks index access; the cleaner choice is
+to NOT modify nodes and instead key the sidechannel by a producer/consumer
+shared traversal-order index).
+
+**Recommended key scheme — emit-order index, NOT tree position.** Both the
+producer (`JSONWriter`) and the consumer (downstream tools, dexllm-web)
+walk the AST in the same pre-order traversal and assign each visited
+statement-form node a 0-based sequential index. The producer stores
+`pc_map[i] = (i_th_visited_statement, byte_off)`; the consumer matches by
+its own counter.
 
 ```cpp
 // dast.cpp — JSONWriter
 struct AstResult {
     AstValue ast;
-    std::vector<std::pair<uint32_t /*ast_stmt_seq*/, uint32_t /*byte_off*/>>
+    std::vector<std::pair<uint32_t /*stmt_emit_seq*/, uint32_t /*byte_off*/>>
         pc_map;
 };
 
@@ -200,25 +295,48 @@ class JSONWriter {
     std::vector<std::pair<uint32_t, uint32_t>> pc_map_;
 };
 
-// Single hook — every statement-form AST node passes through ins_to_stmt.
+// Hook 1 — regular statement chokepoint.
 AstValue JSONWriter::ins_to_stmt(IRForm* op, bool is_ctor) {
     if (op && op->source_byte_off != UINT32_MAX) {
         pc_map_.emplace_back(stmt_seq_, op->source_byte_off);
     }
     ++stmt_seq_;
-    // ... existing transform (unchanged — AST shape is NOT modified)
+    // ... existing transform (unchanged)
 }
+
+// Hook 2 — visit_cond_node. Conditional headers (`if (...) {`) emit as
+// a `["IfStatement", cond_expr, then_body, else_body]` AST node — the
+// `cond_expr` is built via visit_condition without going through
+// ins_to_stmt. Same blocking problem as Writer's EmitIf.
+void JSONWriter::visit_cond_node(CondBlock* cond) {
+    auto ins = cond->get_ins();
+    if (!ins.empty() && ins.back()->source_byte_off != UINT32_MAX) {
+        pc_map_.emplace_back(stmt_seq_, ins.back()->source_byte_off);
+    }
+    ++stmt_seq_;
+    // ... existing transform (unchanged — emits IfStatement node)
+}
+
+// Hook 3 — visit_loop_node (same rationale, for WhileStatement /
+// DoWhileStatement nodes).
+void JSONWriter::visit_loop_node(LoopBlock* loop) { /* mirror */ }
+
+// Hook 4 — visit_switch_node (SwitchStatement).
+void JSONWriter::visit_switch_node(SwitchBlock* sw) { /* mirror */ }
 ```
 
 The pybind11 / wasm bindings expose `pc_map` as a separate field of the
 returned dict, mirroring the text-side `DecompileMethodWithPcMap` shape.
 
-`ast_stmt_seq` is the index of the statement-form AST node within the
-method's flattened statement sequence (depth-first pre-order). Consumers
-walking the AST keep an independent counter; matching is by sequence index,
-not by tree position. If a future consumer needs richer mapping
-(stmt → multiple sub-expression offsets), upgrade to
-`vector<pair<seq, vector<byte_off>>>` then. YAGNI.
+**Consumer contract** — every AST consumer that wants pc_map MUST walk the
+AST in the SAME order JSONWriter emits: depth-first pre-order, visiting
+statement-form nodes (anything created by `ins_to_stmt`, `visit_cond_node`,
+`visit_loop_node`, `visit_switch_node`) in source-emit order. Documented
+in the producer-side comment so a future schema bump (e.g. switching to
+post-order, or interleaving) is caught.
+
+If a future consumer needs richer mapping (stmt → multiple sub-expression
+offsets), upgrade to `vector<pair<seq, vector<byte_off>>>` then. YAGNI.
 
 ### Step 5 — new public API on `Decompiler`
 
@@ -355,33 +473,47 @@ Verify with `/dexkit-bench` before/after — must not regress >2%.
 1. **DAD parity unchanged.** `tests/parity/` 28 suites all pass.
 2. **Sweep clean.** `/dexkit-sweep` on the existing 22-APK corpus: 0 crashes,
    throughput within 2% of baseline.
-3. **New test.** `tests/test_pc_line_map.py` — decompile a hand-picked
-   method, assert (a) every Java line that mentions an invoke / iget / sget
-   / new-instance / const-string has a `pc_map` entry, (b) the entry's
-   `byte_off` matches the actual smali offset of that op.
-4. **Audit pass.** Add `tests/test_pc_map_coverage.py` — for every method in
+3. **Statement-line test.** `tests/test_pc_line_map.py` — decompile a
+   hand-picked method, assert (a) every Java line that mentions an invoke /
+   iget / sget / new-instance / const-string has a `pc_map` entry,
+   (b) the entry's `byte_off` matches the actual smali offset of that op.
+4. **Conditional/loop/switch header test** (Finding A guard — MANDATORY).
+   `tests/test_pc_line_map_headers.py` — for hand-picked methods that
+   contain:
+     - a short-circuit condition packed on one line (`(x && y) || z`)
+     - a `while (…)` loop header
+     - a `do { … } while (…)` posttest header
+     - a `switch (…)` header
+   assert the corresponding `if (`/`while (`/`} while (`/`switch (` line
+   has a `pc_map` entry, and the offset matches the actual `if-*` /
+   `*-switch` smali instruction's byte offset. Without this gate, the
+   v3 Finding A regression (missing hooks at header emit sites) lands
+   green — the headline feature silently degrades to D-2 heuristic for
+   the case D-3 was built for.
+5. **Audit pass.** Add `tests/test_pc_map_coverage.py` — for every method in
    a corpus subset, walk `pc_map` and verify the offsets correspond to real
    `RawIns` byte offsets in the snapshot.
-5. **AST forward-compat.** Existing `decompile_method_ast` consumers (the
-   dexllm-web AST display, if any) still parse cleanly with the new `pc`
-   field present.
+6. **AST forward-compat.** AST nested-list shape is byte-identical to the
+   pre-D-3 output (parity 28/28 still holds). New `pc_map` field is exposed
+   as a sibling to the existing AST tree in the result dict — consumers
+   that don't request it never see it.
 
 ## Estimated effort
 
 | Step | LoC | Risk |
 |---|---|---|
 | 1. `IRForm` field | 1 | trivial |
-| 2. Single stamp at dispatch funnel + control_flow inheritance | ~5 | trivial — bounded sites |
-| 3. Writer pc_map (Write chokepoint + VisitIns hook) | ~30 | low |
-| 4. JSONWriter pc_map sidechannel (ins_to_stmt hook) | ~30 | low — AST tree unchanged |
+| 2. Single stamp at dispatch funnel (no wrap inheritance — `Condition::get_ins()` concats) | ~3 | trivial |
+| 3. Writer pc_map (Write chokepoint + VisitIns + EmitIf/Loop/Switch header hooks) | ~50 | low |
+| 4. JSONWriter pc_map sidechannel (ins_to_stmt + visit_cond/loop/switch_node hooks) | ~50 | low — AST tree unchanged |
 | 5. `DecompileMethodWithPcMap` API | ~20 | low |
 | 6. pybind11 binding | ~15 | low |
 | 7. WASM binding (downstream) | ~15 | low |
 | 8. dexllm-web smali pane UI | ~150 | medium — UI layout, scroll math |
-| Tests | ~100 | — |
-| **Total** | **~365** | one PR per repo |
+| Tests (incl. mandatory header gate from Finding A) | ~150 | — |
+| **Total** | **~450** | one PR per repo |
 
-One dexllm PR (Steps 1–6, ~100 LoC + ~100 LoC tests), one dexllm-web PR
+One dexllm PR (Steps 1–6, ~140 LoC + ~150 LoC tests), one dexllm-web PR
 (Steps 7–8, ~165 LoC). Sequencing: dexllm first, then dexllm-web after the
 new wasm artifact is in.
 
@@ -470,7 +602,7 @@ mandatory-stop. v2 moves the AST offsets to a sidechannel map (same shape
 as the Writer's `pc_map`), keyed by AST-statement sequence index. AST tree
 shape is unchanged.
 
-### What didn't change
+### What didn't change in v2
 
 - The core idea (stamp on IR construction, harvest at emit time, parity-
   neutral metadata) is sound.
@@ -478,3 +610,58 @@ shape is unchanged.
 - Acceptance criteria + risk analysis stand.
 - Open questions stand; #2 (AST `null` vs `0`) became moot after error 3's
   fix — sidechannel maps have no node-side ambiguity.
+
+### v3 corrections (2026-06-24, second design-review round)
+
+The v2 spec had three more issues that an emit-path code review caught.
+Reproduced verbatim with file:line citations:
+
+#### Finding A (blocking) — emit hook missed conditional / loop / switch headers
+
+v2 said `record_line` runs at `VisitIns` only. But conditional, loop, and
+switch HEADERS don't go through `VisitIns` — they're emitted via direct
+`visit_cond` / `Accept` calls on the condition operand IR:
+
+| Emit path | Header emit call | Hooked by v2? |
+|---|---|---|
+| `EmitIf` ([`writer.cpp:826/848/879`](https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/blob/master/native/dad_cpp/writer.cpp#L826)) | `cond->visit_cond(wi)` | ❌ |
+| `EmitLoop` ([`writer.cpp:909/969`](https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/blob/master/native/dad_cpp/writer.cpp#L909)) | `loop->visit_cond(wi)` / `latch_cond->visit_cond(wi)` | ❌ |
+| `EmitSwitch` ([`writer.cpp:981`](https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/blob/master/native/dad_cpp/writer.cpp#L981)) | `lins.back()->Accept(wi)` | ❌ |
+
+v2 as written would silently produce ZERO pc_map entries for
+`if (…)` / `while (…)` / `} while (…)` / `switch (…)` lines — and
+short-circuit conditions on one of those lines is the headline D-3
+motivation case. Implementing v2 verbatim = the feature doesn't do its
+main job.
+
+Same gap on the AST side: `dast.cpp:538/490/591` `visit_cond_node` /
+`visit_loop_node` / `visit_switch_node` emit conditions via
+`visit_condition` / `visit_expr` and don't pass through `ins_to_stmt`.
+
+**Fix:** hooks at four sites, not one. Text and AST mirror each other.
+v3 spec (above) lays them out.
+
+#### Finding B — wrap-inheritance not needed (and turns out simpler that way)
+
+v2 said `ShortCircuitStruct` wraps need to inherit `source_byte_off` from
+their first child. Actually `Condition::get_ins()` ([`basic_blocks.cpp:306`](https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/blob/master/native/dad_cpp/basic_blocks.cpp#L306))
+already concats both arms' `get_ins()`. Each leaf is dispatch-stamped per
+Step 2. The Finding A header hook can pull from `cond->get_ins().back()`
+and get the right answer for short-circuit chains of arbitrary depth — no
+wrap-level field needed. v3 drops the wrap-inheritance plan from Step 2;
+control_flow.cpp doesn't need to touch.
+
+#### Finding C — AST sidechannel key underspecified
+
+v2 wrote "key by AST-statement sequence index" but didn't define what
+that index is (DFS pre-order? tree position? source-emit order?). With
+Finding A landing additional non-`ins_to_stmt` hook sites
+(`visit_cond_node` etc.), an under-specified key is more likely to drift
+between producer and consumer.
+
+**Fix:** v3 spec (above) explicitly names the key as **statement-emit
+sequence index** — both sides walk the AST pre-order in JSONWriter's emit
+order, incrementing a shared 0-based counter at each statement-form node
+(everything that goes through `ins_to_stmt`, `visit_cond_node`,
+`visit_loop_node`, or `visit_switch_node`). Documented in the
+producer-side comment so a future schema change is caught.
