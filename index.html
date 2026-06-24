@@ -634,7 +634,7 @@
     <video id="transvid" muted playsinline disablepictureinpicture preload="auto">
       <source src="trans.mp4" type="video/mp4">
     </video>
-    <div class="big">⬇ Drop a <b>.apk</b> / <b>.dex</b> / <b>.jar</b> here</div>
+    <div class="big">Drop a <b>.apk</b> / <b>.dex</b> / <b>.jar</b> here</div>
     <div>or click to choose a file — nothing is uploaded, decompilation runs locally</div>
   </div>
   <input id="file" type="file" accept=".apk,.dex,.jar,.zip,application/octet-stream">
@@ -1612,7 +1612,7 @@ async function processCurrentDk(label, loadMs, opts) {
   permIndex = []; permTotals = null; permPending = true;
 
   const dumpPill = dumpedSources.length
-    ? ` · <span class="pill bad" title="runtime-dumped dexes loaded with priority over the original APK">📦 ${dumpedSources.length} dump${dumpedSources.length === 1 ? "" : "s"}</span>`
+    ? ` · <span class="pill bad" title="runtime-dumped dexes loaded with priority over the original APK">${dumpedSources.length} dump${dumpedSources.length === 1 ? "" : "s"}</span>`
     : "";
   const statusHead = `<b>${label}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}${dumpPill}`;
   runtimeStatusHead = statusHead + statusPills();
@@ -1627,7 +1627,7 @@ async function processCurrentDk(label, loadMs, opts) {
     $("#vname").textContent = "— select a class —"; $("#vmeta").textContent = "";
     $("#iocbar").classList.add("empty"); $("#iocbar").innerHTML = "";
     $("#code").innerHTML = '<div class="placeholder">Pick a class on the left to decompile it.' +
-      (iocTotals && iocTotals.total ? ' Classes that reference a network indicator are marked <span class="ioc-badge">⚑</span>, or click any indicator on the right to jump to it.' : "") + '</div>';
+      (iocTotals && iocTotals.total ? ' Classes that reference a network indicator are marked with a count badge, or click any indicator on the right to jump to it.' : "") + '</div>';
     $("#iocfilter").value = ""; $("#permfilter").value = "";
     $("#search").value = "";
   }
@@ -1831,12 +1831,12 @@ function isolatedStatusHead(did) {
   const iso = isolated.get(did);
   const cls = iso && iso.classes ? iso.classes.length : 0;
   const iocPill = (iocTotals && iocTotals.total)
-    ? ` · <span class="pill bad" title="indicators in this dex only">⚑ ${iocTotals.total} IOC${iocTotals.total === 1 ? "" : "s"}</span>`
+    ? ` · <span class="pill bad" title="indicators in this dex only">${iocTotals.total} IOC${iocTotals.total === 1 ? "" : "s"}</span>`
     : (iocTotals ? ` · <span class="pill ok">no IOCs</span>` : "");
   const permPill = permPending
-    ? ` · <span class="pill" style="background:#8b949e22;color:var(--muted)">🔓 analyzing…</span>`
+    ? ` · <span class="pill" style="background:#8b949e22;color:var(--muted)">analyzing perms…</span>`
     : (permTotals && permTotals.perms
-        ? ` · <span class="pill bad" title="perms exercised in this dex only">🔓 ${permTotals.perms} perm${permTotals.perms === 1 ? "" : "s"}</span>`
+        ? ` · <span class="pill bad" title="perms exercised in this dex only">${permTotals.perms} perm${permTotals.perms === 1 ? "" : "s"}</span>`
         : "");
   return `<b>${lbl}</b> · isolated · ${cls} classes${iocPill}${permPill}`;
 }
@@ -1949,9 +1949,10 @@ function renderDexBar() {
   // file name) — concise on the strip. The full source context lives in the
   // tooltip and in the meta line under the viewer header.
   for (const d of dexInfo) {
-    const icon = d.dump ? "📦" : "📄";
     const tab = d.tabLabel || d.sourceLabel;
-    const labelHtml = `<span class="ico">${icon}</span>` + escAttr(tab);
+    // Dump vs regular is communicated via the dashed-red `.dump` border on the
+    // tab (set by makeTab via `opts.dump`); no need for an emoji prefix.
+    const labelHtml = escAttr(tab);
     if (!d.valid) {
       makeTab(labelHtml, "x-" + d.dex_id, { bad: true, title: "rejected at load: " + (d.reason || "verification failed") });
       continue;
@@ -1970,12 +1971,12 @@ function escAttr(s) {
 // Network-indicator / permission status pills (composed from current totals).
 function statusPills() {
   const iocPill = (iocTotals && iocTotals.total)
-    ? ` · <span class="pill bad" title="distinct network indicators recovered from dex strings">⚑ ${iocTotals.total} IOC${iocTotals.total === 1 ? "" : "s"}</span>`
+    ? ` · <span class="pill bad" title="distinct network indicators recovered from dex strings">${iocTotals.total} IOC${iocTotals.total === 1 ? "" : "s"}</span>`
     : ` · <span class="pill ok">no IOCs</span>`;
   const permPill = permPending
-    ? ` · <span class="pill" style="background:#8b949e22;color:var(--muted)">🔓 analyzing…</span>`
+    ? ` · <span class="pill" style="background:#8b949e22;color:var(--muted)">analyzing perms…</span>`
     : (permTotals && permTotals.perms)
-      ? ` · <span class="pill bad" title="dangerous permissions exercised through real gated-API calls">🔓 ${permTotals.perms} perm${permTotals.perms === 1 ? "" : "s"}</span>`
+      ? ` · <span class="pill bad" title="dangerous permissions exercised through real gated-API calls">${permTotals.perms} perm${permTotals.perms === 1 ? "" : "s"}</span>`
       : "";
   return iocPill + permPill;
 }
@@ -2054,7 +2055,7 @@ function makePkgRow(label, eff, depth, expand) {
   row.append(tw, pl, cnt);
   if (eff.iocCount > 0) {
     const b = document.createElement("span"); b.className = "ioc-badge";
-    b.textContent = "⚑ " + eff.iocCount;
+    b.textContent = eff.iocCount;
     b.title = eff.iocCount + " network-indicator reference(s) under this package";
     row.append(b);
   }
@@ -2080,7 +2081,7 @@ function makeClassRow(c, depth) {
   const n = iocCountFor(c.desc);
   if (n > 0) {
     const b = document.createElement("span"); b.className = "ioc-badge";
-    b.textContent = "⚑ " + n; b.title = iocTitle(c.desc);
+    b.textContent = n; b.title = iocTitle(c.desc);
     div.append(b);
   }
   div.onclick = () => selectClass(c.desc, div);
@@ -2197,7 +2198,7 @@ function renderIocBar(cls) {
   if (!total) { bar.classList.add("empty"); return; }
   bar.classList.remove("empty");
   const hd = document.createElement("div"); hd.className = "iochd";
-  hd.innerHTML = `⚑ <b>${total}</b> network indicator${total === 1 ? "" : "s"} referenced by this class ` +
+  hd.innerHTML = `<b>${total}</b> network indicator${total === 1 ? "" : "s"} referenced by this class ` +
     `<span style="color:var(--muted)">· recovered statically from dex strings · click to copy</span>`;
   bar.appendChild(hd);
   for (const cat of IOC_CATS) {
@@ -2223,7 +2224,7 @@ function renderIocPanel() {
   const panel = $("#iocpanel"), body = $("#iocpanelbody");
   if (!iocIndex.length) { panel.classList.add("empty"); body.innerHTML = ""; return; }
   panel.classList.remove("empty");
-  $("#iocphd").innerHTML = `network indicators <span class="ipcount" title="distinct indicators">⚑ ${iocIndex.length}</span>`;
+  $("#iocphd").innerHTML = `network indicators <span class="ipcount" title="distinct indicators">${iocIndex.length}</span>`;
   const filt = ($("#iocfilter").value || "").toLowerCase().trim();
   body.innerHTML = ""; let shown = 0;
   for (const cat of IOC_CATS) {
@@ -2257,7 +2258,7 @@ function renderPermPanel() {
     panel.classList.add("empty"); body.innerHTML = ""; return;
   }
   panel.classList.remove("empty");
-  $("#permhd2").innerHTML = `dangerous permissions <span class="ipcount" title="gated-API usages (app code)">🔓 ${permIndex.length}</span>`;
+  $("#permhd2").innerHTML = `dangerous permissions <span class="ipcount" title="gated-API usages (app code)">${permIndex.length}</span>`;
   const filt = ($("#permfilter").value || "").toLowerCase().trim();
   body.innerHTML = "";
   const prows = permIndex.filter(p => !filt ||
@@ -2268,7 +2269,7 @@ function renderPermPanel() {
   for (const p of prows) { if (!byPerm.has(p.perm)) byPerm.set(p.perm, []); byPerm.get(p.perm).push(p); }
   for (const [perm, rows] of [...byPerm.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
     const ph = document.createElement("div"); ph.className = "permhd";
-    ph.textContent = "🔓 " + perm.replace(/^android\.permission\./, "") + ` (${rows.length})`;
+    ph.textContent = perm.replace(/^android\.permission\./, "") + ` (${rows.length})`;
     ph.title = perm; body.appendChild(ph);
     for (const r of rows.sort((a, b) => a.api.localeCompare(b.api))) {
       const [apiCls, apiMethod] = r.api.split("#");
