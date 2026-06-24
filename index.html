@@ -1170,10 +1170,12 @@ async function addDumpedDex(file) {
     return;
   }
   const loadMs = (performance.now() - t0).toFixed(0);
-  // Sources just changed → any isolated isolation we may have built is now
-  // stale (the new dump's dex_ids weren't included). Drop it; if we're
-  // currently IN isolated mode, rebuild and re-activate the current tab.
-  disposeIsolated();
+  // Aggregate dk just got rebuilt with the new dump → the regular per-dex
+  // Isolated entries we may have built (keyed by global dex_id) are now
+  // stale (dex_ids shifted). Drop ONLY the regular entries; the user's
+  // Isolated-only "+ dex" additions ("x1"/"x2"/...) survive — a Runtime
+  // change is one-way and must not erase what was added in Isolated.
+  disposeIsolated({ keepExtras: true });
   await processCurrentDk(originalSource.label, loadMs, { firstLoad: false });
   if (viewMode === "isolated") {
     ensureIsolated();
@@ -1318,7 +1320,13 @@ async function processCurrentDk(label, loadMs, opts) {
   // Establish baseDexId per source + global dex_id → source mapping before
   // buildDexInfo / decompile routing rely on it.
   computeBaseDexIds();
-  dexInfo = buildDexInfo(rep, perDexCount);
+  // Rebuild the regular-dex entries from the current aggregate dk, but
+  // preserve any Isolated-only "+ dex" additions the user made — those are
+  // the user's own tabs in Isolated mode and don't depend on the runtime
+  // aggregate. disposeIsolated({keepExtras:true}) on the caller side keeps
+  // the matching iso DexKits alive in parallel.
+  const preservedExtras = dexInfo.filter(d => d.isolatedOnly);
+  dexInfo = buildDexInfo(rep, perDexCount).concat(preservedExtras);
 
   // network-IOC pass over the full corpus (dumps + apk) — first-wins applied.
   statusEl.innerHTML = `<b>${label}</b> · scanning for network indicators…`;
@@ -1412,23 +1420,27 @@ function renderModeToggle() {
   }
 }
 
-// Tear down all isolated DexKits + their vfs files, on both main and worker.
-// Called when sources change (loadFile, addDumpedDex) so the next isolated
-// entry rebuilds from scratch.
-function disposeIsolated() {
-  for (const [did, iso] of isolated) {
+// Tear down isolated DexKits + their vfs files, on both main and worker.
+// Two modes:
+//   default        — full wipe (loadFile reset, new APK).
+//   {keepExtras:true} — preserve Isolated-only "+ dex" additions (string-keyed
+//                      "x1"/"x2"/...) while dropping the regular APK-dex
+//                      entries. Used by addDumpedDex: a Runtime change must
+//                      not erase what the user added separately in Isolated.
+function disposeIsolated({ keepExtras = false } = {}) {
+  for (const [did, iso] of [...isolated]) {
+    const isExtra = typeof did === "string";
+    if (keepExtras && isExtra) continue;
     try { iso.dk.delete(); } catch (_) {}
-    // Regular dex_ids go to /iso-N.dex; isolated-only extras (string keys
-    // like "x1") go to /extra-x1.dex. Wipe both kinds.
-    try { Module.FS.unlink(`/iso-${did}.dex`); } catch (_) {}
-    try { Module.FS.unlink(`/extra-${did}.dex`); } catch (_) {}
+    if (isExtra) { try { Module.FS.unlink(`/extra-${did}.dex`); } catch (_) {} }
+    else         { try { Module.FS.unlink(`/iso-${did}.dex`);   } catch (_) {} }
+    isolated.delete(did);
   }
-  isolated.clear();
-  // Isolated-only entries in dexInfo go away with the iso dks; the next
-  // processCurrentDk rebuilds the regular ones.
-  dexInfo = dexInfo.filter(d => !d.isolatedOnly);
-  nextExtraKey = 1;
-  if (Module) wcall({ type: "resetIsolated" }).catch(e => console.error("worker resetIso:", e));
+  if (!keepExtras) {
+    dexInfo = dexInfo.filter(d => !d.isolatedOnly);
+    nextExtraKey = 1;
+  }
+  if (Module) wcall({ type: "resetIsolated", keepExtras }).catch(e => console.error("worker resetIso:", e));
 }
 
 // Build isolated DexKits for every valid dex in dexInfo. Sync on the main
@@ -1440,6 +1452,12 @@ function ensureIsolated() {
   if (!dk) return;
   for (const d of dexInfo) {
     if (!d.valid) continue;
+    // Isolated-only extras (the user's "+ dex" additions made in Isolated
+    // mode) carry their own bytes — addIsolatedDex already populated the
+    // isolated map and worker. They are NOT extracted from the runtime
+    // aggregate, so skip them here. Their dex_id is a string ("x1") which
+    // `dk.extractDexBytes(int)` couldn't accept anyway.
+    if (d.isolatedOnly) continue;
     if (isolated.has(d.dex_id)) continue;
     let view;
     try { view = dk.extractDexBytes(d.dex_id); }

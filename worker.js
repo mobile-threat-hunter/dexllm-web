@@ -105,9 +105,17 @@ function resetState() {
   resetIsolated();
 }
 
-function resetIsolated() {
-  for (const d of isolatedMap.values()) { try { d.delete(); } catch (_) {} }
-  isolatedMap.clear();
+// resetIsolated({keepExtras:true}) preserves the user's Isolated-mode "+ dex"
+// additions (string-keyed "x1"/"x2"/...) while dropping the regular APK dexes
+// (numeric keys). Used when Runtime adds a dump and the aggregate dk is
+// rebuilt — the runtime change must NOT clobber Isolated-only extras.
+function resetIsolated(opts) {
+  const keepExtras = !!(opts && opts.keepExtras);
+  for (const [key, isoDk] of [...isolatedMap]) {
+    if (keepExtras && typeof key === "string") continue;
+    try { isoDk.delete(); } catch (_) {}
+    isolatedMap.delete(key);
+  }
 }
 
 function rebuildDk() {
@@ -215,7 +223,7 @@ self.onmessage = (e) => {
       else if (type === "addDump")     result = await handleAddDump(msg);
       else if (type === "decompile")   result = handleDecompile(msg);
       else if (type === "addIsolated") result = await handleAddIsolated(msg);
-      else if (type === "resetIsolated") { resetIsolated(); result = {}; }
+      else if (type === "resetIsolated") { resetIsolated(msg); result = {}; }
       else if (type === "reset")       { resetState(); result = {}; }
       else throw new Error("unknown message type: " + type);
       self.postMessage({ id, ok: true, result });
