@@ -552,6 +552,52 @@
       0 0 28px rgba(107,161,255,0.16);
   }
   #glowline.on { display:block; }
+  /* Method tokens get a soft cursor + hover underline so they read as clickable.
+     `.tk-fun` is the lowercase-name-followed-by-`(` class from highlight();
+     clicks open a callers popup (declaration) or jump to the declaration (call). */
+  #code .tk-fun { cursor:pointer; }
+  #code .tk-fun:hover { text-decoration:underline; text-underline-offset:2px; }
+
+  /* Floating callers popup. Pinned with position:fixed near the clicked token.
+     Closes on Escape, click outside, or selectClass. */
+  #callerpop {
+    position:fixed; display:none; z-index:50; max-width:480px; max-height:360px;
+    overflow:auto;
+    background:linear-gradient(180deg, var(--bg-3) 0%, var(--bg-2) 100%);
+    border-radius:10px;
+    box-shadow:
+      inset 0 0 0 1px var(--line-3),
+      0 12px 40px rgba(0,0,0,0.7),
+      0 0 0 1px rgba(107,161,255,0.10);
+    font:12px/1.5 var(--f-mono);
+  }
+  #callerpop.show { display:block; }
+  .callerpop-head {
+    padding:9px 14px; font:600 10.5px/1.4 var(--f-ui);
+    letter-spacing:.05em; text-transform:uppercase; color:var(--fg-3);
+    box-shadow:inset 0 -1px 0 var(--line-1);
+    position:sticky; top:0;
+    background:linear-gradient(180deg, var(--bg-3) 0%, rgba(13,15,22,0.92) 100%);
+    backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
+  }
+  .callerpop-head b { color:var(--fg); font-family:var(--f-mono); font-weight:600; }
+  .callerpop-item {
+    padding:5px 14px; cursor:pointer; word-break:break-all;
+    color:var(--fg-2); position:relative;
+    transition:background 160ms var(--e-out), color 160ms var(--e-out);
+  }
+  .callerpop-item::before {
+    content:""; position:absolute; left:0; top:0; bottom:0; width:2px;
+    background:transparent; transition:background 160ms var(--e-out);
+  }
+  .callerpop-item:hover { background:rgba(255,255,255,0.04); color:var(--fg); }
+  .callerpop-item:hover::before {
+    background:linear-gradient(180deg, var(--brand), var(--brand-3));
+    box-shadow:0 0 8px var(--brand-glow);
+  }
+  .callerpop-empty {
+    padding:10px 14px; color:var(--fg-3); font:12px var(--f-ui);
+  }
   .placeholder {
     color:var(--fg-3); padding:40px;
     font:13px/1.6 var(--f-ui); letter-spacing:0.01em;
@@ -649,6 +695,14 @@
 <div id="dexbar">
   <button id="adddex" type="button" title="Add a runtime-dumped .dex/.apk on top (prefer=true → its classes win collisions)">+ dex</button>
   <input id="adddexfile" type="file" accept=".dex,.apk,.jar,.zip,application/octet-stream" multiple>
+</div>
+
+<!-- Floating popup listing the callers of a clicked method declaration.
+     Positioned per-click near the clicked token; populated by showCallersFor.
+     Closes on Escape, outside click, or class switch. -->
+<div id="callerpop" role="dialog" aria-label="method callers">
+  <div class="callerpop-head">callers of <b id="callerpop-method"></b></div>
+  <div id="callerpop-body"></div>
 </div>
 
 <main id="main">
@@ -2402,6 +2456,214 @@ function lazyXrefForIoc(value, cat) {
 // the class, returning empty body and never glowing the line.
 //   - Runtime mode: switch to "all" — the aggregate sees every class.
 //   - Isolated mode: switch to the FIRST dex tab that declares the class.
+// ── Code-click navigation ──────────────────────────────────────────────────
+// Method tokens in the decompiled view are clickable:
+//   - on a declaration ("public void foo(...)")  → popup with all callers of foo
+//   - on a call site   ("this.foo()" or "X.foo()") → jump to foo's declaration
+// In Isolated mode every lookup stays within the active tab's dk; if the
+// target lives in a different dex we report "not in this dex" instead of
+// crossing into another tab (Isolated == per-dex isolation contract).
+
+function activeQueryDk() {
+  // The dk to use for findCallSitesToApi / locateClassDex / listClassMethods
+  // queries triggered by code clicks. Isolated mode → that tab's iso dk so
+  // results respect the per-dex universe. Runtime mode → the aggregated dk
+  // (cross-dex callers + first-wins).
+  if (viewMode === "isolated") {
+    const iso = isolated.get(selectedDex);
+    if (iso) return iso.dk;
+  }
+  return dk;
+}
+
+// Given an element inside #code, find which line of codeLineCache it sits on.
+// Uses bounding rect math; works for both highlighted (per-token spans) and
+// plain-text chunked rendering.
+function getLineForElement(el) {
+  if (!el || !codeLineCache.length) return null;
+  const code = $("#code");
+  const r = el.getBoundingClientRect();
+  const codeR = code.getBoundingClientRect();
+  const lh = measureCodeLh(code);
+  const padTop = parseFloat(getComputedStyle(code).paddingTop) || 0;
+  const top = r.top - codeR.top + code.scrollTop;
+  const idx = Math.floor((top - padTop) / lh);
+  if (idx < 0 || idx >= codeLineCache.length) return null;
+  return { idx, line: codeLineCache[idx] };
+}
+
+// Decide whether a `name(` occurrence on `line` is a method declaration or
+// a call site. Heuristic, but matches the cases DAD's writer emits:
+//   declaration  — name preceded by a type or modifier identifier
+//   call site    — name preceded by `.` (member access) OR `:` (label) OR
+//                  `=` (assignment with a method-named LHS, which is itself
+//                  rare and not a declaration)
+function isMethodDeclaration(line, name) {
+  const idx = line.indexOf(name + "(");
+  if (idx < 0) return false;
+  const before = line.slice(0, idx).trimEnd();
+  if (before.endsWith(".") || before.endsWith(":") || before.endsWith("=")) return false;
+  // Has at least one identifier-or-keyword token immediately before the
+  // method name: that's either an access modifier or the return type.
+  // (The lone `name(` "constructor-without-modifier" form DAD doesn't emit.)
+  return /\w\s*$/.test(before);
+}
+
+// Receiver class for a method call on this line, if we can read it off the
+// text. Patterns we handle:
+//   ClassName.method(            → "ClassName" (dotted qualified path OK)
+//   pkg.sub.ClassName.method(    → "pkg.sub.ClassName"
+//   this.method(  or  method(    → null (caller is the current class)
+//   var.method(                  → null (variable receiver; can't infer type
+//                                  from one line without a full IR — fall back
+//                                  to currentClass declaration search)
+function receiverClassOf(line, name) {
+  const idx = line.indexOf(name + "(");
+  if (idx < 0) return null;
+  const before = line.slice(0, idx);
+  // Capture trailing "X.Y.Z." dotted-path with at least one Uppercase segment.
+  const m = before.match(/([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\.\s*$/);
+  if (!m) return null;
+  const path = m[1];
+  // Require at least one Uppercase segment OR multiple dotted segments —
+  // distinguishes a class-qualified call from a variable-qualified one.
+  if (!/[A-Z]/.test(path.charAt(0)) && !path.includes(".")) return null;
+  return "L" + path.replace(/\./g, "/") + ";";
+}
+
+const methodOfDescriptor = (md) => ((md.split("->")[1] || "").split("("))[0];
+
+// Popup: list callers of <currentClass>->name(...). In Isolated mode the
+// query uses the active iso dk so callers come from THAT dex only.
+function showCallersFor(cls, name, anchor) {
+  const pop = $("#callerpop");
+  $("#callerpop-method").textContent = name;
+  const body = $("#callerpop-body");
+  body.innerHTML = '<div class="callerpop-empty">searching…</div>';
+  pop.classList.add("show");
+  // Position below + slightly right of the clicked token. Clamp to viewport.
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = Math.max(12, Math.min(window.innerWidth - 500, r.left)) + "px";
+  pop.style.top = (r.bottom + 6) + "px";
+
+  // Collect every overload of `name` declared on cls, then findCallSitesToApi
+  // for each. Defer the (expensive, sync wasm) work to a setTimeout so the
+  // popup paints "searching…" first.
+  setTimeout(() => {
+    if (!pop.classList.contains("show")) return;   // dismissed mid-flight
+    const useDk = activeQueryDk();
+    const methods = useDk.listClassMethods(cls);
+    const overloads = [];
+    for (let i = 0; i < methods.size(); i++) {
+      const md = methods.get(i);
+      if (md.indexOf("->" + name + "(") > 0) overloads.push(md);
+    }
+    methods.delete();
+    if (!overloads.length) {
+      body.innerHTML = `<div class="callerpop-empty">${name} not declared on this class</div>`;
+      return;
+    }
+    const all = new Set();
+    for (const desc of overloads) {
+      const cs = useDk.findCallSitesToApi(desc);
+      for (let i = 0; i < cs.size(); i++) all.add(cs.get(i));
+      cs.delete();
+    }
+    const callers = [...all].sort();
+    if (!callers.length) {
+      const note = viewMode === "isolated" ? "no callers in this dex" : "no callers found";
+      body.innerHTML = `<div class="callerpop-empty">${note}</div>`;
+      return;
+    }
+    body.innerHTML = "";
+    for (const c of callers) {
+      const item = document.createElement("div");
+      item.className = "callerpop-item";
+      item.textContent = c;
+      item.title = c;
+      const callerCls = c.split("->")[0];
+      const callerMethod = methodOfDescriptor(c);
+      item.onclick = () => {
+        pop.classList.remove("show");
+        navigateToClass(callerCls, { needle: name, scope: callerMethod });
+      };
+      body.appendChild(item);
+    }
+  }, 30);
+}
+
+// Navigate to the declaration of `name(` referenced as a call on `line`.
+//   - If the receiver is a class explicit in the text (ClassName.method), jump
+//     to that class with the method as scope.
+//   - Else, search WITHIN the current class for the method declaration.
+//   - In Isolated mode: only navigate if the target class is loaded in the
+//     active dex; otherwise show a small toast saying "not in this dex".
+function navigateToCalleeMethod(currentCls, name, line) {
+  const recv = receiverClassOf(line, name);
+  const target = recv || currentCls;
+  if (viewMode === "isolated") {
+    const iso = isolated.get(selectedDex);
+    if (iso && iso.classes && !iso.classes.includes(target)) {
+      flashToast("'" + name + "' target not in this dex");
+      return;
+    }
+  } else if (recv) {
+    // In Runtime, verify the class is actually loaded somewhere (cheap check).
+    if (dk.locateClassDex(target) < 0) {
+      // Class isn't loaded — silently fall back to a same-class search so the
+      // user still gets something useful (the local declaration if it exists).
+      navigateToClass(currentCls, { needle: name, scope: name });
+      return;
+    }
+  }
+  navigateToClass(target, { needle: name, scope: name });
+}
+
+// Brief floating toast for inline navigation failures (mainly Isolated's
+// "target not in this dex" case). Lives in #vhead corner so the user sees it
+// without losing focus on the code.
+let toastTimer = null;
+function flashToast(msg) {
+  const head = $("#vmeta");
+  const prev = head.textContent;
+  head.dataset._prev = head.dataset._prev || prev;
+  head.innerHTML = `<span style="color:var(--warn)">${msg}</span>`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    head.textContent = head.dataset._prev || "";
+    delete head.dataset._prev;
+  }, 1800);
+}
+
+// Click delegation on #code: route to caller popup or callee navigation
+// depending on whether the clicked .tk-fun token is a declaration or a call.
+$("#code").addEventListener("click", (e) => {
+  const target = e.target.closest(".tk-fun");
+  if (!target) return;
+  if (!currentClass) return;
+  e.stopPropagation();
+  const name = target.textContent;
+  const info = getLineForElement(target);
+  if (!info) return;
+  if (isMethodDeclaration(info.line, name)) {
+    showCallersFor(currentClass, name, target);
+  } else {
+    navigateToCalleeMethod(currentClass, name, info.line);
+  }
+});
+
+// Dismiss the callers popup on outside click / Escape / class switch.
+document.addEventListener("click", (e) => {
+  const pop = $("#callerpop");
+  if (!pop.classList.contains("show")) return;
+  if (pop.contains(e.target)) return;
+  if (e.target.closest(".tk-fun")) return;   // re-click on a fun token rebuilds
+  pop.classList.remove("show");
+}, true);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") $("#callerpop").classList.remove("show");
+});
+
 function navigateToClass(desc, hint) {
   // Check the currently active tab's class pool.
   let pool;
@@ -2437,6 +2699,9 @@ function navigateToClass(desc, hint) {
 
 let currentClass = null;
 function selectClass(cls, el, hint) {
+  // Dismiss any open callers popup — its anchor token is about to be replaced.
+  const pop = document.getElementById("callerpop");
+  if (pop) pop.classList.remove("show");
   if (selectedEl) selectedEl.classList.remove("sel");
   selectedEl = el || null;
   if (el) el.classList.add("sel");
