@@ -2516,7 +2516,7 @@ function renderCode(text) {
   renderCode.plainLarge = false;
   if (text.length > 200000) {
     renderCode.plainLarge = true;
-    const lh = parseFloat(getComputedStyle(code).lineHeight) || 19.5;
+    const lh = measureCodeLh(code);
     let html = "";
     for (let i = 0; i < n; i += CHUNK_LINES) {
       const cnt = Math.min(CHUNK_LINES, n - i);
@@ -2529,6 +2529,47 @@ function renderCode(text) {
   }
   const g = document.createElement("div"); g.id = "glowline";
   code.appendChild(g);
+}
+
+// Pixel line height of #code's text rendering. parseFloat(getComputedStyle
+// .lineHeight) is the fast path on engines that report computed pixels for a
+// unitless line-height like `1.65` (Chrome, Edge, recent Firefox). Mobile
+// Safari (and some older WebKits) instead keep the multiplier as-is, in
+// which case naive parseFloat returns ~1.65 — `target * 1.65` would
+// underflow by a factor of ~font-size, and the glow lands many lines above
+// where it should.
+//
+// Fallback path inserts two hidden probe <div>s — one with 1 line, one with
+// 2 lines — and subtracts offsetHeight. That subtraction is layout-fact, not
+// CSS-string parsing, so it works regardless of how the browser exposes the
+// computed line-height value.
+function measureCodeLh(code) {
+  const cs = getComputedStyle(code);
+  const raw = cs.lineHeight;
+  // Fast path: "Npx" with a plausible value
+  if (raw && raw.endsWith("px")) {
+    const px = parseFloat(raw);
+    if (px > 5) return px;
+  }
+  // Probe path: two divs differing by ONE line, height delta = one line.
+  const mk = (text) => {
+    const e = document.createElement("div");
+    e.style.cssText =
+      "position:absolute;left:-9999px;top:0;visibility:hidden;" +
+      "white-space:pre;pointer-events:none;" +
+      "font-family:inherit;font-size:inherit;line-height:inherit;";
+    e.textContent = text;
+    code.appendChild(e);
+    return e;
+  };
+  const p1 = mk("X"), p2 = mk("X\nX");
+  // getBoundingClientRect keeps subpixel precision (offsetHeight rounds to
+  // integer — for a 20.625px line-height that's enough drift to put the
+  // glow ~5 lines off at line 172).
+  const lh = p2.getBoundingClientRect().height - p1.getBoundingClientRect().height;
+  code.removeChild(p1); code.removeChild(p2);
+  if (lh > 0) return lh;
+  return parseFloat(cs.fontSize) * 1.5;   // last-resort fallback
 }
 
 // Jump to and glow the line matching `hint`:
@@ -2552,9 +2593,8 @@ function locateAndGlow(hint) {
   if (target < 0) return;
   const code = $("#code"), g = $("#glowline");
   if (!g) return;
-  const cs = getComputedStyle(code);
-  const lh = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) * 1.5);
-  const padTop = parseFloat(cs.paddingTop) || 0;
+  const lh = measureCodeLh(code);
+  const padTop = parseFloat(getComputedStyle(code).paddingTop) || 0;
   const top = padTop + target * lh;
   g.style.top = top + "px"; g.style.height = lh + "px";
   g.classList.add("on");
