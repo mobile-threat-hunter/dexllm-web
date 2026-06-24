@@ -1,0 +1,8 @@
+## Embedded bundle is rebuilt from the repo root by build.sh. Don't commit
+## duplicates — the GitHub Pages site is the source of truth for the
+## .html / .wasm / .js artifacts; this directory only mirrors them at build
+## time to feed go:embed.
+static/
+
+## Native build artifact (Windows .exe lives in repo root dist/).
+dexllm-web
