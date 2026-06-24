@@ -556,11 +556,19 @@
      `.tk-fun` is the lowercase-name-followed-by-`(` class from highlight();
      clicks open a callers popup (declaration) or jump to the declaration (call).
      `.tk-typ` (Uppercase identifiers) is clickable too — used for the
-     `new X(...)` constructor-jump path. */
+     `new X(...)` constructor-jump path. `.tk-var` / `.tk-ide` carry field
+     names — clickable for the field get/set xref popup (declaration) and the
+     field-declaration jump (usage). */
   #code .tk-fun,
-  #code .tk-typ { cursor:pointer; }
+  #code .tk-typ,
+  #code .tk-var,
+  #code .tk-con,
+  #code .tk-ide { cursor:pointer; }
   #code .tk-fun:hover,
-  #code .tk-typ:hover { text-decoration:underline; text-underline-offset:2px; }
+  #code .tk-typ:hover,
+  #code .tk-var:hover,
+  #code .tk-con:hover,
+  #code .tk-ide:hover { text-decoration:underline; text-underline-offset:2px; }
 
   /* Floating callers popup. Pinned with position:fixed near the clicked token.
      Closes on Escape, click outside, or selectClass. */
@@ -2244,6 +2252,7 @@ function highlight(code) {
       else if (/^[A-Z]/.test(t)) cls = "tk-typ"; // Type / constructor (even if a call)
       else if (/^([vp]\d|[ms][A-Z])/.test(t)) cls = "tk-var";   // v1/p5 locals+params, mX/sX fields
       else if (/^\s*\(/.test(code.slice(last))) cls = "tk-fun"; // lowercase + '(' = method
+      else cls = "tk-ide";                                        // any other identifier — clickable as field candidate
     }
     out += cls ? `<span class="${cls}">${escHtml(t)}</span>` : escHtml(t);
   }
@@ -2570,7 +2579,7 @@ function smaliInvokesFrom(useDk, methodDesc) {
   _smaliInvokesCache.set(methodDesc, invokes);
   return invokes;
 }
-function clearSmaliCacheForClass(/* cls */) { _smaliInvokesCache.clear(); }
+function clearSmaliCacheForClass(/* cls */) { _smaliInvokesCache.clear(); _smaliFieldsCache.clear(); }
 
 const methodOfDescriptor = (md) => ((md.split("->")[1] || "").split("("))[0];
 
@@ -2717,6 +2726,183 @@ function showCallersFor(cls, name, anchor) {
       body.appendChild(item);
     }
   }, 30);
+}
+
+// ── Field xref ─────────────────────────────────────────────────────────────
+// dexkit owns L2.5 reverse maps `field_get_method_ids` / `field_put_method_ids`,
+// instruction-faithful (`iget*/sget*` for reads, `iput*/sput*` for writes), so
+// we can show READERS vs WRITERS as separate sections in the popup. C++ side
+// exposes `findFieldGetMethods` / `findFieldPutMethods` keyed by the field
+// descriptor `Lcls;->name:Type` (built from FieldIds + TypeIds + strings).
+
+// Declaration-line detector. DAD's class output emits fields BEFORE methods
+// with `[modifiers]? Type name [= initializer]?;` — no `(`, terminated by `;`,
+// and the field name is the last identifier before `=` or `;`. We use that
+// shape to distinguish a click on the field's declaration line from a click
+// on the same identifier inside a method body.
+function isFieldDeclLine(line, name) {
+  if (line.includes("(")) return false;
+  if (!/;\s*$/.test(line)) return false;
+  const tail = line.replace(/=.*$/, "").replace(/;\s*$/, "").trim();
+  // Allow `[]`/generic suffixes that might trail the field name (rare in
+  // DAD output, but be permissive).
+  return new RegExp("\\b" + name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(?:\\s*\\[\\s*\\])*\\s*$").test(tail);
+}
+
+// Render the get/set xref popup for a field declared on `cls`. Two sections
+// per field overload: "Read by" (FieldGetMethods) + "Written by"
+// (FieldPutMethods). Each row navigates to that method with `needle` set to
+// the field name so locateAndGlow highlights the access site.
+function showFieldXrefFor(cls, fieldName, anchor) {
+  const pop = $("#callerpop");
+  $("#callerpop-method").textContent = fieldName + " — field xref";
+  const body = $("#callerpop-body");
+  body.innerHTML = '<div class="callerpop-empty">searching…</div>';
+  pop.classList.add("show");
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = Math.max(12, Math.min(window.innerWidth - 500, r.left)) + "px";
+  pop.style.top = (r.bottom + 6) + "px";
+  setTimeout(() => {
+    if (!pop.classList.contains("show")) return;
+    const useDk = activeQueryDk();
+    let fieldsVec;
+    try { fieldsVec = useDk.listClassFieldDescriptors(cls); }
+    catch (_) { body.innerHTML = '<div class="callerpop-empty">field xref unavailable</div>'; return; }
+    const fieldDescs = [];
+    for (let i = 0; i < fieldsVec.size(); i++) {
+      const fd = fieldsVec.get(i);
+      const m = fd.match(/->([^:]+):/);
+      if (m && m[1] === fieldName) fieldDescs.push(fd);
+    }
+    fieldsVec.delete();
+    if (!fieldDescs.length) {
+      body.innerHTML = `<div class="callerpop-empty">${escAttr(fieldName)} not declared on this class</div>`;
+      return;
+    }
+    body.innerHTML = "";
+    for (const fd of fieldDescs) {
+      // Type tail for display (`:I`/`:Ljava/lang/String;`).
+      const typeTail = fd.split(":").slice(1).join(":");
+      if (fieldDescs.length > 1) {
+        const head = document.createElement("div");
+        head.style.cssText = "padding:4px 10px;color:var(--fg-3);font:11px var(--f-ui);border-bottom:1px solid var(--bd-1)";
+        head.textContent = fd;
+        body.appendChild(head);
+      }
+      const getters = [], setters = [];
+      let gv, pv;
+      try {
+        gv = useDk.findFieldGetMethods(fd);
+        for (let i = 0; i < gv.size(); i++) getters.push(gv.get(i));
+      } finally { if (gv) gv.delete(); }
+      try {
+        pv = useDk.findFieldPutMethods(fd);
+        for (let i = 0; i < pv.size(); i++) setters.push(pv.get(i));
+      } finally { if (pv) pv.delete(); }
+      const section = (label, list, prefix) => {
+        const sec = document.createElement("div");
+        sec.style.cssText = "padding:6px 10px 2px;color:var(--fg-3);font:11px var(--f-ui);text-transform:uppercase;letter-spacing:0.3px";
+        sec.textContent = `${label} · ${list.length}`;
+        body.appendChild(sec);
+        if (!list.length) {
+          const e = document.createElement("div");
+          e.className = "callerpop-empty";
+          e.style.padding = "2px 18px";
+          e.textContent = "none";
+          body.appendChild(e);
+          return;
+        }
+        for (const desc of list) {
+          const item = document.createElement("div");
+          item.className = "callerpop-item";
+          item.textContent = desc;
+          item.title = desc;
+          const targetCls = desc.split("->")[0];
+          const targetMethod = methodOfDescriptor(desc);
+          item.onclick = () => {
+            pop.classList.remove("show");
+            navigateToClass(targetCls, { needle: fieldName, scope: targetMethod });
+          };
+          body.appendChild(item);
+        }
+      };
+      section("Read by",    getters, "r");
+      section("Written by", setters, "w");
+      // Suffix display of the field's type — quietly informative.
+      if (typeTail) {
+        const t = document.createElement("div");
+        t.style.cssText = "padding:4px 10px;color:var(--fg-3);font:11px var(--f-ui);text-align:right;opacity:0.7";
+        t.textContent = ": " + typeTail;
+        body.appendChild(t);
+      }
+    }
+  }, 30);
+}
+
+// Smali-faithful field-access parser for the enclosing method. Each `iget*/`
+// `iput*/sget*/sput*` carries the FULL `Lcls;->name:Type` of its target — the
+// bytecode answer to "which field is this identifier?" that text inference
+// can't reach.
+const _smaliFieldsCache = new Map();
+function smaliFieldsFrom(useDk, methodDesc) {
+  if (_smaliFieldsCache.has(methodDesc)) return _smaliFieldsCache.get(methodDesc);
+  let smali;
+  try { smali = useDk.renderMethodSmali(methodDesc); }
+  catch (_) { _smaliFieldsCache.set(methodDesc, []); return []; }
+  const accesses = [];
+  // baksmali-style: `iget v0, v1, Lcls;->name:Type` or `sput-object v0, Lcls;->name:Type`.
+  const RE = /^\s*(?:0x[0-9a-f]+\s*:\s*)?([is](?:get|put)[a-z\-]*)\b[^,]*,(?:[^,]*,)?\s*(L[\w\/$]+;->[a-zA-Z_$<][\w$]*:[^\s,)}]+)/i;
+  for (const ln of smali.split("\n")) {
+    const m = ln.match(RE);
+    if (m) accesses.push({ op: m[1].toLowerCase(), descriptor: m[2] });
+  }
+  _smaliFieldsCache.set(methodDesc, accesses);
+  return accesses;
+}
+
+function navigateToFieldDeclFromUsage(currentCls, lineIdx, fieldName) {
+  const useDk = activeQueryDk();
+  const callerDesc = findEnclosingMethodDescriptor(currentCls, lineIdx, useDk);
+  let matches = [];
+  if (callerDesc) {
+    const accesses = smaliFieldsFrom(useDk, callerDesc);
+    for (const a of accesses) {
+      const namePart = (a.descriptor.split("->")[1] || "").split(":")[0];
+      if (namePart === fieldName) matches.push(a.descriptor);
+    }
+    matches = [...new Set(matches)];
+  }
+  // Fallback: same-class field-by-name match (catches `count` referenced
+  // directly in a method that the smali parse missed — rare).
+  if (!matches.length) {
+    let fields;
+    try { fields = useDk.listClassFieldDescriptors(currentCls); }
+    catch (_) { fields = null; }
+    if (fields) {
+      const sameCls = [];
+      for (let i = 0; i < fields.size(); i++) {
+        const fd = fields.get(i);
+        if ((fd.split("->")[1] || "").split(":")[0] === fieldName) sameCls.push(fd);
+      }
+      fields.delete();
+      matches = sameCls;
+    }
+  }
+  if (!matches.length) {
+    flashToast("'" + fieldName + "' field not found");
+    return;
+  }
+  if (matches.length === 1) {
+    const fd = matches[0];
+    const targetCls = fd.split("->")[0];
+    // Glow the declaration line — scope:null so locateAndGlow searches
+    // class-wide for the field name; the decl line is the only match
+    // outside method bodies.
+    navigateToClass(targetCls, { needle: fieldName, scope: null });
+    return;
+  }
+  // Multiple — picker (same chrome as callee picker).
+  showCalleePicker(matches, fieldName);
 }
 
 // Navigate to the declaration of `name(` referenced as a call on `line`.
@@ -2984,6 +3170,32 @@ function navigateToConstructor(name, lineIdx, anchor) {
 // constructor jump depending on the clicked token's class + line context.
 $("#code").addEventListener("click", (e) => {
   if (!currentClass) return;
+  // Field tokens: .tk-var (Android-prefix mX/sX, or DAD's vN/pN locals/params)
+  // and .tk-ide (any other identifier — `count` etc.). We try the field path
+  // first; if the click is on a local/param the smali fallback yields no
+  // matches and we silently no-op (locals route nowhere meaningful yet).
+  const fldT = e.target.closest(".tk-var, .tk-con, .tk-ide");
+  if (fldT && !e.target.closest(".tk-fun, .tk-typ")) {
+    const name = fldT.textContent;
+    const info = getLineForElement(fldT);
+    if (!info) return;
+    // DAD's renamed locals/params (`v1`, `p5`, `v0_3`) are never fields — bail
+    // before doing wasm work so a click on a local doesn't trigger a query.
+    if (/^[vp]\d/.test(name)) return;
+    if (isFieldDeclLine(info.line, name)) {
+      e.stopPropagation();
+      showFieldXrefFor(currentClass, name, fldT);
+      return;
+    }
+    // Usage context — only act if there IS an enclosing method (otherwise
+    // a click in the class header / static-block area would fire a fruitless
+    // smali render).
+    if (findEnclosingMethodName(info.idx)) {
+      e.stopPropagation();
+      navigateToFieldDeclFromUsage(currentClass, info.idx, name);
+      return;
+    }
+  }
   // Method tokens: declaration → callers popup; call site → callee jump.
   const funT = e.target.closest(".tk-fun");
   if (funT) {
@@ -3030,7 +3242,7 @@ document.addEventListener("click", (e) => {
   const pop = $("#callerpop");
   if (!pop.classList.contains("show")) return;
   if (pop.contains(e.target)) return;
-  if (e.target.closest(".tk-fun")) return;   // re-click on a fun token rebuilds
+  if (e.target.closest(".tk-fun, .tk-var, .tk-con, .tk-ide")) return;   // re-click on an identifier token rebuilds
   pop.classList.remove("show");
 }, true);
 document.addEventListener("keydown", (e) => {
