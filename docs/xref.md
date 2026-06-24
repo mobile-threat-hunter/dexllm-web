@@ -298,7 +298,7 @@ analysis.
 
 | Gap | What's missing | Workaround |
 |---|---|---|
-| Smali ↔ Java view sync (#11) | DAD emits Java text via `Writer::WriteMethod`; baksmali emits smali. **No PC-to-source-line map is exposed across the boundary.** DAD's AST carries some position info but it's IR-num, not source-line. | Heuristic match by invoke / field-access order within the method (a Java line containing `obj.foo()` maps to the Nth `invoke-*` of name `foo` in smali). Imprecise for trivial control-flow but useful in practice. A precise fix would require DAD changes upstream to emit per-source-line bytecode-offset metadata — out of scope for this repo. |
+| Smali ↔ Java view sync (#11) | DAD emits Java text via `Writer::WriteMethod`; baksmali emits smali. **No PC-to-source-line map is exposed across the boundary.** DAD's AST carries some position info but it's IR-num, not source-line. | Three-tier approach: D-1 side-panel (no sync, ~50 LoC, trivial); D-2 heuristic anchor matching (invoke/field/new/return order, ~200 LoC, 80–90% accurate); D-3 precise PC↔line map ([spec in `d3-pc-line-map.md`](d3-pc-line-map.md)) — requires a dexllm upstream PR that threads `RawIns::byte_off` from IR construction through Writer/JSONWriter into a new `DecompileMethodWithPcMap` API. Parity-neutral metadata-only change, ~570 LoC across two repos. |
 
 #### E. Explicitly out of scope (not a dexkit question)
 
