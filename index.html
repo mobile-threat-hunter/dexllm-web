@@ -445,11 +445,21 @@ let dexInfo = [];                // per-dex: [{dex_id, name, valid, reason, sour
 let selectedDex = "all";         // "all" | <dex_id:number>; class list filter
 let dexClasses = new Map();      // dex_id -> [classDescriptor, …] (from listClassesInDex; no dedup)
 let viewMode = "runtime";        // "runtime" | "standalone"
-// Runtime = packer-unpack workflow: aggregate [all] tab + per-dex tabs + dump
-//   priority resolution (first-wins). Multi-source classes overlap routes to
-//   the source-aware dk for each tab.
-// Standalone = each dex inspected independently as if it were the only file.
-//   No [all] tab, no aggregate. Just the per-dex tabs.
+// Runtime = the running-on-ART state. classes*.dex of the APK loaded in their
+//   declared order, then dumped dexes patched on top (dumps win class
+//   collisions, mirroring ART after a packer unpack). Aggregate [all] tab +
+//   per-dex tabs. IoC / dangerous-perm panels show the WHOLE app's view.
+// Standalone = every .dex (APK's classes*.dex + each dump) loaded into its
+//   OWN single-dex WasmDexKit — truly isolated, no first-wins, no
+//   aggregation. Each tab = one dex's universe; IoC + dangerous-perm panels
+//   show ONLY that dex's indicators, recomputed per tab.
+
+// Standalone-mode per-dex state. Key = global aggregated dex_id.
+// {dk, classes, ioc:{classIoc,iocIndex,iocTotals}, perm:{permIndex,permTotals}, permLoaded}
+let isolated = new Map();
+// Runtime-mode panel snapshot — captured when leaving runtime, restored when
+// switching back so the heavy first-load computation isn't redone.
+let runtimePanelSnap = null;
 const $ = s => document.querySelector(s);
 const statusEl = $("#status");
 
@@ -1026,6 +1036,8 @@ async function loadFile(file) {
   // path stays stable lets the rebuild flow (multi-source ctor) reuse it.
   for (const v of vfsBytes) { try { Module.FS.unlink(v); } catch (_) {} }
   vfsBytes.clear();
+  disposeIsolated();
+  runtimePanelSnap = null;
   dumpedSources = [];
   try { Module.FS.writeFile("/input.bin", buf); } catch (_) {
     try { Module.FS.unlink("/input.bin"); } catch (_) {} Module.FS.writeFile("/input.bin", buf);
@@ -1141,7 +1153,24 @@ async function addDumpedDex(file) {
     return;
   }
   const loadMs = (performance.now() - t0).toFixed(0);
+  // Sources just changed → any standalone isolation we may have built is now
+  // stale (the new dump's dex_ids weren't included). Drop it; if we're
+  // currently IN standalone mode, rebuild and re-activate the current tab.
+  disposeIsolated();
   await processCurrentDk(originalSource.label, loadMs, { firstLoad: false });
+  if (viewMode === "standalone") {
+    ensureIsolated();
+    // selectedDex may have shifted (dump dex_ids inserted ahead of the
+    // original's): if the previously-selected tab is no longer valid, jump to
+    // the first valid one.
+    if (!isolated.has(Number(selectedDex))) {
+      const first = dexInfo.find(d => d.valid && isolated.has(d.dex_id));
+      selectedDex = first ? first.dex_id : selectedDex;
+    }
+    activateStandaloneTab(selectedDex);
+    renderPanels();
+    statusEl.innerHTML = standaloneStatusHead(Number(selectedDex));
+  }
 }
 
 // Post-load pipeline shared between initial APK load and add-dumped-dex.
@@ -1203,7 +1232,8 @@ async function processCurrentDk(label, loadMs, opts) {
     ? ` · <span class="pill bad" title="runtime-dumped dexes loaded with priority over the original APK">📦 ${dumpedSources.length} dump${dumpedSources.length === 1 ? "" : "s"}</span>`
     : "";
   const statusHead = `<b>${label}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}${dumpPill}`;
-  statusEl.innerHTML = statusHead + statusPills();
+  runtimeStatusHead = statusHead + statusPills();
+  statusEl.innerHTML = runtimeStatusHead;
 
   if (opts && opts.firstLoad) {
     await opts.transition;
@@ -1268,28 +1298,172 @@ function renderModeToggle() {
   }
 }
 
-// Switch between runtime and standalone. Side effects:
-//   - re-render the dex tab bar (standalone hides [all])
-//   - if the current selection becomes invalid (e.g. "all" while in standalone),
-//     auto-pick the first valid dex
-//   - bust the same-class decompile cache so the next click re-decompiles via
-//     the routing appropriate for the new mode
+// Tear down all isolated DexKits + their vfs files, on both main and worker.
+// Called when sources change (loadFile, addDumpedDex) so the next standalone
+// entry rebuilds from scratch.
+function disposeIsolated() {
+  for (const [did, iso] of isolated) {
+    try { iso.dk.delete(); } catch (_) {}
+    try { Module.FS.unlink(`/iso-${did}.dex`); } catch (_) {}
+  }
+  isolated.clear();
+  if (Module) wcall({ type: "resetIsolated" }).catch(e => console.error("worker resetIso:", e));
+}
+
+// Build isolated DexKits for every valid dex in dexInfo. Sync on the main
+// thread (extractDexBytes + WasmDexKit ctor are both synchronous). The worker
+// mirror is fired off concurrently and the worker's message queue serializes
+// the addIsolated against the eventual decompile request — by the time the
+// user clicks a class, the worker has its iso DexKit ready.
+function ensureIsolated() {
+  if (!dk) return;
+  for (const d of dexInfo) {
+    if (!d.valid) continue;
+    if (isolated.has(d.dex_id)) continue;
+    let view;
+    try { view = dk.extractDexBytes(d.dex_id); }
+    catch (err) { console.warn("extractDexBytes failed for dex_id", d.dex_id, describeError(err)); continue; }
+    if (!view) continue;
+    const bytes = new Uint8Array(view);             // copy out before next wasm alloc
+    const vfs = `/iso-${d.dex_id}.dex`;
+    try { Module.FS.writeFile(vfs, bytes); } catch (_) {
+      try { Module.FS.unlink(vfs); } catch (_) {} Module.FS.writeFile(vfs, bytes);
+    }
+    let isoDk;
+    try { isoDk = new Module.WasmDexKit(vfs); }
+    catch (err) { console.warn("isolated load failed for dex_id", d.dex_id, describeError(err)); continue; }
+    isolated.set(d.dex_id, { dk: isoDk, classes: null, ioc: null, perm: null, permLoaded: false });
+    // Mirror to worker (fire-and-forget; the worker's serial queue guarantees
+    // ordering vs the later decompile message).
+    const wbytes = new Uint8Array(bytes);
+    wcall({ type: "addIsolated", bytes: wbytes, vfs, key: d.dex_id }, [wbytes.buffer])
+      .catch(e => console.error("worker addIsolated failed:", e));
+  }
+}
+
+// Standalone tab activation. Lazy-computes the per-tab IoC pass (~30ms for a
+// typical APK dex) and defers the heavier dangerous-perm pass to a setTimeout
+// so the UI paints first. Cached results live on the iso entry, so subsequent
+// switches to the same tab are instant.
+function activateStandaloneTab(did) {
+  const key = Number(did);
+  const iso = isolated.get(key);
+  if (!iso) return;
+
+  // Lazy class list — same set as dexClasses.get(did), but read from the iso
+  // dk for symmetry.
+  if (iso.classes === null) {
+    const v = iso.dk.listClasses();
+    const arr = []; for (let i = 0; i < v.size(); i++) arr.push(v.get(i));
+    v.delete(); arr.sort();
+    iso.classes = arr;
+  }
+
+  // Lazy IoC — runs computeIocs against THIS dex only, snapshots the panel
+  // globals, restores them. computeIocs writes to module-level vars
+  // (classIoc/iocIndex/iocTotals), so we capture the result by save/restore.
+  if (iso.ioc === null) {
+    const descriptors = iso.classes.slice();
+    const tv = iso.dk.listExternalTypeRefs();
+    for (let i = 0; i < tv.size(); i++) descriptors.push(tv.get(i));
+    tv.delete();
+    computeIocs(iso.dk, descriptors);
+    iso.ioc = { classIoc, iocIndex, iocTotals };
+  }
+  classIoc = iso.ioc.classIoc;
+  iocIndex = iso.ioc.iocIndex;
+  iocTotals = iso.ioc.iocTotals;
+
+  // Lazy perm — deferred so the UI paints before the L2 work starts. The
+  // current-tab guard (closure over `key`) bails if the user switched away
+  // mid-flight, so we don't clobber the panel with a stale result.
+  if (iso.perm) {
+    permIndex = iso.perm.permIndex;
+    permTotals = iso.perm.permTotals;
+    permPending = false;
+  } else {
+    permIndex = []; permTotals = null; permPending = true;
+    renderPermPanel();
+    setTimeout(async () => {
+      if (viewMode !== "standalone" || Number(selectedDex) !== key) return;
+      if (!dangerMap) {
+        try { dangerMap = await fetch("dangerous_perm_api.json").then(r => r.ok ? r.json() : {}); }
+        catch (_) { dangerMap = {}; }
+      }
+      if (viewMode !== "standalone" || Number(selectedDex) !== key) return;
+      computePerms(iso.dk, true);
+      iso.perm = { permIndex, permTotals };
+      iso.permLoaded = true;
+      permPending = false;
+      renderPermPanel();
+      statusEl.innerHTML = standaloneStatusHead(key);
+    }, 30);
+  }
+}
+
+// Status line text for a standalone tab — replaces the global IoC/perm pills
+// with this tab's own counts.
+function standaloneStatusHead(did) {
+  const di = dexInfo.find(d => d.dex_id === did);
+  const lbl = di ? di.sourceLabel : `dex ${did}`;
+  const iso = isolated.get(did);
+  const cls = iso && iso.classes ? iso.classes.length : 0;
+  const iocPill = (iocTotals && iocTotals.total)
+    ? ` · <span class="pill bad" title="indicators in this dex only">⚑ ${iocTotals.total} IOC${iocTotals.total === 1 ? "" : "s"}</span>`
+    : (iocTotals ? ` · <span class="pill ok">no IOCs</span>` : "");
+  const permPill = permPending
+    ? ` · <span class="pill" style="background:#8b949e22;color:var(--muted)">🔓 analyzing…</span>`
+    : (permTotals && permTotals.perms
+        ? ` · <span class="pill bad" title="perms exercised in this dex only">🔓 ${permTotals.perms} perm${permTotals.perms === 1 ? "" : "s"}</span>`
+        : "");
+  return `<b>${lbl}</b> · standalone · ${cls} classes${iocPill}${permPill}`;
+}
+
+// Save / restore the runtime-aggregate panel state across mode switches so
+// the heavy initial compute isn't redone every toggle.
+function snapshotPanels() {
+  return { classIoc, iocIndex, iocTotals, permIndex, permTotals, permPending };
+}
+function restorePanels(s) {
+  classIoc = s.classIoc; iocIndex = s.iocIndex; iocTotals = s.iocTotals;
+  permIndex = s.permIndex; permTotals = s.permTotals; permPending = s.permPending;
+}
+
+// Switch between runtime and standalone modes. The heavy lifting:
+//   - When LEAVING runtime, snapshot the aggregate panel state so switching
+//     back restores it without redoing the compute.
+//   - When ENTERING standalone, ensureIsolated extracts each dex's bytes and
+//     creates an isolated WasmDexKit (both on main thread for IoC/perm and
+//     in the worker for decompile). activateStandaloneTab then swaps the
+//     panels to the selected tab's per-dex view.
+//   - When ENTERING runtime, restore the snapshot.
 function setMode(newMode) {
   if (newMode !== "runtime" && newMode !== "standalone") return;
   if (viewMode === newMode) return;
+  if (viewMode === "runtime") runtimePanelSnap = snapshotPanels();
   viewMode = newMode;
-  // If "all" is selected but standalone hides it, fall back to the first valid
-  // dex. Likewise if we're entering runtime from a state where allClasses is
-  // populated, "all" is always available so the current selection stays valid.
-  if (viewMode === "standalone" && selectedDex === "all") {
-    const first = dexInfo.find(d => d.valid);
-    selectedDex = first ? first.dex_id : "all";
+  if (viewMode === "standalone") {
+    if (selectedDex === "all") {
+      const first = dexInfo.find(d => d.valid);
+      selectedDex = first ? first.dex_id : "all";
+    }
+    ensureIsolated();
+    activateStandaloneTab(selectedDex);
+  } else {
+    if (runtimePanelSnap) restorePanels(runtimePanelSnap);
+    statusEl.innerHTML = runtimeStatusHead || statusEl.innerHTML;
   }
   currentClass = null; codeLineCache = [];
   renderModeToggle();
   renderDexBar();
   renderList($("#search").value || "");
+  renderPanels();
+  if (viewMode === "standalone") statusEl.innerHTML = standaloneStatusHead(Number(selectedDex));
 }
+
+// Tracked at processCurrentDk end so we can restore the runtime status pills
+// when switching back from standalone.
+let runtimeStatusHead = "";
 
 // Render the per-dex tab bar. In runtime mode the leading [all] tab aggregates
 // every loaded dex via first-wins; in standalone mode each dex is its own tab
@@ -1312,12 +1486,17 @@ function renderDexBar() {
     b.addEventListener("click", () => {
       if (selectedDex === key) return;
       selectedDex = key;
-      // Tab switch changes the source the next decompile routes to — bust the
-      // "same class still on screen" cache so a re-click re-decompiles via the
-      // newly-selected source's dk.
+      // Tab switch changes which dk decompile routes to — and in standalone
+      // mode it also changes the IoC/perm panels' source dex. Bust the
+      // same-class cache so the next click re-decompiles via the new route.
       currentClass = null; codeLineCache = [];
       renderDexBar();                        // refresh .sel state
       renderList($("#search").value || "");  // refilter
+      if (viewMode === "standalone" && typeof key === "number") {
+        activateStandaloneTab(key);          // swap IoC/perm panels to this dex
+        renderPanels();
+        statusEl.innerHTML = standaloneStatusHead(key);
+      }
     });
     bar.insertBefore(b, addBtn);
     return b;
@@ -1803,24 +1982,32 @@ function selectClass(cls, el, hint) {
   $("#vmeta").innerHTML = '<span class="spin"></span>decompiling…';
   $("#code").textContent = "";
   renderIocBar(cls);
-  // Route the decompile call. In "all" mode we use the worker's aggregated dk
-  // (sourceIdx=-1). When a specific dex tab is active (per-dex tab in either
-  // mode), route to that dex's owning SOURCE so cross-source overlap shows
-  // the right version (the source index matches the worker's sources[] order:
-  // dumps first, original last). The source's standalone dk still applies
-  // first-wins WITHIN that source — a known limitation for within-source
-  // multidex collisions; rare in practice.
-  let sourceIdx = -1, dexNote = "";
+  // Route the decompile call.
+  //   - "all" tab (runtime only): aggregated dk, sourceIdx=-1
+  //   - Runtime per-dex tab: route to that dex's owning source so cross-source
+  //     overlap (e.g. dump vs original) shows the right version
+  //   - Standalone per-dex tab: route to the TRULY ISOLATED single-dex dk via
+  //     isolatedKey so the user sees that dex's body in full isolation (no
+  //     first-wins even within a multidex source)
+  let sourceIdx = -1, isolatedKey = null, dexNote = "";
   if (selectedDex !== "all") {
     const did = Number(selectedDex);
     const di = dexInfo.find(d => d.dex_id === did);
-    if (di) { sourceIdx = di.sourceIdx; dexNote = ` · from ${di.sourceLabel}`; }
+    if (di) {
+      if (viewMode === "standalone") {
+        isolatedKey = did;
+        dexNote = ` · standalone (${di.sourceLabel})`;
+      } else {
+        sourceIdx = di.sourceIdx;
+        dexNote = ` · from ${di.sourceLabel}`;
+      }
+    }
   }
   const reqStart = performance.now();
   const reqClass = cls;
   // Decompile is now async via the worker — the main thread stays responsive
   // even while a heavy class takes seconds in wasm.
-  wcall({ type: "decompile", cls: reqClass, sourceIdx }).then(java => {
+  wcall({ type: "decompile", cls: reqClass, sourceIdx, isolatedKey }).then(java => {
     // Discard out-of-order responses: if the user clicked a different class
     // while this one was decompiling, ignore this result.
     if (currentClass !== reqClass) return;

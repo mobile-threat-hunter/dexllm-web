@@ -37,6 +37,13 @@ let dumpedSources = [];                // alias of sources where .dump === true
 let originalSource = null;             // alias of sources[i] where .dump === false
 let initPromise = null;
 
+// Standalone-mode isolated DexKits: each loaded classes*.dex (across all
+// sources) gets its OWN single-dex WasmDexKit so the per-tab IoC and
+// dangerous-perm panels are TRULY isolated — no first-wins, no aggregation
+// pooling values from other dexes. Key = global aggregated dex_id (matches
+// what main thread tracks in `dexInfo`).
+let isolatedMap = new Map();
+
 function ensureInit() {
   if (Module) return Promise.resolve();
   if (initPromise) return initPromise;
@@ -94,6 +101,12 @@ function resetState() {
     try { dk.delete(); } catch (_) {}
   }
   sources = []; dumpedSources = []; originalSource = null; dk = null;
+  resetIsolated();
+}
+
+function resetIsolated() {
+  for (const d of isolatedMap.values()) { try { d.delete(); } catch (_) {} }
+  isolatedMap.clear();
 }
 
 function rebuildDk() {
@@ -145,10 +158,34 @@ async function handleAddDump({ bytes, label, vfs }) {
   return { dexCount: dk.dexCount() };
 }
 
-function handleDecompile({ cls, sourceIdx }) {
+function handleDecompile({ cls, sourceIdx, isolatedKey }) {
+  // Standalone mode: route to the isolated single-dex WasmDexKit so the user
+  // sees THAT dex's body of the class (no first-wins from siblings in the
+  // same source, no aggregation across sources).
+  if (isolatedKey != null) {
+    const isoDk = isolatedMap.get(isolatedKey);
+    if (!isoDk) throw new Error("isolated dex not loaded (key=" + isolatedKey + ")");
+    return isoDk.decompileClassJava(cls);
+  }
   const useDk = sourceIdx === -1 ? dk : (sources[sourceIdx] && sources[sourceIdx].dk) || dk;
   if (!useDk) throw new Error("no source loaded");
   return useDk.decompileClassJava(cls);
+}
+
+// Receive ONE extracted dex's bytes from main, create an isolated DexKit, and
+// store under the global dex_id key. Called once per dex on entry to
+// standalone mode; idempotent if main re-sends.
+async function handleAddIsolated({ bytes, vfs, key }) {
+  const buf = new Uint8Array(bytes);
+  try { Module.FS.writeFile(vfs, buf); } catch (_) {
+    try { Module.FS.unlink(vfs); } catch (_) {}
+    Module.FS.writeFile(vfs, buf);
+  }
+  const isoDk = new Module.WasmDexKit(vfs);
+  const prev = isolatedMap.get(key);
+  if (prev) { try { prev.delete(); } catch (_) {} }
+  isolatedMap.set(key, isoDk);
+  return { key, dexCount: isoDk.dexCount() };
 }
 
 // Serialize all messages through a single in-order queue. Each onmessage call
@@ -173,10 +210,12 @@ self.onmessage = (e) => {
       }
       await ensureInit();
       let result;
-      if (type === "load")          result = await handleLoad(msg);
-      else if (type === "addDump")  result = await handleAddDump(msg);
-      else if (type === "decompile") result = handleDecompile(msg);
-      else if (type === "reset")    { resetState(); result = {}; }
+      if (type === "load")             result = await handleLoad(msg);
+      else if (type === "addDump")     result = await handleAddDump(msg);
+      else if (type === "decompile")   result = handleDecompile(msg);
+      else if (type === "addIsolated") result = await handleAddIsolated(msg);
+      else if (type === "resetIsolated") { resetIsolated(); result = {}; }
+      else if (type === "reset")       { resetState(); result = {}; }
       else throw new Error("unknown message type: " + type);
       self.postMessage({ id, ok: true, result });
     } catch (err) {
