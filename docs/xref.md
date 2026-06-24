@@ -256,3 +256,65 @@ decline.
 
 Out of scope for this codebase (no plans): rename propagation, persistent
 project state / bookmarks. dexllm-web is a read-only triage view.
+
+### Feasibility with dexkit
+
+For each gap, which dexkit primitive backs it — and which need work outside
+dexkit's surface. (Bindings to add to `wasm_module.cpp` are listed inline.)
+
+#### A. Fully implementable with EXISTING dexkit APIs
+
+Just need a new embind binding + JS wiring. dexkit already does the heavy
+analysis.
+
+| Gap | dexkit primitive | Notes |
+|---|---|---|
+| Class/type xref (#1) | `FindMethodsByMatcher` with `MethodMatcher::usingTypes` (schema); also `FieldMatcher::type` for field-of-type-X queries | A type appears in 5 positions: field type, method return, method param, `instanceof`/`check-cast`, annotation argument. The first three are covered by matchers; the cast/instanceof ones can be picked up via smali parse if needed. |
+| Override / implementor (#2) | `FindClassesBySuperclass` + `FindClassesImplementing` (already in `DexKitExt`, just not bound) | Direct one-liner each. |
+| Class hierarchy (#3) | slicer `ClassDef::superclass_idx` + `interfaces_off` for ↑; `FindClassesBySuperclass`/`Implementing` for ↓ | Hierarchy walks the slicer reader directly — same pattern as `BuildFieldDescriptor`. |
+| String click-xref (#4) | `xrefStringsToClasses` already exposed; `BatchFindMethodsUsingStrings` in `DexKitExt` not yet exposed | Wire a binding for the method-level variant so the click can target the precise method, not just the class. |
+| Global symbol search (#8) | `listClasses` + `listClassMethods` + `listClassFieldDescriptors` already exposed | Pure JS index on top. |
+| Lambda factory unwinding (#13) | Same `findCallSitesWithOffset` + name pattern (`-$$Lambda$Cls$ABC`, `$$ExternalSyntheticLambda*`) | Extends the existing `access$NNN` BFS to a wider name pattern. |
+| Framework method markers (#15) | `listExternalMethodRefs` already exposed | Tag callees whose target class is in the external-ref set. |
+| Call graph view (#16) | Recursive `findCallSitesToApi` / smali-invokes | Implementable; UI cost is a graph-layout dep (dagre/d3), not a dexkit cost. |
+
+#### B. Pure UI / JS — no dexkit work needed
+
+| Gap | What it needs |
+|---|---|
+| Local variable highlighting (#10) | DOM scan inside the current method block. Identifier-occurrence highlighting only — no semantic analysis required. |
+| Result panel (#5) | DOM refactor: hoist the popup body into a dockable side-panel container. |
+| Human-readable descriptors (#6) | One formatter function: `Lpkg/sub/Outer$Inner;->meth(IJ)Ljava/lang/String;` → `Outer$Inner.meth(int, long): String`. |
+| Filtering (#7) | Predicate composition over the existing result list. |
+| Sort options (#9) | Comparator selector. |
+
+#### C. Implementable but EXPENSIVE — needs precompute
+
+| Gap | Why expensive | Mitigation |
+|---|---|---|
+| Reference-count badges (#12) | Requires `findCallSitesToApi` on every method in the visible class (or every class for sidebar badges). dexkit has no batched count API. | Compute lazily on class open + cache; throttle / Web Worker so the UI doesn't block. |
+
+#### D. NOT cleanly implementable without modifying the decompiler
+
+| Gap | What's missing | Workaround |
+|---|---|---|
+| Smali ↔ Java view sync (#11) | DAD emits Java text via `Writer::WriteMethod`; baksmali emits smali. **No PC-to-source-line map is exposed across the boundary.** DAD's AST carries some position info but it's IR-num, not source-line. | Heuristic match by invoke / field-access order within the method (a Java line containing `obj.foo()` maps to the Nth `invoke-*` of name `foo` in smali). Imprecise for trivial control-flow but useful in practice. A precise fix would require DAD changes upstream to emit per-source-line bytecode-offset metadata — out of scope for this repo. |
+
+#### E. Explicitly out of scope (not a dexkit question)
+
+| Item | Reason |
+|---|---|
+| Rename propagation | Read-only triage view — no persistent symbol store. |
+| Bookmarks / project state | Same. Browser history is the only persistence layer. |
+
+### Summary
+
+- **8 of 16 gaps** (A) — drop-in with new bindings + JS. No upstream changes.
+- **5 of 16 gaps** (B) — UI work only. dexkit already has what's needed via existing exposed methods.
+- **1 of 16 gaps** (C) — implementable but needs precompute strategy.
+- **1 of 16 gaps** (D) — limited by DAD's lack of source-line ↔ bytecode-offset map; heuristic only without upstream changes.
+- **2 items** (E) — out of scope by design.
+
+The high-impact Phase 1 gaps (class/type xref, override/implementor, string
+click-xref) are all in bucket A — dexkit has every primitive required. The
+rewrite's friction is JS architecture, not dexkit capability.
