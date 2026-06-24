@@ -2613,9 +2613,16 @@ function resolveTransitiveCallers(useDk, descriptors, opts = {}) {
 
 // Popup: list callers of <currentClass>->name(...). In Isolated mode the
 // query uses the active iso dk so callers come from THAT dex only.
+// Special case: name === `<init>` triggers the constructor-callers flow —
+// caller navigation glows `new ClassName(` in the caller's body rather than
+// `<init>(` (which never appears in DAD source output).
 function showCallersFor(cls, name, anchor) {
+  const isCtor = name === "<init>";
+  const simpleCls = isCtor
+    ? (cls.match(/\/([A-Za-z_$][\w$]*);$/) || ["", ""])[1]
+    : null;
   const pop = $("#callerpop");
-  $("#callerpop-method").textContent = name;
+  $("#callerpop-method").textContent = isCtor ? (simpleCls + " — new sites") : name;
   const body = $("#callerpop-body");
   body.innerHTML = '<div class="callerpop-empty">searching…</div>';
   pop.classList.add("show");
@@ -2671,11 +2678,14 @@ function showCallersFor(cls, name, anchor) {
       const callerMethod = methodOfDescriptor(c.desc);
       item.onclick = () => {
         pop.classList.remove("show");
-        // When the chain is non-empty, the actual code line in callerMethod
-        // doesn't invoke `name` directly — it invokes the first accessor in
-        // the chain. Glow that accessor's call instead so the highlight
-        // lands on the real invoke site.
-        const needle = c.chain.length ? methodOfDescriptor(c.chain[0]) : name;
+        // Glow target:
+        //   - non-empty accessor chain → glow the first accessor invocation
+        //   - constructor mode → glow the class's simple name (the line
+        //     literally reads `new ClassName(...)` in DAD output)
+        //   - normal call → glow the called method name
+        const needle = c.chain.length
+          ? methodOfDescriptor(c.chain[0])
+          : (isCtor ? simpleCls : name);
         navigateToClass(callerCls, { needle, scope: callerMethod });
       };
       body.appendChild(item);
@@ -2868,6 +2878,32 @@ function isNewCtorContext(line, tokenIdx, tokenLen) {
   return /^\s*\(/.test(after);
 }
 
+// True when the clicked .tk-typ token is the method name of a constructor
+// DECLARATION line — DAD emits constructors as `public ClassName(args)` so
+// the token must equal the current class's simple name (or trailing $Inner
+// for nested types), be followed by `(`, and the line must look like a
+// method declaration (has access modifiers / a return type before the name).
+// Clicking such a token opens the callers popup with name=`<init>` so the
+// user sees every `new ClassName(...)` site.
+function isCtorDeclaration(line, tokenText, tokenIdx, currentCls) {
+  if (!currentCls) return false;
+  const simple = (currentCls.match(/\/([A-Za-z_$][\w$]*);$/) || ["", ""])[1];
+  if (!simple) return false;
+  if (tokenText !== simple && !simple.endsWith("$" + tokenText)) return false;
+  const after = line.slice(tokenIdx + tokenText.length);
+  if (!/^\s*\(/.test(after)) return false;
+  // Constructors can be DEFAULT-access — DAD emits them with no modifier at
+  // all (e.g. `AppChooser$1(a2dp.Vol.AppChooser p1)` for a synthetic inner
+  // class ctor). So unlike isMethodDeclaration (which requires a leading
+  // type / modifier identifier for the return-type slot), we accept an
+  // empty `before` here. Just rule out the obvious call-site forms.
+  const before = line.slice(0, tokenIdx);
+  const trimmed = before.trimEnd();
+  if (trimmed.endsWith(".") || trimmed.endsWith(":") || trimmed.endsWith("=")) return false;
+  if (/\bnew\s+(?:[A-Za-z_$][\w$]*\.)*$/.test(before)) return false;   // `new` → it's a call
+  return true;
+}
+
 // `new X(...)` jump: parse the enclosing method's smali for invoke-direct
 // on `<init>` whose target class's simple-name (or trailing inner-class
 // segment) matches the clicked token, then navigate to that class. DAD emits
@@ -2936,26 +2972,30 @@ $("#code").addEventListener("click", (e) => {
     }
     return;
   }
-  // Type tokens: only meaningful in `new X(...)` context for now.
+  // Type tokens: two contexts of interest.
+  //   - `new pkg.X(` → jump to X's constructor (existing)
+  //   - `public ClassName(args)` declaration line → callers of <init> popup
   const typT = e.target.closest(".tk-typ");
   if (typT) {
     const info = getLineForElement(typT);
     if (!info) return;
     const tokenText = typT.textContent;
-    // Find THIS token's position on the line. A type name may legitimately
-    // recur (`Foo v = new Foo(`), so search for the rect-aligned occurrence
-    // — fall back to the first occurrence if rect math is unavailable.
     let tokenIdx = info.line.indexOf(tokenText);
     if (tokenIdx < 0) return;
-    // Walk forward through repeated occurrences when the current one doesn't
-    // satisfy isNewCtorContext but a later one might.
+    // Walk repeated occurrences looking for either context.
     while (tokenIdx >= 0) {
-      if (isNewCtorContext(info.line, tokenIdx, tokenText.length)) break;
+      if (isNewCtorContext(info.line, tokenIdx, tokenText.length)) {
+        e.stopPropagation();
+        navigateToConstructor(tokenText, info.idx, typT);
+        return;
+      }
+      if (isCtorDeclaration(info.line, tokenText, tokenIdx, currentClass)) {
+        e.stopPropagation();
+        showCallersFor(currentClass, "<init>", typT);
+        return;
+      }
       tokenIdx = info.line.indexOf(tokenText, tokenIdx + 1);
     }
-    if (tokenIdx < 0) return;
-    e.stopPropagation();
-    navigateToConstructor(tokenText, info.idx, typT);
   }
 });
 
