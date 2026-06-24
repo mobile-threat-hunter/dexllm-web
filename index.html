@@ -2274,11 +2274,17 @@ function renderPermPanel() {
     for (const r of rows.sort((a, b) => a.api.localeCompare(b.api))) {
       const [apiCls, apiMethod] = r.api.split("#");
       const label = apiCls.split(".").pop() + "#" + apiMethod;
-      // each caller is a method descriptor → navigate to its class and glow the
-      // line where this gated API is invoked.
+      // The signature suffix in apiMethod ("getLastKnownLocation(String)") will
+      // NEVER appear verbatim in the decompiled Java — the call site renders
+      // the actual argument expression (e.g. "((String) v20.get(v13))"), not
+      // the formal parameter type. Using apiMethod as the needle would fail to
+      // match anything and fall back to scope (the caller method declaration),
+      // making the glow land on the method header instead of the call site.
+      // Strip "(...)" so the needle is just the method NAME.
+      const apiName = apiMethod.split("(")[0];
       const targets = r.callers.slice().sort().map(c => ({
         display: c, cls: classOfMethod(c),
-        hint: { needle: apiMethod, scope: methodNameOf(c) },
+        hint: { needle: apiName, scope: methodNameOf(c) },
       }));
       body.appendChild(makeNavRow(label, "perm", targets, "callers"));
     }
