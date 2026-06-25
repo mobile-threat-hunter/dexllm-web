@@ -517,8 +517,43 @@
 
   #viewer {
     flex:1; display:flex; flex-direction:column; min-width:0;
-    background:var(--bg);
+    background:var(--bg); position:relative;
   }
+  /* Smali pane — docked-right overlay shown when "↔ smali" is toggled.
+     Lives inside #viewer (which is now position:relative). */
+  #smalipane {
+    position:absolute; right:0; top:0; bottom:0; width:480px;
+    background:var(--bg-1); border-left:1px solid var(--bd-1);
+    overflow:auto; z-index:5; display:none;
+    font:12px/1.6 var(--f-mono); color:var(--fg);
+  }
+  #smalipane.show { display:block; }
+  #smalipane .smalihd {
+    padding:8px 14px; color:var(--fg-3); font:500 11px/1.4 var(--f-ui);
+    border-bottom:1px solid var(--bd-1); position:sticky; top:0;
+    background:var(--bg-1); letter-spacing:0.03em; text-transform:uppercase;
+  }
+  #smali {
+    margin:0; padding:8px 0; white-space:pre;
+  }
+  .smali-line {
+    display:block; padding:0 14px; cursor:pointer;
+  }
+  .smali-line:hover { background:rgba(255,255,255,0.04); }
+  .smali-line.glow {
+    background:linear-gradient(90deg,
+      rgba(107,161,255,0.28) 0%,
+      rgba(107,161,255,0.10) 60%,
+      transparent 100%);
+    box-shadow:inset 2px 0 0 var(--brand);
+  }
+  #vhead .smalibtn {
+    margin-left:auto; padding:3px 9px; border:1px solid var(--bd-1);
+    border-radius:4px; cursor:pointer; color:var(--fg-3);
+    font:500 11px/1.4 var(--f-ui); user-select:none;
+  }
+  #vhead .smalibtn:hover { color:var(--fg); border-color:var(--brand); }
+  #vhead .smalibtn.active { color:var(--brand); border-color:var(--brand); }
   #vhead {
     padding:11px 18px; color:var(--fg-3);
     font:500 12px/1.4 var(--f-ui);
@@ -727,9 +762,14 @@
   </div>
   <div id="viewer">
     <div id="vhead"><span class="name" id="vname">— select a class —</span>
-      <span id="vmeta"></span></div>
+      <span id="vmeta"></span>
+      <span class="smalibtn" id="smaliBtn" title="Toggle smali sync pane (D-3 line ↔ bytecode-offset map)">↔ smali</span></div>
     <div id="iocbar" class="empty"></div>
     <pre id="code"><div class="placeholder">Pick a class on the left to decompile it.</div></pre>
+    <div id="smalipane">
+      <div class="smalihd" id="smaliHd">smali — click a Java line in the code view</div>
+      <pre id="smali"></pre>
+    </div>
   </div>
   <div id="rightcol">
     <div id="iocpanel" class="sidepanel empty">
@@ -2582,7 +2622,7 @@ function smaliInvokesFrom(useDk, methodDesc) {
   _smaliInvokesCache.set(methodDesc, invokes);
   return invokes;
 }
-function clearSmaliCacheForClass(/* cls */) { _smaliInvokesCache.clear(); _smaliFieldsCache.clear(); }
+function clearSmaliCacheForClass(/* cls */) { _smaliInvokesCache.clear(); _smaliFieldsCache.clear(); _smaliClearCache(); }
 
 const methodOfDescriptor = (md) => ((md.split("->")[1] || "").split("("))[0];
 
@@ -3340,6 +3380,155 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+// ── Smali sync (D-3) ────────────────────────────────────────────────────────
+// dexllm exposes `decompileMethodJavaWithPc(desc) → {source, pcMap}` (see
+// dexllm#1) — the line ↔ byte-offset map we couldn't compute heuristically.
+// The smali pane on the right shows the current method's smali; clicking a
+// Java line in the code viewer scrolls/glows the matching smali instruction,
+// and vice versa. Toggle via the "↔ smali" button in the viewer header.
+
+const smaliSync = {
+  enabled: false,
+  methodDesc: null,
+  cache: new Map(),   // methodDesc → {pcMap, smaliText, smaliLines}
+};
+
+function toggleSmaliSync() {
+  smaliSync.enabled = !smaliSync.enabled;
+  const pane = $("#smalipane");
+  const btn = $("#smaliBtn");
+  pane.classList.toggle("show", smaliSync.enabled);
+  btn.classList.toggle("active", smaliSync.enabled);
+  $("#code").style.paddingRight = smaliSync.enabled ? "500px" : "";
+  if (!smaliSync.enabled) {
+    smaliSync.methodDesc = null;
+    $("#smali").innerHTML = "";
+    $("#smaliHd").textContent = "smali — click a Java line in the code view";
+  }
+}
+function _smaliClearCache() { smaliSync.cache.clear(); smaliSync.methodDesc = null; if (smaliSync.enabled) $("#smali").innerHTML = ""; }
+
+function _loadMethodForSync(methodDesc) {
+  let cache = smaliSync.cache.get(methodDesc);
+  if (cache) return cache;
+  const useDk = activeQueryDk();
+  let r, smaliText;
+  try { r = useDk.decompileMethodJavaWithPc(methodDesc); }
+  catch (_) { return null; }
+  try { smaliText = useDk.renderMethodSmali(methodDesc); }
+  catch (_) { return null; }
+  const smaliLines = smaliText.split("\n").map((text, idx) => {
+    const m = text.match(/^\s*0x([0-9a-f]+)\s*:/i);
+    return { idx, offset: m ? parseInt(m[1], 16) : -1, text };
+  });
+  cache = {
+    pcMap: (r.pcMap || []).map(x => ({ line: x.line, offset: x.offset })),
+    smaliText, smaliLines,
+  };
+  smaliSync.cache.set(methodDesc, cache);
+  return cache;
+}
+
+// Find the method header line (the `public void foo(...)` line) of the
+// enclosing method. Walks backward from `fromLineIdx` looking for the first
+// access-modifier-prefixed line that contains `(` — same heuristic as
+// findEnclosingMethodName but returns the line index.
+function _methodHeaderLine(fromLineIdx) {
+  for (let i = fromLineIdx; i >= 0; i--) {
+    const line = codeLineCache[i];
+    if (!line) continue;
+    if (!/^\s*(public|private|protected|static|final|abstract|synchronized|native)\b/.test(line)) continue;
+    if (line.includes("(")) return i;
+  }
+  return -1;
+}
+
+function _renderSmaliPane(cache, glowOffset) {
+  const pre = $("#smali");
+  let html = "";
+  for (const sl of cache.smaliLines) {
+    const glow = glowOffset != null && sl.offset >= 0 && sl.offset === glowOffset;
+    html += `<span class="smali-line${glow ? " glow" : ""}" data-offset="${sl.offset}">${escAttr(sl.text)}</span>\n`;
+  }
+  pre.innerHTML = html;
+  if (glowOffset != null) {
+    const target = pre.querySelector(`.smali-line.glow`);
+    if (target) target.scrollIntoView({ block: "center" });
+  }
+}
+
+function syncSmaliFromCodeLine(codeLineIdx) {
+  if (!smaliSync.enabled || !currentClass) return;
+  const useDk = activeQueryDk();
+  const methodDesc = findEnclosingMethodDescriptor(currentClass, codeLineIdx, useDk);
+  if (!methodDesc) return;
+  const cache = _loadMethodForSync(methodDesc);
+  if (!cache) return;
+  const headerLine = _methodHeaderLine(codeLineIdx);
+  if (headerLine < 0) return;
+  // DAD's DecompileMethod source begins with a leading "\n" — its Writer
+  // counts that as line 1, putting the signature on line 2. So the class-
+  // view's header line corresponds to method-local line 2 (not 1).
+  const methodLocalLine = (codeLineIdx - headerLine) + 2;
+  let entry = cache.pcMap.find(e => e.line === methodLocalLine);
+  if (!entry) entry = cache.pcMap.find(e => e.line >= methodLocalLine);
+  smaliSync.methodDesc = methodDesc;
+  const simpleName = methodOfDescriptor(methodDesc);
+  $("#smaliHd").textContent = `smali · ${simpleName}${entry ? "  · @ 0x" + entry.offset.toString(16) : ""}`;
+  _renderSmaliPane(cache, entry ? entry.offset : null);
+}
+
+// Reverse direction — smali line click → glow the corresponding Java line.
+function syncCodeFromSmaliLine(smaliEl) {
+  const offset = parseInt(smaliEl.dataset.offset, 10);
+  if (!Number.isFinite(offset) || offset < 0) return;
+  if (!smaliSync.methodDesc) return;
+  const cache = smaliSync.cache.get(smaliSync.methodDesc);
+  if (!cache) return;
+  // Pick the pcMap entry whose offset is the largest <= clicked offset.
+  let best = null;
+  for (const e of cache.pcMap) {
+    if (e.offset <= offset && (!best || e.offset > best.offset)) best = e;
+  }
+  if (!best) return;
+  // Find the method's header line in the class view, then add (method-local - 1).
+  const simpleName = methodOfDescriptor(smaliSync.methodDesc);
+  let headerLine = -1;
+  for (let i = 0; i < codeLineCache.length; i++) {
+    if (/^\s*(public|private|protected|static|final|abstract|synchronized|native)\b/.test(codeLineCache[i])
+        && codeLineCache[i].includes(simpleName + "(")) { headerLine = i; break; }
+  }
+  // Constructor: DAD emits the class simple name, not `<init>`.
+  if (headerLine < 0 && simpleName === "<init>") {
+    const cls = smaliSync.methodDesc.split("->")[0];
+    const cn = (cls.match(/\/?([A-Za-z_$][\w$]*);$/) || ["", ""])[1];
+    for (let i = 0; i < codeLineCache.length; i++) {
+      if (codeLineCache[i].includes(cn + "(")) { headerLine = i; break; }
+    }
+  }
+  if (headerLine < 0) return;
+  const codeLineIdx = headerLine + (best.line - 2);   // method-line 2 == class header line
+  // Manual scroll + glow (locateAndGlow needs a needle).
+  const code = $("#code"), g = $("#glowline");
+  if (!g) return;
+  const lh = measureCodeLh(code);
+  const padTop = parseFloat(getComputedStyle(code).paddingTop) || 0;
+  const top = padTop + codeLineIdx * lh;
+  g.style.top = top + "px"; g.style.height = lh + "px";
+  g.classList.add("on");
+  code.scrollTop = Math.max(0, top - code.clientHeight / 2 + lh / 2);
+  // Re-glow the smali line so the user sees which offset they clicked.
+  _renderSmaliPane(cache, best.offset);
+  $("#smaliHd").textContent = `smali · ${simpleName}  · @ 0x${best.offset.toString(16)}`;
+}
+
+// Wire the toggle button + smali-line click delegation.
+$("#smaliBtn").addEventListener("click", toggleSmaliSync);
+$("#smali").addEventListener("click", (e) => {
+  const sl = e.target.closest(".smali-line");
+  if (sl) syncCodeFromSmaliLine(sl);
+});
+
 // Navigate to the declaration of `name(` referenced as a call on `line`.
 //   - If the receiver is a class explicit in the text (ClassName.method), jump
 //     to that class with the method as scope.
@@ -3605,6 +3794,13 @@ function navigateToConstructor(name, lineIdx, anchor) {
 // constructor jump depending on the clicked token's class + line context.
 $("#code").addEventListener("click", (e) => {
   if (!currentClass) return;
+  // D-3 smali sync runs ALONGSIDE the other dispatches — if the smali pane
+  // is open, every click in the code area also drives the smali pane to
+  // the matching offset (uses the click target's line, not its token).
+  if (smaliSync.enabled) {
+    const info = getLineForElement(e.target);
+    if (info) syncSmaliFromCodeLine(info.idx);
+  }
   // Field tokens: .tk-var (Android-prefix mX/sX, or DAD's vN/pN locals/params)
   // and .tk-ide (any other identifier — `count` etc.). We try the field path
   // first; if the click is on a local/param the smali fallback yields no
