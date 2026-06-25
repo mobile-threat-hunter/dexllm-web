@@ -522,22 +522,28 @@
   /* Smali pane — docked-right overlay shown when "↔ smali" is toggled.
      Lives inside #viewer (which is now position:relative). */
   #smalipane {
-    position:absolute; right:0; top:0; bottom:0; width:480px;
+    position:absolute; right:0; top:0; bottom:0; width:520px;
     background:var(--bg-1); border-left:1px solid var(--bd-1);
     overflow:auto; z-index:5; display:none;
-    font:12px/1.6 var(--f-mono); color:var(--fg);
+    font:12px/1.65 var(--f-mono); color:var(--fg);
   }
   #smalipane.show { display:block; }
   #smalipane .smalihd {
     padding:8px 14px; color:var(--fg-3); font:500 11px/1.4 var(--f-ui);
     border-bottom:1px solid var(--bd-1); position:sticky; top:0;
     background:var(--bg-1); letter-spacing:0.03em; text-transform:uppercase;
+    z-index:1;
   }
   #smali {
     margin:0; padding:8px 0; white-space:pre;
+    /* Each smali line wraps long descriptors so we don't need horizontal
+       scroll for the common case (invoke targets can be ~120 chars). */
+    white-space:pre-wrap; word-break:break-word;
   }
   .smali-line {
-    display:block; padding:0 14px; cursor:pointer;
+    display:block; padding:1px 14px 1px 70px; cursor:pointer;
+    position:relative;
+    border-left:2px solid transparent;
   }
   .smali-line:hover { background:rgba(255,255,255,0.04); }
   .smali-line.glow {
@@ -545,8 +551,24 @@
       rgba(107,161,255,0.28) 0%,
       rgba(107,161,255,0.10) 60%,
       transparent 100%);
-    box-shadow:inset 2px 0 0 var(--brand);
+    border-left-color:var(--brand);
   }
+  /* Smali syntax tokens. Offset prefix is rendered as a left-fixed gutter so
+     opcodes line up regardless of how many hex digits the offset uses. */
+  .smali-off {
+    position:absolute; left:14px; width:46px; text-align:right;
+    color:var(--fg-3); font-size:11px;
+    user-select:none;
+  }
+  .smali-op  { color:#ff8a5b; font-weight:500; }    /* opcodes — warm orange */
+  .smali-reg { color:#a8cfee; }                     /* v0/p1   — soft blue   */
+  .smali-typ { color:#ffaa6e; }                     /* Lcls;   — same as Java tk-typ */
+  .smali-mtd { color:#c8a8ff; }                     /* method name in invoke */
+  .smali-fld { color:#a8cfee; }                     /* field name in iget/iput */
+  .smali-str { color:#8bd99d; }                     /* "..."   — string */
+  .smali-num { color:#e5c378; }                     /* numbers */
+  .smali-dir { color:#ff6b80; font-size:11px; }     /* .registers / .end method */
+  .smali-cm  { color:var(--fg-3); font-style:italic; font-size:11px; } /* ;... comments */
   #vhead .smalibtn {
     margin-left:auto; padding:3px 9px; border:1px solid var(--bd-1);
     border-radius:4px; cursor:pointer; color:var(--fg-3);
@@ -3390,7 +3412,8 @@ document.addEventListener("keydown", (e) => {
 const smaliSync = {
   enabled: false,
   methodDesc: null,
-  cache: new Map(),   // methodDesc → {pcMap, smaliText, smaliLines}
+  classHeaderLine: -1,  // class-view line index of the currently-shown method's header
+  cache: new Map(),     // methodDesc → {pcMap, smaliText, smaliLines}
 };
 
 function toggleSmaliSync() {
@@ -3399,14 +3422,19 @@ function toggleSmaliSync() {
   const btn = $("#smaliBtn");
   pane.classList.toggle("show", smaliSync.enabled);
   btn.classList.toggle("active", smaliSync.enabled);
-  $("#code").style.paddingRight = smaliSync.enabled ? "500px" : "";
+  $("#code").style.paddingRight = smaliSync.enabled ? "540px" : "";
   if (!smaliSync.enabled) {
     smaliSync.methodDesc = null;
     $("#smali").innerHTML = "";
     $("#smaliHd").textContent = "smali — click a Java line in the code view";
   }
 }
-function _smaliClearCache() { smaliSync.cache.clear(); smaliSync.methodDesc = null; if (smaliSync.enabled) $("#smali").innerHTML = ""; }
+function _smaliClearCache() {
+  smaliSync.cache.clear();
+  smaliSync.methodDesc = null;
+  smaliSync.classHeaderLine = -1;
+  if (smaliSync.enabled) $("#smali").innerHTML = "";
+}
 
 function _loadMethodForSync(methodDesc) {
   let cache = smaliSync.cache.get(methodDesc);
@@ -3429,18 +3457,96 @@ function _loadMethodForSync(methodDesc) {
   return cache;
 }
 
-// Find the method header line (the `public void foo(...)` line) of the
-// enclosing method. Walks backward from `fromLineIdx` looking for the first
-// access-modifier-prefixed line that contains `(` — same heuristic as
-// findEnclosingMethodName but returns the line index.
-function _methodHeaderLine(fromLineIdx) {
+// Find the method header line of `methodSimpleName` in the class view,
+// walking backward from fromLineIdx. The simple-name check is what prevents
+// landing on a sibling method's header — the previous version only checked
+// the modifier prefix + `(`, which matched the wrong method when the user
+// clicked inside method M and a sibling overload of the same name existed
+// directly above. With the name pinned, we'll only ever land on M's own
+// signature line.
+function _methodHeaderLine(fromLineIdx, methodSimpleName) {
+  const needle = methodSimpleName + "(";
   for (let i = fromLineIdx; i >= 0; i--) {
     const line = codeLineCache[i];
     if (!line) continue;
     if (!/^\s*(public|private|protected|static|final|abstract|synchronized|native)\b/.test(line)) continue;
-    if (line.includes("(")) return i;
+    if (line.includes(needle)) return i;
+  }
+  // Fallback (rare): some constructors / static-init lines don't carry a
+  // modifier (package-private ctor in obfuscated code). Walk again without
+  // the modifier guard.
+  for (let i = fromLineIdx; i >= 0; i--) {
+    const line = codeLineCache[i];
+    if (line && line.includes(needle)) return i;
   }
   return -1;
+}
+
+// Smali syntax highlighter. Splits each line into the offset prefix, the
+// opcode, register operands, the type/method/field descriptor target, and
+// any trailing literal. Each piece gets a .smali-* span so the CSS palette
+// can color them — opcodes orange, registers blue, types same orange as
+// Java's tk-typ for visual consistency, etc.
+function _highlightSmaliLine(text) {
+  // Directive line: `.method`, `.registers`, `.end method`, …
+  if (/^\s*\./.test(text)) {
+    return `<span class="smali-dir">${escAttr(text)}</span>`;
+  }
+  // Method header from RenderMethodSmali: `Lcls;->name(proto)Ret;` plain
+  if (/^L[\w\/$]+;->/.test(text.trim())) {
+    return `<span class="smali-typ">${escAttr(text)}</span>`;
+  }
+  // Strip the `0xNN:` prefix from the line; we render it in a left gutter.
+  const m = text.match(/^(\s*)(0x[0-9a-f]+)\s*:\s*(.*)$/i);
+  let indent = "", off = "", body = text;
+  if (m) { indent = m[1]; off = m[2]; body = m[3]; }
+  // Comment after `;` — preserve trailing.
+  let trailing = "";
+  const ci = body.indexOf(";");
+  if (ci >= 0 && !/^"/.test(body.slice(0, ci))) {
+    trailing = body.slice(ci);
+    body = body.slice(0, ci);
+  }
+  // Tokenize body. baksmali format:
+  //   opcode v0[, v1, v2], target-descriptor[, literal]
+  // We just walk and color by token shape.
+  let out = "";
+  const RE = /(invoke-[a-z/-]+|iget[a-z/-]*|iput[a-z/-]*|sget[a-z/-]*|sput[a-z/-]*|const[a-z0-9/-]*|move[a-z/-]*|new-[a-z-]+|return[a-z/-]*|aget[a-z/-]*|aput[a-z/-]*|throw|monitor-[a-z]+|check-cast|instance-of|array-length|fill-array-data|filled-new-array[a-z/-]*|goto[/0-9]*|cmp[gl]?-[a-z]+|neg-[a-z]+|not-[a-z]+|int-to-[a-z]+|long-to-[a-z]+|float-to-[a-z]+|double-to-[a-z]+|add-[a-z0-9/-]+|sub-[a-z0-9/-]+|mul-[a-z0-9/-]+|div-[a-z0-9/-]+|rem-[a-z0-9/-]+|and-[a-z0-9/-]+|or-[a-z0-9/-]+|xor-[a-z0-9/-]+|shl-[a-z0-9/-]+|shr-[a-z0-9/-]+|ushr-[a-z0-9/-]+|rsub-[a-z0-9/-]+|if-[a-z]+|nop|packed-switch|sparse-switch)|([vp]\d+)|("(?:\\.|[^"\\])*")|(L[\w\/$]+;->[a-zA-Z_$<][\w$<>]*\([^)]*\)[\w\/$;\[]+)|(L[\w\/$]+;->[a-zA-Z_$][\w$]*:[\w\/$;\[]+)|(L[\w\/$]+;|\[+[A-Z][\w\/$;]*)|(-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?|0x[0-9a-fA-F]+|0[bB][01]+)|([,{}()])|(\s+)|([^\s,{}()]+)/g;
+  let mm, last = 0;
+  while ((mm = RE.exec(body))) {
+    out += escAttr(body.slice(last, mm.index));
+    last = RE.lastIndex;
+    if (mm[1])      out += `<span class="smali-op">${escAttr(mm[0])}</span>`;
+    else if (mm[2]) out += `<span class="smali-reg">${escAttr(mm[0])}</span>`;
+    else if (mm[3]) out += `<span class="smali-str">${escAttr(mm[0])}</span>`;
+    else if (mm[4]) {
+      // Method target: Lcls;->name(proto)Ret. Color cls / method name.
+      const arrow = mm[0].indexOf("->");
+      const open = mm[0].indexOf("(", arrow);
+      out += `<span class="smali-typ">${escAttr(mm[0].slice(0, arrow))}</span>`
+           + `<span style="color:var(--fg-3)">-&gt;</span>`
+           + `<span class="smali-mtd">${escAttr(mm[0].slice(arrow + 2, open))}</span>`
+           + `<span style="color:var(--fg-3)">${escAttr(mm[0].slice(open))}</span>`;
+    }
+    else if (mm[5]) {
+      // Field target: Lcls;->name:Type
+      const arrow = mm[0].indexOf("->");
+      const colon = mm[0].indexOf(":", arrow);
+      out += `<span class="smali-typ">${escAttr(mm[0].slice(0, arrow))}</span>`
+           + `<span style="color:var(--fg-3)">-&gt;</span>`
+           + `<span class="smali-fld">${escAttr(mm[0].slice(arrow + 2, colon))}</span>`
+           + `<span style="color:var(--fg-3)">:</span>`
+           + `<span class="smali-typ">${escAttr(mm[0].slice(colon + 1))}</span>`;
+    }
+    else if (mm[6]) out += `<span class="smali-typ">${escAttr(mm[0])}</span>`;
+    else if (mm[7]) out += `<span class="smali-num">${escAttr(mm[0])}</span>`;
+    else if (mm[8]) out += `<span style="color:var(--fg-3)">${escAttr(mm[0])}</span>`;
+    else            out += escAttr(mm[0]);
+  }
+  out += escAttr(body.slice(last));
+  const offHtml = off ? `<span class="smali-off">${escAttr(off)}</span>` : "";
+  const trailHtml = trailing ? `<span class="smali-cm">${escAttr(trailing)}</span>` : "";
+  return offHtml + escAttr(indent) + out + trailHtml;
 }
 
 function _renderSmaliPane(cache, glowOffset) {
@@ -3448,7 +3554,9 @@ function _renderSmaliPane(cache, glowOffset) {
   let html = "";
   for (const sl of cache.smaliLines) {
     const glow = glowOffset != null && sl.offset >= 0 && sl.offset === glowOffset;
-    html += `<span class="smali-line${glow ? " glow" : ""}" data-offset="${sl.offset}">${escAttr(sl.text)}</span>\n`;
+    html += `<span class="smali-line${glow ? " glow" : ""}" data-offset="${sl.offset}">`
+         + _highlightSmaliLine(sl.text)
+         + `</span>\n`;
   }
   pre.innerHTML = html;
   if (glowOffset != null) {
@@ -3462,19 +3570,37 @@ function syncSmaliFromCodeLine(codeLineIdx) {
   const useDk = activeQueryDk();
   const methodDesc = findEnclosingMethodDescriptor(currentClass, codeLineIdx, useDk);
   if (!methodDesc) return;
+  // Header simple name as it appears in DAD's class-view text: descriptors
+  // use `<init>` / `<clinit>`, but DAD writes constructors as the class
+  // simple name and static-init as `static`.
+  const cls = methodDesc.split("->")[0];
+  const dexName = methodOfDescriptor(methodDesc);
+  const classSimple = (cls.match(/\/?([A-Za-z_$][\w$]*);$/) || ["", ""])[1];
+  let viewName = dexName;
+  if (dexName === "<init>") viewName = classSimple;
+  else if (dexName === "<clinit>") viewName = "static";
+  const headerLine = _methodHeaderLine(codeLineIdx, viewName);
+  if (headerLine < 0) return;
   const cache = _loadMethodForSync(methodDesc);
   if (!cache) return;
-  const headerLine = _methodHeaderLine(codeLineIdx);
-  if (headerLine < 0) return;
   // DAD's DecompileMethod source begins with a leading "\n" — its Writer
   // counts that as line 1, putting the signature on line 2. So the class-
   // view's header line corresponds to method-local line 2 (not 1).
   const methodLocalLine = (codeLineIdx - headerLine) + 2;
+  // Exact match → glow. Else: the dex op semantically "active" on this Java
+  // line is the most-recent entry whose line is <= clicked line (= the last
+  // op emitted by the source). For lines BEFORE the first pcMap entry
+  // (signature, blank, opening brace) we leave the glow off — there's no
+  // meaningful dex op for those.
   let entry = cache.pcMap.find(e => e.line === methodLocalLine);
-  if (!entry) entry = cache.pcMap.find(e => e.line >= methodLocalLine);
+  if (!entry) {
+    for (const e of cache.pcMap) {
+      if (e.line <= methodLocalLine && (!entry || e.line > entry.line)) entry = e;
+    }
+  }
   smaliSync.methodDesc = methodDesc;
-  const simpleName = methodOfDescriptor(methodDesc);
-  $("#smaliHd").textContent = `smali · ${simpleName}${entry ? "  · @ 0x" + entry.offset.toString(16) : ""}`;
+  smaliSync.classHeaderLine = headerLine;
+  $("#smaliHd").textContent = `smali · ${dexName}${entry ? "  · @ 0x" + entry.offset.toString(16) : ""}`;
   _renderSmaliPane(cache, entry ? entry.offset : null);
 }
 
@@ -3491,21 +3617,11 @@ function syncCodeFromSmaliLine(smaliEl) {
     if (e.offset <= offset && (!best || e.offset > best.offset)) best = e;
   }
   if (!best) return;
-  // Find the method's header line in the class view, then add (method-local - 1).
-  const simpleName = methodOfDescriptor(smaliSync.methodDesc);
-  let headerLine = -1;
-  for (let i = 0; i < codeLineCache.length; i++) {
-    if (/^\s*(public|private|protected|static|final|abstract|synchronized|native)\b/.test(codeLineCache[i])
-        && codeLineCache[i].includes(simpleName + "(")) { headerLine = i; break; }
-  }
-  // Constructor: DAD emits the class simple name, not `<init>`.
-  if (headerLine < 0 && simpleName === "<init>") {
-    const cls = smaliSync.methodDesc.split("->")[0];
-    const cn = (cls.match(/\/?([A-Za-z_$][\w$]*);$/) || ["", ""])[1];
-    for (let i = 0; i < codeLineCache.length; i++) {
-      if (codeLineCache[i].includes(cn + "(")) { headerLine = i; break; }
-    }
-  }
+  // Use the header line cached during forward sync — that's the EXACT
+  // line the user's Java click resolved to. Avoids ambiguity when several
+  // methods share a simple name (constructor overloads, static_factory
+  // patterns, sibling overloads with the same lambda name).
+  const headerLine = smaliSync.classHeaderLine;
   if (headerLine < 0) return;
   const codeLineIdx = headerLine + (best.line - 2);   // method-line 2 == class header line
   // Manual scroll + glow (locateAndGlow needs a needle).
