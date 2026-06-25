@@ -1481,6 +1481,7 @@ async function loadFile(file) {
   selectedDex = "all";
   if (dk) { try { dk.delete(); } catch (_) {} dk = null; }
   clearSymbolIndex();
+  _smaliBumpDk();
 
   let t0 = performance.now();
   try {
@@ -1920,6 +1921,8 @@ function activateIsolatedTab(did) {
   const key = did;
   const iso = isolated.get(key);
   if (!iso) return;
+  // Switching the active iso dk → D-3 cache becomes invalid.
+  if (selectedDex !== key) _smaliBumpDk();
 
   // Lazy class list — same set as dexClasses.get(did), but read from the iso
   // dk for symmetry.
@@ -2013,6 +2016,10 @@ function restorePanels(s) {
 function setMode(newMode) {
   if (newMode !== "runtime" && newMode !== "isolated") return;
   if (viewMode === newMode) return;
+  // Active dexkit identity is about to change — bump D-3 cache token so a
+  // methodDesc cached under the previous dk's render gets evicted before
+  // returning stale smali.
+  _smaliBumpDk();
   if (viewMode === "runtime") runtimePanelSnap = snapshotPanels();
   viewMode = newMode;
   if (viewMode === "isolated") {
@@ -2575,16 +2582,25 @@ function activeQueryDk() {
 }
 
 // Given an element inside #code, find which line of codeLineCache it sits on.
-// Uses bounding rect math; works for both highlighted (per-token spans) and
-// plain-text chunked rendering.
-function getLineForElement(el) {
+// `evt` (optional) carries the original click event — in plain-large render
+// mode the target is the whole .chunk div (400 lines), so its bounding rect
+// always points at the chunk's first line. Falling back to `evt.clientY`
+// gives us the actual cursor y, so the click maps to the correct line.
+function getLineForElement(el, evt) {
   if (!el || !codeLineCache.length) return null;
   const code = $("#code");
-  const r = el.getBoundingClientRect();
   const codeR = code.getBoundingClientRect();
   const lh = measureCodeLh(code);
   const padTop = parseFloat(getComputedStyle(code).paddingTop) || 0;
-  const top = r.top - codeR.top + code.scrollTop;
+  // Prefer the cursor y when we have it and the target is a coarse-grained
+  // container (chunk, the #code <pre> itself, or anything spanning >1 line).
+  let top;
+  const r = el.getBoundingClientRect();
+  if (evt && Number.isFinite(evt.clientY) && (r.height > lh * 1.5 || el === code)) {
+    top = evt.clientY - codeR.top + code.scrollTop;
+  } else {
+    top = r.top - codeR.top + code.scrollTop;
+  }
   const idx = Math.floor((top - padTop) / lh);
   if (idx < 0 || idx >= codeLineCache.length) return null;
   return { idx, line: codeLineCache[idx] };
@@ -2659,6 +2675,9 @@ function smaliInvokesFrom(useDk, methodDesc) {
   _smaliInvokesCache.set(methodDesc, invokes);
   return invokes;
 }
+// Called from places that want to drop ALL smali-derived caches (invokes,
+// fields, D-3 sync). Wired into selectClass via the explicit class-change
+// branch above; isolated/runtime mode changes go through _smaliBumpDk.
 function clearSmaliCacheForClass(/* cls */) { _smaliInvokesCache.clear(); _smaliFieldsCache.clear(); _smaliClearCache(); }
 
 const methodOfDescriptor = (md) => ((md.split("->")[1] || "").split("("))[0];
@@ -3427,8 +3446,11 @@ document.addEventListener("keydown", (e) => {
 const smaliSync = {
   enabled: false,
   methodDesc: null,
-  classHeaderLine: -1,  // class-view line index of the currently-shown method's header
-  cache: new Map(),     // methodDesc → {pcMap, smaliText, smaliLines}
+  dexName: null,                // simple name to display in header (overload / ctor / clinit aware)
+  classHeaderLine: -1,          // class-view line index of the currently-shown method's header
+  cacheClass: null,             // currentClass at the time the cache below was built
+  cacheDkToken: 0,              // bumped on every mode/dump/loadFile change to invalidate
+  cache: new Map(),             // methodDesc → {pcMap, smaliText, smaliLines}
 };
 
 // Persisted pane width — restored on toggle, written on drop. Bounded to
@@ -3436,7 +3458,9 @@ const smaliSync = {
 // view of space.
 const SMALI_W_KEY = "dexllm-web.smaliWidth";
 function _smaliPaneWidth() {
-  const stored = parseInt(localStorage.getItem(SMALI_W_KEY) || "", 10);
+  let stored = NaN;
+  try { stored = parseInt(localStorage.getItem(SMALI_W_KEY) || "", 10); }
+  catch (_) {}
   if (Number.isFinite(stored) && stored >= 220) return stored;
   return 520;
 }
@@ -3465,63 +3489,109 @@ function toggleSmaliSync() {
   }
 }
 
-// Drag-to-resize. Captures pointer on mousedown, updates width on move,
-// persists on up. Cursor + selection are globally locked to avoid the
-// pointer flickering as it crosses iframes/elements during drag.
+// Drag-to-resize via Pointer Events. setPointerCapture guarantees we get a
+// matching pointerup/lostpointercapture even when the user alt-tabs, opens
+// devtools, or releases the button over an iframe — eliminating the stuck-
+// drag class of bugs that mouse events leave behind.
 (function _wireSmaliResize() {
   let dragState = null;
   const handle = $("#smaliResize");
   if (!handle) return;
-  handle.addEventListener("mousedown", (e) => {
-    e.preventDefault();
-    dragState = { startX: e.clientX, startW: $("#smalipane").offsetWidth };
-    handle.classList.add("dragging");
-    document.body.classList.add("smaliResizing");
-  });
-  document.addEventListener("mousemove", (e) => {
-    if (!dragState) return;
-    // Drag right → narrower pane (pane is on the right edge), drag left → wider.
-    const dx = dragState.startX - e.clientX;
-    _applySmaliPaneWidth(dragState.startW + dx);
-  });
-  document.addEventListener("mouseup", () => {
+  const endDrag = () => {
     if (!dragState) return;
     dragState = null;
     handle.classList.remove("dragging");
     document.body.classList.remove("smaliResizing");
     const w = $("#smalipane").offsetWidth;
-    localStorage.setItem(SMALI_W_KEY, String(w));
+    try { localStorage.setItem(SMALI_W_KEY, String(w)); } catch (_) {}
+  };
+  handle.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    dragState = { startX: e.clientX, startW: $("#smalipane").offsetWidth };
+    handle.classList.add("dragging");
+    document.body.classList.add("smaliResizing");
+    try { handle.setPointerCapture(e.pointerId); } catch (_) {}
   });
-  // Viewer resize → re-clamp (window resize might've shrunk the max).
+  handle.addEventListener("pointermove", (e) => {
+    if (!dragState) return;
+    // Drag right → narrower pane (pane is on the right edge), drag left → wider.
+    const dx = dragState.startX - e.clientX;
+    _applySmaliPaneWidth(dragState.startW + dx);
+  });
+  handle.addEventListener("pointerup", endDrag);
+  handle.addEventListener("lostpointercapture", endDrag);
+  handle.addEventListener("pointercancel", endDrag);
+  // Fallbacks for browsers that don't fully implement pointer capture.
+  window.addEventListener("blur", endDrag);
+  document.addEventListener("visibilitychange", () => { if (document.hidden) endDrag(); });
+
+  // Viewer resize → re-clamp (window resize might've shrunk the max). rAF
+  // throttle so a continuous browser-edge drag doesn't run a layout-thrash
+  // pair (offsetWidth read → style write) per resize event.
+  let resizeTok = 0;
   window.addEventListener("resize", () => {
-    if (!smaliSync.enabled) return;
-    _applySmaliPaneWidth($("#smalipane").offsetWidth);
+    if (!smaliSync.enabled || resizeTok) return;
+    resizeTok = requestAnimationFrame(() => {
+      resizeTok = 0;
+      _applySmaliPaneWidth($("#smalipane").offsetWidth);
+    });
   });
 })();
 function _smaliClearCache() {
   smaliSync.cache.clear();
   smaliSync.methodDesc = null;
+  smaliSync.dexName = null;
   smaliSync.classHeaderLine = -1;
-  if (smaliSync.enabled) $("#smali").innerHTML = "";
+  smaliSync.cacheClass = null;
+  if (smaliSync.enabled) {
+    $("#smali").innerHTML = "";
+    $("#smaliHd").textContent = "smali — click a Java line in the code view";
+  }
 }
+// Bump the dk-identity token whenever the active dexkit changes (mode
+// switch, dump add, file load, isolated-tab switch). The cache lookup
+// checks this token so a methodDesc that's in the map but was rendered
+// against a different dk gets evicted before it returns stale smali.
+function _smaliBumpDk() { smaliSync.cacheDkToken++; _smaliClearCache(); }
 
 function _loadMethodForSync(methodDesc) {
-  let cache = smaliSync.cache.get(methodDesc);
-  if (cache) return cache;
+  // Cache lookup is qualified by the dk-identity token so a methodDesc
+  // that was rendered against a different dk (runtime vs isolated, dump
+  // change, file load) doesn't return stale smali.
+  const existing = smaliSync.cache.get(methodDesc);
+  if (existing && existing.dkToken === smaliSync.cacheDkToken) return existing;
   const useDk = activeQueryDk();
   let r, smaliText;
   try { r = useDk.decompileMethodJavaWithPc(methodDesc); }
   catch (_) { return null; }
   try { smaliText = useDk.renderMethodSmali(methodDesc); }
   catch (_) { return null; }
+  // wasm_module.cpp's decompileMethodJavaWithPc catches std::exception and
+  // returns `{ source: "// DECOMPILE ERROR: ...", pcMap: [] }`. JS can't
+  // distinguish that from "method has zero source-line→offset entries"
+  // (legal for an abstract method), so we treat a sentinel ERROR-prefix
+  // source as a non-cacheable failure — otherwise the empty-pcMap entry
+  // would land in the cache and lock the method out of sync forever.
+  if (typeof r.source === "string" && r.source.startsWith("// DECOMPILE ERROR")) {
+    return null;
+  }
   const smaliLines = smaliText.split("\n").map((text, idx) => {
     const m = text.match(/^\s*0x([0-9a-f]+)\s*:/i);
     return { idx, offset: m ? parseInt(m[1], 16) : -1, text };
   });
-  cache = {
+  const cache = {
     pcMap: (r.pcMap || []).map(x => ({ line: x.line, offset: x.offset })),
     smaliText, smaliLines,
+    dkToken: smaliSync.cacheDkToken,
   };
+  // FIFO cap — Map preserves insertion order, so dropping the oldest key
+  // gives us approximate-LRU for free. Holds ~64 methods × ~30KB worst
+  // case ≈ 2MB. Tunable.
+  const SMALI_CACHE_CAP = 64;
+  if (smaliSync.cache.size >= SMALI_CACHE_CAP) {
+    const firstKey = smaliSync.cache.keys().next().value;
+    if (firstKey !== undefined) smaliSync.cache.delete(firstKey);
+  }
   smaliSync.cache.set(methodDesc, cache);
   return cache;
 }
@@ -3630,14 +3700,110 @@ function _renderSmaliPane(cache, glowOffset) {
   pre.innerHTML = html;
   if (glowOffset != null) {
     const target = pre.querySelector(`.smali-line.glow`);
-    if (target) target.scrollIntoView({ block: "center" });
+    // Use scrollTop on the pane itself, NOT scrollIntoView — the latter
+    // also scrolls every overflow ancestor and can hijack the #code or
+    // page scroll position.
+    if (target) {
+      const pane = $("#smalipane");
+      const targetTop = target.offsetTop - pane.offsetTop;
+      pane.scrollTop = Math.max(0,
+        targetTop - pane.clientHeight / 2 + target.offsetHeight / 2);
+    }
   }
+}
+
+// Count proto-encoded parameter slots in a Dalvik proto string, e.g.
+// "(ILjava/lang/String;[B)V" → 3. Each iteration consumes one type:
+//   V/Z/B/S/C/I/F     1 char primitive
+//   J/D               1 char (we count as a single param slot, not two —
+//                     matches Java source param count)
+//   L...;             reference (ends at the next `;`)
+//   [...              array (multi-leading-`[` then one of the above)
+function _countProtoParams(proto) {
+  const m = proto.match(/^\(([^)]*)\)/);
+  if (!m) return -1;
+  const body = m[1];
+  let n = 0, i = 0;
+  while (i < body.length) {
+    const c = body[i];
+    if (c === "[") { while (body[i] === "[") i++; continue; }
+    if (c === "L") { const sc = body.indexOf(";", i); if (sc < 0) return -1; i = sc + 1; ++n; continue; }
+    // primitive — single char
+    ++n; ++i;
+  }
+  return n;
+}
+// Count visible Java params in a method header line, e.g. `public void foo(int x, String y) {` → 2.
+function _countJavaHeaderParams(line) {
+  const open = line.indexOf("(");
+  const close = line.indexOf(")", open);
+  if (open < 0 || close < 0) return -1;
+  const inside = line.slice(open + 1, close).trim();
+  if (!inside) return 0;
+  // Top-level commas only — generic `<...>` could embed commas but DAD's
+  // class-view emits descriptors without generics (type erasure).
+  let depth = 0, count = 1;
+  for (let i = 0; i < inside.length; i++) {
+    const c = inside[i];
+    if (c === "<" || c === "(" || c === "[") depth++;
+    else if (c === ">" || c === ")" || c === "]") depth--;
+    else if (c === "," && depth === 0) count++;
+  }
+  return count;
+}
+
+// Smali-sync-local descriptor lookup. Walks back to find the header line,
+// extracts the method's visible name + param count, and picks the dex
+// descriptor whose proto matches by arity. Falls back to first-name-match
+// when arity disambiguation has only one candidate or none.
+function _findMethodDescForSync(cls, codeLineIdx, useDk) {
+  const mname = findEnclosingMethodName(codeLineIdx);
+  if (!mname) return null;
+  const classSimple = (cls.match(/\/?([A-Za-z_$][\w$]*);$/) || ["", ""])[1];
+  // Candidate dex names — match DAD's class-view emission rules.
+  const candidates = [mname];
+  if (mname === classSimple) candidates.push("<init>", "<clinit>");
+  if (mname === "static")    candidates.push("<clinit>");
+  // Find the header line (modifier + simpleName + `(`).
+  let headerLineIdx = -1;
+  for (let i = codeLineIdx; i >= 0; i--) {
+    const ln = codeLineCache[i];
+    if (!ln) continue;
+    if (!/^\s*(public|private|protected|static|final|abstract|synchronized|native)\b/.test(ln)) continue;
+    if (ln.includes(mname + "(")) { headerLineIdx = i; break; }
+  }
+  const javaParams = headerLineIdx >= 0 ? _countJavaHeaderParams(codeLineCache[headerLineIdx]) : -1;
+  const ms = useDk.listClassMethods(cls);
+  const matches = [];
+  for (let i = 0; i < ms.size(); i++) {
+    const md = ms.get(i);
+    for (const cn of candidates) {
+      const sigStart = md.indexOf("->" + cn + "(");
+      if (sigStart < 0) continue;
+      const protoStart = sigStart + 2 + cn.length;
+      const proto = md.slice(protoStart);
+      matches.push({ desc: md, proto, params: _countProtoParams(proto) });
+      break;
+    }
+  }
+  ms.delete();
+  if (!matches.length) return null;
+  // Single match → done.
+  if (matches.length === 1) return matches[0].desc;
+  // Multiple overloads: pick the one whose param count matches the visible
+  // Java signature. If still ambiguous (rare), fall back to first.
+  if (javaParams >= 0) {
+    const exact = matches.filter(m => m.params === javaParams);
+    if (exact.length === 1) return exact[0].desc;
+    if (exact.length > 1)   return exact[0].desc;
+  }
+  return matches[0].desc;
 }
 
 function syncSmaliFromCodeLine(codeLineIdx) {
   if (!smaliSync.enabled || !currentClass) return;
   const useDk = activeQueryDk();
-  const methodDesc = findEnclosingMethodDescriptor(currentClass, codeLineIdx, useDk);
+  const methodDesc = _findMethodDescForSync(currentClass, codeLineIdx, useDk);
   if (!methodDesc) return;
   // Header simple name as it appears in DAD's class-view text: descriptors
   // use `<init>` / `<clinit>`, but DAD writes constructors as the class
@@ -3645,9 +3811,12 @@ function syncSmaliFromCodeLine(codeLineIdx) {
   const cls = methodDesc.split("->")[0];
   const dexName = methodOfDescriptor(methodDesc);
   const classSimple = (cls.match(/\/?([A-Za-z_$][\w$]*);$/) || ["", ""])[1];
+  // DAD's class-view emits `<init>` as `ClassName(...)` and `<clinit>` as
+  // `static ClassName()` — both translate to the class simple name. The
+  // walkback then matches `<modifier-prefix> classSimple(`. For <clinit>,
+  // the modifier is "static" so the regular walk catches it correctly.
   let viewName = dexName;
-  if (dexName === "<init>") viewName = classSimple;
-  else if (dexName === "<clinit>") viewName = "static";
+  if (dexName === "<init>" || dexName === "<clinit>") viewName = classSimple;
   const headerLine = _methodHeaderLine(codeLineIdx, viewName);
   if (headerLine < 0) return;
   const cache = _loadMethodForSync(methodDesc);
@@ -3669,6 +3838,7 @@ function syncSmaliFromCodeLine(codeLineIdx) {
   }
   smaliSync.methodDesc = methodDesc;
   smaliSync.classHeaderLine = headerLine;
+  smaliSync.dexName = dexName;
   $("#smaliHd").textContent = `smali · ${dexName}${entry ? "  · @ 0x" + entry.offset.toString(16) : ""}`;
   _renderSmaliPane(cache, entry ? entry.offset : null);
 }
@@ -3704,7 +3874,8 @@ function syncCodeFromSmaliLine(smaliEl) {
   code.scrollTop = Math.max(0, top - code.clientHeight / 2 + lh / 2);
   // Re-glow the smali line so the user sees which offset they clicked.
   _renderSmaliPane(cache, best.offset);
-  $("#smaliHd").textContent = `smali · ${simpleName}  · @ 0x${best.offset.toString(16)}`;
+  const nameForHd = smaliSync.dexName || methodOfDescriptor(smaliSync.methodDesc);
+  $("#smaliHd").textContent = `smali · ${nameForHd}  · @ 0x${best.offset.toString(16)}`;
 }
 
 // Wire the toggle button + smali-line click delegation.
@@ -3983,7 +4154,7 @@ $("#code").addEventListener("click", (e) => {
   // is open, every click in the code area also drives the smali pane to
   // the matching offset (uses the click target's line, not its token).
   if (smaliSync.enabled) {
-    const info = getLineForElement(e.target);
+    const info = getLineForElement(e.target, e);
     if (info) syncSmaliFromCodeLine(info.idx);
   }
   // Field tokens: .tk-var (Android-prefix mX/sX, or DAD's vN/pN locals/params)
@@ -4196,6 +4367,12 @@ function selectClass(cls, el, hint) {
     if (hint) locateAndGlow(hint);
     return;
   }
+  // Class is changing — D-3 smaliSync state (methodDesc, classHeaderLine,
+  // cache) is per-class; clear it so a stale forward-sync header doesn't
+  // glow an arbitrary line in the new class on a subsequent smali click.
+  // The umbrella clearSmaliCacheForClass also drops the L4 invoke/field
+  // caches that are descriptor-keyed and could mismatch across classes.
+  if (cls !== currentClass) clearSmaliCacheForClass();
   currentClass = cls;
   pushNavState(hint);
   $("#vname").textContent = cls;
