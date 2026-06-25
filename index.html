@@ -3618,18 +3618,26 @@ function _loadMethodForSync(methodDesc) {
 // directly above. With the name pinned, we'll only ever land on M's own
 // signature line.
 function _methodHeaderLine(fromLineIdx, methodSimpleName) {
-  const needle = methodSimpleName + "(";
+  // findEnclosingMethodName captures the name with `/([identifier])\s*$/`
+  // against the slice before `(`, so it tolerates whitespace between the
+  // identifier and `(` (DAD doesn't currently emit such, but the upstream
+  // accept set is broader than ours was). Mirror that tolerance here so
+  // the two walks accept the SAME set of header lines — otherwise a future
+  // DAD style change could land findEnclosingMethodName a match while we
+  // miss it, silently disabling overload-arity disambiguation.
+  const re = new RegExp(
+    "\\b" + methodSimpleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*\\("
+  );
   for (let i = fromLineIdx; i >= 0; i--) {
     const line = codeLineCache[i];
     if (!line) continue;
     if (!/^\s*(public|private|protected|static|final|abstract|synchronized|native)\b/.test(line)) continue;
-    if (line.includes(needle)) return i;
+    if (re.test(line)) return i;
   }
   // A package-private (no-modifier) header would be invisible to this walk —
-  // but findEnclosingMethodName / _findMethodDescForSync both use the same
-  // modifier-guarded walk to discover the method name in the first place, so
-  // by the time we get here a no-modifier header would have already failed
-  // those upstream checks. No separate fallback needed.
+  // findEnclosingMethodName / _findMethodDescForSync both use the same
+  // modifier-guarded walk to discover the method name first, so by the time
+  // we reach here a no-modifier header would have already failed upstream.
   return -1;
 }
 
@@ -3779,8 +3787,13 @@ function _findMethodDescForSync(cls, codeLineIdx, useDk) {
   const classSimple = (cls.match(/\/?([A-Za-z_$][\w$]*);$/) || ["", ""])[1];
   // Candidate dex names — match DAD's class-view emission rules.
   const candidates = [mname];
+  // DAD writes constructors as `ClassName(...)` and static initializers as
+  // `static ClassName()` — the captured identifier in both is the class
+  // simple name, so a single check covers both. A literal `mname === "static"`
+  // branch existed earlier but was unreachable: findEnclosingMethodName picks
+  // the LAST identifier before `(`, which for `static ClassName()` is
+  // `ClassName`, never `static`.
   if (mname === classSimple) candidates.push("<init>", "<clinit>");
-  if (mname === "static")    candidates.push("<clinit>");
   // Share the header walkback with the rest of the block.
   const headerLineIdx = _methodHeaderLine(codeLineIdx, mname);
   const javaParams = headerLineIdx >= 0 ? _countJavaHeaderParams(codeLineCache[headerLineIdx]) : -1;
