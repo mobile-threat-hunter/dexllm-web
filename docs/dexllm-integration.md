@@ -161,8 +161,9 @@ threads keep a **parallel, order-matched set of DexKits** so cross-source
 routing stays consistent:
 
 - **Runtime mode** (`addDumpedDex` → `addDump`): dumped dexes are aggregated
-  into one `WasmDexKit(VectorString, /*prefer=*/true)` where unpacked classes
-  win collisions — mirroring ART after a packer unpacks
+  into one `WasmDexKit(VectorString, true)`. Sources are ordered **dumps first,
+  original last**, so on a class collision the unpacked/dumped class wins
+  (first-wins) — mirroring ART after a packer unpacks
   ([`worker.js:121` `rebuildDk()`](../worker.js#L121)).
 - **Isolated mode** (`addIsolatedDex` → `addIsolated`): each `classes*.dex`
   gets its **own** single-dex `WasmDexKit`, keyed by global dex id, so per-dex
@@ -180,7 +181,7 @@ actually invoked across [`index.html`](../index.html) and
 ### Loading & structure
 | Method | Used for |
 |---|---|
-| `new WasmDexKit(path)` / `new WasmDexKit(VectorString, prefer)` | Construct a single-source or aggregated multi-source kit. |
+| `new WasmDexKit(path)` / `new WasmDexKit(VectorString, true)` | Construct a single-source or aggregated multi-source kit. |
 | `verifyReport()` | Slot/dex count + integrity per source. |
 | `dexCount()` | Number of dexes in the kit. |
 | `extractDexBytes(dexId)` | Pull one dex's raw bytes out (feeds Isolated-mode per-dex kits). |
