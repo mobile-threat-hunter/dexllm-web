@@ -468,6 +468,32 @@
     box-shadow:inset 0 -1px 0 var(--line-1);
   }
   .iocitem.perm .ival { color:#ffb070; }
+  /* protection-level filter chips + grouping */
+  .permlevels {
+    display:flex; flex-wrap:wrap; gap:6px; padding:8px 12px 2px;
+  }
+  .permlvlchip {
+    display:inline-flex; align-items:center; gap:5px; cursor:pointer;
+    padding:3px 9px; border-radius:999px; user-select:none;
+    font:600 10px/1.4 var(--f-ui); letter-spacing:.02em; text-transform:uppercase;
+    color:var(--fg-3); background:var(--bg-1);
+    box-shadow:inset 0 0 0 1px var(--line-2);
+    transition:color 160ms var(--e-out), box-shadow 160ms var(--e-out), background 160ms var(--e-out);
+  }
+  .permlvlchip .dot { width:7px; height:7px; border-radius:999px; opacity:.35; }
+  .permlvlchip.on { color:var(--fg); background:var(--bg-3); }
+  .permlvlchip.on .dot { opacity:1; }
+  .permlvlchip .lc { opacity:.6; font-weight:500; }
+  .permlvlhd {
+    display:flex; align-items:center; gap:7px;
+    padding:10px 16px 4px; font:700 10px/1.4 var(--f-ui);
+    text-transform:uppercase; letter-spacing:.09em;
+    position:sticky; top:0; z-index:2;
+    background:linear-gradient(180deg, rgba(13,15,22,0.94) 0%, rgba(8,9,15,0.88) 100%);
+    backdrop-filter:blur(10px) saturate(150%); -webkit-backdrop-filter:blur(10px) saturate(150%);
+    box-shadow:inset 0 -1px 0 var(--line-1);
+  }
+  .permlvlhd .dot { width:8px; height:8px; border-radius:999px; }
   .iocgrp {
     padding:10px 16px 5px; font:600 10px/1.4 var(--f-ui);
     text-transform:uppercase; letter-spacing:.08em; color:var(--fg-2);
@@ -836,7 +862,8 @@
       <div id="iocpanelbody" class="pbody"></div>
     </div>
     <div id="permpanel" class="sidepanel empty">
-      <div class="iocphd" id="permhd2">dangerous permissions</div>
+      <div class="iocphd" id="permhd2">permissions</div>
+      <div id="permlevels" class="permlevels"></div>
       <input id="permfilter" class="pfilter" placeholder="filter APIs / callers…" autocomplete="off">
       <div id="permpanelbody" class="pbody"></div>
     </div>
@@ -856,10 +883,31 @@ let Module = null, dk = null, allClasses = [], selectedEl = null;
 let classIoc = new Map();
 let iocTotals = null;            // { urls, ips, domains, emails, onion, total }
 let iocIndex = [];               // [{ value, cat, classes:[descriptor,…] }] — for the global panel
-let permIndex = [];              // [{ perm, api, callers:[methodDescriptor,…] }] — dangerous-permission callers
+let permIndex = [];              // [{ perm, level, api, callers:[methodDescriptor,…] }] — permission callers
 let permTotals = null;           // { perms, apis, callers }
 let permPending = false;         // true while the deferred caller analysis runs
-let dangerMap = null;            // permission -> [pkg.Class#method] (AOSP dangerous slice), fetched once
+let permApiMap = null;           // permission -> [pkg.Class#method] (full AOSP map, 564 perms), fetched once
+let permLevels = {};             // permission -> base protectionLevel ("dangerous"/"signature"/…)
+
+// Protection-level buckets (severity desc) — drive grouping, colour, and the
+// header checkbox filters. `signatureOrSystem` folds into `signature`; the
+// long tail (role/system/module/unknown) folds into `other`.
+const PERM_LEVELS = [
+  { key: "dangerous", label: "dangerous", color: "#ff5e5e" },
+  { key: "signature", label: "signature", color: "#c08cff" },
+  { key: "internal",  label: "internal",  color: "#5db4ff" },
+  { key: "normal",    label: "normal",    color: "#46c98b" },
+  { key: "other",     label: "other",     color: "#8b949e" },
+];
+const levelBucket = lvl =>
+  lvl === "dangerous" ? "dangerous" :
+  (lvl === "signature" || lvl === "signatureOrSystem") ? "signature" :
+  lvl === "internal" ? "internal" :
+  lvl === "normal" ? "normal" : "other";
+// Which buckets are currently shown. Default = all (the panel now covers every
+// permission, not just the dangerous slice); the checkboxes narrow the view
+// WITHOUT recomputing — computePerms always maps every level once.
+let activePermLevels = new Set(PERM_LEVELS.map(l => l.key));
 
 // ── multi-source state ──────────────────────────────────────────────────────
 // Track every source the current DexKit was built from so we can rebuild when
@@ -1108,13 +1156,15 @@ const iocCountFor = cd => {
   let n = 0; for (const cat of IOC_CATS) n += e[cat].size; return n;
 };
 
-// ---- dangerous-permission callers (dexllm.dangerous_permission_api_callers) ----
+// ---- permission callers (dexllm.dangerous_permission_api_callers) ----
 // Port of src/dexllm/dangerous_api.py. Join the AOSP permission→API table against
 // the APK's external method refs, then resolve each used gated API to the methods
-// that call it.
+// that call it. The table (`perm_api.json`) covers EVERY protection level — 564
+// permissions — not just the dangerous slice; `perm_levels.json` tags each with
+// its protectionLevel so the panel groups/filters by level.
 //
-// dexllm 0.1.6+ ships a SIGNATURE-PRECISE dangerous_perm_api.json (entries are
-// `pkg.Class#method(params)`), so overloads with different permission gates are
+// Entries are SIGNATURE-PRECISE (`pkg.Class#method(params)`), so overloads with
+// different permission gates are
 // disambiguated. We mirror dangerous_api.py's matching policy: arity is the
 // primary, parse-robust discriminator; exact simple-type matching is only the
 // tiebreak when a (class, method) has multiple overloads of the same arity. A
@@ -1233,9 +1283,9 @@ function parseApi(entry) {
 // overload of a given arity — needs no signature parsing to disambiguate. Dedup
 // is by FULL signature STRING, not the reduced simple-type tuple (two overloads
 // can reduce to the same tuple, e.g. java.util.Date vs java.sql.Date).
-function buildOverloadIndex(dangerMap) {
+function buildOverloadIndex(apiMap) {
   const seen = new Map();                  // "cls method" -> Set<sig>
-  for (const sigs of Object.values(dangerMap)) {
+  for (const sigs of Object.values(apiMap)) {
     for (const sig of sigs) {
       const { cls, name, types } = parseApi(sig);
       if (types === null) continue;
@@ -1289,12 +1339,13 @@ function buildExternalIndex(dkInst) {
 
 function computePerms(dkInst, appOnly = true) {
   permIndex = []; permTotals = null;
-  if (!dangerMap) return;
+  if (!permApiMap) return;
   const idx = buildExternalIndex(dkInst);
-  const overloads = buildOverloadIndex(dangerMap);
+  const overloads = buildOverloadIndex(permApiMap);
   const perms = new Set(), callersAll = new Set();
-  for (const perm of Object.keys(dangerMap)) {
-    for (const sig of dangerMap[perm]) {
+  for (const perm of Object.keys(permApiMap)) {
+    const level = levelBucket(permLevels[perm] || "unknown");
+    for (const sig of permApiMap[perm]) {
       const { cls, name, types } = parseApi(sig);
       if (types === null) continue;                  // field/constant entry
       const refs = idx.get(cls + " " + name);
@@ -1314,7 +1365,7 @@ function computePerms(dkInst, appOnly = true) {
         cs.delete();
       }
       if (callers.size) {
-        permIndex.push({ perm, api: sig, callers: [...callers] });
+        permIndex.push({ perm, level, api: sig, callers: [...callers] });
         perms.add(perm); callers.forEach(c => callersAll.add(c));
       }
     }
@@ -1983,10 +2034,7 @@ function activateIsolatedTab(did) {
     renderPermPanel();
     setTimeout(async () => {
       if (viewMode !== "isolated" || selectedDex !== key) return;
-      if (!dangerMap) {
-        try { dangerMap = await fetch("dangerous_perm_api.json").then(r => r.ok ? r.json() : {}); }
-        catch (_) { dangerMap = {}; }
-      }
+      await ensurePermData();
       if (viewMode !== "isolated" || selectedDex !== key) return;
       computePerms(iso.dk, true);
       iso.perm = { permIndex, permTotals };
@@ -2155,19 +2203,32 @@ function statusPills() {
   const permPill = permPending
     ? ` · <span class="pill" style="background:#8b949e22;color:var(--muted)">analyzing perms…</span>`
     : (permTotals && permTotals.perms)
-      ? ` · <span class="pill bad" title="dangerous permissions exercised through real gated-API calls">${permTotals.perms} perm${permTotals.perms === 1 ? "" : "s"}</span>`
+      ? ` · <span class="pill bad" title="permissions exercised through real gated-API calls (all protection levels)">${permTotals.perms} perm${permTotals.perms === 1 ? "" : "s"}</span>`
       : "";
   return iocPill + permPill;
 }
 
-// Deferred dangerous-permission caller mapping (the expensive L2 step).
+// Load the full permission→API map + protection-level table once. Both are
+// static assets; a failed fetch leaves an empty map so the panel degrades to
+// "no permissions" rather than throwing.
+async function ensurePermData() {
+  if (permApiMap) return;
+  try {
+    const [api, levels] = await Promise.all([
+      fetch("perm_api.json").then(r => r.ok ? r.json() : {}),
+      fetch("perm_levels.json").then(r => r.ok ? r.json() : {}).catch(() => ({})),
+    ]);
+    permApiMap = api; permLevels = levels || {};
+  } catch (_) { permApiMap = {}; permLevels = {}; }
+}
+
+// Deferred permission caller mapping (the expensive L2 step). Maps EVERY
+// protection level in one pass; the header checkboxes filter the view only.
 async function analyzePerms(statusHead) {
   permIndex = []; permTotals = null; permPending = true;
   renderPermPanel();
   try {
-    if (!dangerMap) {
-      dangerMap = await fetch("dangerous_perm_api.json").then(r => r.ok ? r.json() : {}).catch(() => ({}));
-    }
+    await ensurePermData();
     await new Promise(r => setTimeout(r, 0));
     computePerms(dk);
   } catch (e) { console.error("permission mapping failed:", e); permTotals = null; }
@@ -2425,29 +2486,66 @@ function renderIocPanel() {
   if (!shown) { const d = document.createElement("div"); d.className = "iocgrp"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); }
 }
 
-// dangerous-permission callers — separate panel, grouped by permission
+// Header chips: one per protection level actually present, toggling
+// activePermLevels. Counts reflect mapped gated-API usages (pre text-filter).
+function renderPermLevels() {
+  const bar = $("#permlevels");
+  if (!permIndex.length) { bar.innerHTML = ""; return; }
+  const counts = new Map();
+  for (const p of permIndex) counts.set(p.level, (counts.get(p.level) || 0) + 1);
+  bar.innerHTML = "";
+  for (const lv of PERM_LEVELS) {
+    const n = counts.get(lv.key) || 0;
+    if (!n) continue;                          // hide levels with no hits
+    const chip = document.createElement("span");
+    chip.className = "permlvlchip" + (activePermLevels.has(lv.key) ? " on" : "");
+    chip.title = `${lv.label} permissions — click to toggle`;
+    chip.innerHTML = `<span class="dot" style="background:${lv.color}"></span>${lv.label} <span class="lc">${n}</span>`;
+    chip.onclick = () => {
+      if (activePermLevels.has(lv.key)) activePermLevels.delete(lv.key);
+      else activePermLevels.add(lv.key);
+      renderPermPanel();
+    };
+    bar.appendChild(chip);
+  }
+}
+
+// permission callers — separate panel, grouped by protection level then permission
 function renderPermPanel() {
   const panel = $("#permpanel"), body = $("#permpanelbody");
   if (!permIndex.length) {
+    $("#permlevels").innerHTML = "";
     if (permPending) {                       // analysis still running — show progress
       panel.classList.remove("empty");
-      $("#permhd2").textContent = "dangerous permissions";
+      $("#permhd2").textContent = "permissions";
       body.innerHTML = '<div class="permsec" style="color:var(--muted)">analyzing callers…</div>';
       return;
     }
     panel.classList.add("empty"); body.innerHTML = ""; return;
   }
   panel.classList.remove("empty");
-  $("#permhd2").innerHTML = `dangerous permissions <span class="ipcount" title="gated-API usages (app code)">${permIndex.length}</span>`;
+  renderPermLevels();
   const filt = ($("#permfilter").value || "").toLowerCase().trim();
   body.innerHTML = "";
-  const prows = permIndex.filter(p => !filt ||
+  const prows = permIndex.filter(p => activePermLevels.has(p.level) && (!filt ||
     p.api.toLowerCase().includes(filt) || p.perm.toLowerCase().includes(filt) ||
-    p.callers.some(c => c.toLowerCase().includes(filt)));
+    p.callers.some(c => c.toLowerCase().includes(filt))));
+  $("#permhd2").innerHTML = `permissions <span class="ipcount" title="gated-API usages shown (app code)">${prows.length}</span>`;
   if (!prows.length) { const d = document.createElement("div"); d.className = "permsec"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); return; }
-  const byPerm = new Map();
-  for (const p of prows) { if (!byPerm.has(p.perm)) byPerm.set(p.perm, []); byPerm.get(p.perm).push(p); }
-  for (const [perm, rows] of [...byPerm.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+  // Bucket rows by protection level (severity order), then by permission.
+  const byLevel = new Map();
+  for (const p of prows) { if (!byLevel.has(p.level)) byLevel.set(p.level, []); byLevel.get(p.level).push(p); }
+  for (const lv of PERM_LEVELS) {
+    const lrows = byLevel.get(lv.key);
+    if (!lrows || !lrows.length) continue;
+    const permCount = new Set(lrows.map(r => r.perm)).size;
+    const lh = document.createElement("div"); lh.className = "permlvlhd";
+    lh.style.color = lv.color;
+    lh.innerHTML = `<span class="dot" style="background:${lv.color}"></span>${lv.label} · ${permCount} perm${permCount === 1 ? "" : "s"} · ${lrows.length} api${lrows.length === 1 ? "" : "s"}`;
+    body.appendChild(lh);
+    const byPerm = new Map();
+    for (const p of lrows) { if (!byPerm.has(p.perm)) byPerm.set(p.perm, []); byPerm.get(p.perm).push(p); }
+    for (const [perm, rows] of [...byPerm.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
     const ph = document.createElement("div"); ph.className = "permhd";
     ph.textContent = perm.replace(/^android\.permission\./, "") + ` (${rows.length})`;
     ph.title = perm; body.appendChild(ph);
@@ -2467,6 +2565,7 @@ function renderPermPanel() {
         hint: { needle: apiName, scope: methodNameOf(c) },
       }));
       body.appendChild(makeNavRow(label, "perm", targets, "callers"));
+    }
     }
   }
 }
