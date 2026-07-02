@@ -414,7 +414,8 @@
 
   /* ---- right-side panels: network indicators + dangerous permissions ---- */
   #rightcol {
-    width:340px; min-width:240px;
+    position:relative;
+    width:340px; min-width:240px; flex:none;
     display:flex; flex-direction:column; min-height:0;
     box-shadow:inset 1px 0 0 var(--line-1);
   }
@@ -425,6 +426,34 @@
   }
   .sidepanel + .sidepanel { box-shadow:inset 0 1px 0 var(--line-1); }
   .sidepanel.empty { display:none; }
+  /* Draggable left edge — resize the whole right column (both panels). Mirrors
+     #smaliResize: 6px hot zone straddling the border, brand tint on hover/drag. */
+  #rightcolResize {
+    position:absolute; left:-3px; top:0; bottom:0; width:6px;
+    cursor:col-resize; z-index:6; user-select:none;
+  }
+  #rightcolResize::before {
+    content:""; position:absolute; left:2px; top:0; bottom:0; width:2px;
+    background:transparent; transition:background 0.15s;
+  }
+  #rightcolResize:hover::before,
+  #rightcolResize.dragging::before { background:var(--brand); }
+  body.rightcolResizing,
+  body.rightcolResizing * { cursor:col-resize !important; user-select:none !important; }
+  /* Horizontal divider between the IoC and permission panels — drag to shift
+     the vertical split. Shown by JS only when BOTH panels are visible. */
+  #panelSplit {
+    display:none; flex:none; height:6px; margin:-3px 0; position:relative;
+    cursor:row-resize; z-index:6; user-select:none;
+  }
+  #panelSplit::before {
+    content:""; position:absolute; left:0; right:0; top:2px; height:2px;
+    background:transparent; transition:background 0.15s;
+  }
+  #panelSplit:hover::before,
+  #panelSplit.dragging::before { background:var(--brand); }
+  body.panelResizing,
+  body.panelResizing * { cursor:row-resize !important; user-select:none !important; }
   .iocphd {
     padding:11px 16px; font:600 11.5px/1.4 var(--f-ui);
     color:var(--fg); display:flex; align-items:center; gap:9px;
@@ -773,10 +802,11 @@
     #code { padding:12px 14px; }
     .cls, .pkg { padding:7px 12px; }   /* bigger touch targets */
     #rightcol {
-      width:auto; min-width:0; flex:none; height:auto; max-height:none; order:5;
+      width:auto !important; min-width:0; flex:none; height:auto; max-height:none; order:5;
       border-left:none; border-top:1px solid var(--border);
     }
-    .sidepanel { flex:none; height:38vh; }   /* each panel fixed + inner scroll */
+    .sidepanel { flex:none !important; height:38vh !important; }   /* each panel fixed + inner scroll */
+    #rightcolResize, #panelSplit { display:none !important; }   /* no drag-resize on stacked mobile layout */
   }
 </style>
 </head>
@@ -856,11 +886,13 @@
     </div>
   </div>
   <div id="rightcol">
+    <div id="rightcolResize" title="Drag to resize the panel column"></div>
     <div id="iocpanel" class="sidepanel empty">
       <div class="iocphd" id="iocphd">network indicators</div>
       <input id="iocfilter" class="pfilter" placeholder="filter indicators…" autocomplete="off">
       <div id="iocpanelbody" class="pbody"></div>
     </div>
+    <div id="panelSplit" title="Drag to resize the two panels"></div>
     <div id="permpanel" class="sidepanel empty">
       <div class="iocphd" id="permhd2">permissions</div>
       <div id="permlevels" class="permlevels"></div>
@@ -3674,6 +3706,164 @@ function toggleSmaliSync() {
     });
   });
 })();
+
+// ── right-panel resize ──────────────────────────────────────────────────────
+// Two smali-style drag affordances for the IoC + permission panels:
+//   #rightcolResize — left edge of #rightcol, sets the whole column's WIDTH.
+//   #panelSplit     — divider between the two panels, sets their HEIGHT split
+//                     (only active when both panels are visible).
+// Both persist to localStorage and clamp against the current viewport so a
+// stored value can't strand a panel off-screen. Mirrors _wireSmaliResize:
+// Pointer Events + capture so a drag always gets a matching release.
+const RIGHTCOL_W_MIN      = 240;   // never shrink the column past this
+const RIGHTCOL_W_DEFAULT  = 340;   // matches the CSS default
+const RIGHTCOL_W_MAX_FRAC = 0.6;   // never exceed window.innerWidth × this
+const RIGHTCOL_W_MAX_FLOOR = 300;  // …but always allow at least this
+const PANEL_H_MIN         = 90;    // each panel keeps at least this many px
+const RIGHTCOL_W_KEY = "dexllm-web.rightcolWidth";
+const IOC_FRAC_KEY   = "dexllm-web.iocPanelFrac";
+
+function _lsGetNum(key) {
+  try { const n = parseInt(localStorage.getItem(key) || "", 10); return Number.isFinite(n) ? n : NaN; }
+  catch (_) { return NaN; }
+}
+function _lsGetFloat(key) {
+  try { const n = parseFloat(localStorage.getItem(key) || ""); return Number.isFinite(n) ? n : NaN; }
+  catch (_) { return NaN; }
+}
+
+// ---- column width ----
+function _applyRightcolWidth(w) {
+  const max = Math.max(RIGHTCOL_W_MAX_FLOOR, window.innerWidth * RIGHTCOL_W_MAX_FRAC);
+  w = Math.max(RIGHTCOL_W_MIN, Math.min(max, w));
+  $("#rightcol").style.width = w + "px";
+  return w;
+}
+function _initRightcolWidth() {
+  const stored = _lsGetNum(RIGHTCOL_W_KEY);
+  _applyRightcolWidth(Number.isFinite(stored) && stored >= RIGHTCOL_W_MIN ? stored : RIGHTCOL_W_DEFAULT);
+}
+
+// ---- panel height split ----
+// `avail` = column content height minus the divider; the IoC panel takes a
+// stored fraction of it and the permission panel flexes to fill the rest.
+function _panelAvail() {
+  return $("#rightcol").clientHeight - $("#panelSplit").offsetHeight;
+}
+function _setIocHeight(px) {
+  const avail = _panelAvail();
+  if (avail <= 0) return 0;
+  px = Math.max(PANEL_H_MIN, Math.min(avail - PANEL_H_MIN, px));
+  const ioc = $("#iocpanel");
+  ioc.style.flex = "0 0 auto"; ioc.style.height = px + "px";
+  $("#permpanel").style.flex = "1 1 0";
+  return px;
+}
+function _iocFrac() {
+  const f = _lsGetFloat(IOC_FRAC_KEY);
+  return (Number.isFinite(f) && f > 0.05 && f < 0.95) ? f : 0.5;
+}
+// Show/hide the divider and (re)apply the split based on which panels are
+// visible. Called on init, on window resize, and whenever a panel toggles its
+// `.empty` class (via the MutationObserver below).
+function layoutPanels() {
+  const ioc = $("#iocpanel"), perm = $("#permpanel"), split = $("#panelSplit");
+  const bothOn = !ioc.classList.contains("empty") && !perm.classList.contains("empty");
+  if (bothOn) {
+    split.style.display = "block";
+    _setIocHeight(_panelAvail() * _iocFrac());
+  } else {
+    split.style.display = "none";
+    // Reset inline sizing so the CSS default (flex:1 1 0) governs a lone panel.
+    ioc.style.flex = ""; ioc.style.height = "";
+    perm.style.flex = ""; perm.style.height = "";
+  }
+}
+
+(function _wireRightcolResize() {
+  const handle = $("#rightcolResize");
+  if (!handle) return;
+  let drag = null;
+  const end = () => {
+    if (!drag) return;
+    drag = null;
+    handle.classList.remove("dragging");
+    document.body.classList.remove("rightcolResizing");
+    try { localStorage.setItem(RIGHTCOL_W_KEY, String($("#rightcol").offsetWidth)); } catch (_) {}
+    layoutPanels();   // height split depends on nothing here, but keep the divider consistent
+  };
+  handle.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    drag = { startX: e.clientX, startW: $("#rightcol").offsetWidth };
+    handle.classList.add("dragging");
+    document.body.classList.add("rightcolResizing");
+    try { handle.setPointerCapture(e.pointerId); } catch (_) {}
+  });
+  handle.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    // Column sits on the right edge → drag left = wider (dx grows as x shrinks).
+    _applyRightcolWidth(drag.startW + (drag.startX - e.clientX));
+  });
+  handle.addEventListener("pointerup", end);
+  handle.addEventListener("lostpointercapture", end);
+  handle.addEventListener("pointercancel", end);
+  window.addEventListener("blur", end);
+})();
+
+(function _wirePanelSplit() {
+  const handle = $("#panelSplit");
+  if (!handle) return;
+  let drag = null;
+  const end = () => {
+    if (!drag) return;
+    drag = null;
+    handle.classList.remove("dragging");
+    document.body.classList.remove("panelResizing");
+    const avail = _panelAvail();
+    if (avail > 0) {
+      const frac = $("#iocpanel").offsetHeight / avail;
+      try { localStorage.setItem(IOC_FRAC_KEY, frac.toFixed(4)); } catch (_) {}
+    }
+  };
+  handle.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    drag = { startY: e.clientY, startH: $("#iocpanel").offsetHeight };
+    handle.classList.add("dragging");
+    document.body.classList.add("panelResizing");
+    try { handle.setPointerCapture(e.pointerId); } catch (_) {}
+  });
+  handle.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    _setIocHeight(drag.startH + (e.clientY - drag.startY));
+  });
+  handle.addEventListener("pointerup", end);
+  handle.addEventListener("lostpointercapture", end);
+  handle.addEventListener("pointercancel", end);
+  window.addEventListener("blur", end);
+})();
+
+// Re-clamp both dimensions when the window resizes (rAF-throttled to avoid a
+// layout-thrash read/write pair per event), and relayout the split when either
+// panel appears/disappears.
+(function _wirePanelRelayout() {
+  let tok = 0;
+  window.addEventListener("resize", () => {
+    if (tok) return;
+    tok = requestAnimationFrame(() => {
+      tok = 0;
+      _applyRightcolWidth($("#rightcol").offsetWidth);
+      layoutPanels();
+    });
+  });
+  const obs = new MutationObserver(layoutPanels);
+  for (const id of ["iocpanel", "permpanel"]) {
+    const el = document.getElementById(id);
+    if (el) obs.observe(el, { attributes: true, attributeFilter: ["class"] });
+  }
+  _initRightcolWidth();
+  layoutPanels();
+})();
+
 function _smaliClearCache() {
   smaliSync.cache.clear();
   smaliSync.methodDesc = null;
