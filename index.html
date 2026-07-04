@@ -615,7 +615,17 @@
     border-bottom:1px solid var(--bd-1); position:sticky; top:0;
     background:var(--bg-1); letter-spacing:0.03em; text-transform:uppercase;
     z-index:1;
+    display:flex; align-items:center; gap:8px;
   }
+  #smalipane .smalihd #smaliHd { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  /* ✕ close — explicit "turn off smali" affordance in the pane header. */
+  .smaliclose {
+    flex:none; margin-left:auto; cursor:pointer; user-select:none;
+    width:20px; height:20px; display:inline-flex; align-items:center; justify-content:center;
+    border-radius:5px; color:var(--fg-3); font-size:13px; line-height:1;
+    transition:background 0.15s, color 0.15s;
+  }
+  .smaliclose:hover { background:rgba(255,94,94,0.15); color:var(--bad); }
   #smali {
     margin:0; padding:8px 0; white-space:pre;
     /* Each smali line wraps long descriptors so we don't need horizontal
@@ -895,7 +905,7 @@
     <pre id="code"><div class="placeholder">Pick a class on the left to decompile it.</div></pre>
     <div id="smalipane">
       <div id="smaliResize" title="Drag to resize"></div>
-      <div class="smalihd" id="smaliHd">smali — click a Java line in the code view</div>
+      <div class="smalihd"><span id="smaliHd">smali — click a Java line in the code view</span><span class="smaliclose" id="smaliClose" title="Close smali pane">✕</span></div>
       <pre id="smali"></pre>
     </div>
   </div>
@@ -3717,6 +3727,14 @@ function _applySmaliPaneWidth(w) {
   return w;
 }
 
+// Dock the pane below the toolbar so it never covers #vhead's right-aligned
+// buttons (the ↔ smali toggle + copy). The pane is absolute within #viewer, so
+// its top is #code's offset (= height of #vhead + #iocbar); with bottom:0 it
+// then spans exactly the code area. Re-run on open and on window resize.
+function _positionSmaliPane() {
+  const code = $("#code");
+  if (code) $("#smalipane").style.top = code.offsetTop + "px";
+}
 function toggleSmaliSync() {
   smaliSync.enabled = !smaliSync.enabled;
   const pane = $("#smalipane");
@@ -3724,6 +3742,7 @@ function toggleSmaliSync() {
   pane.classList.toggle("show", smaliSync.enabled);
   btn.classList.toggle("active", smaliSync.enabled);
   if (smaliSync.enabled) {
+    _positionSmaliPane();
     _applySmaliPaneWidth(_smaliPaneWidth());
   } else {
     $("#code").style.paddingRight = "";
@@ -3777,6 +3796,7 @@ function toggleSmaliSync() {
     if (!smaliSync.enabled || resizeTok) return;
     resizeTok = requestAnimationFrame(() => {
       resizeTok = 0;
+      _positionSmaliPane();
       _applySmaliPaneWidth($("#smalipane").offsetWidth);
     });
   });
@@ -4289,6 +4309,8 @@ function syncCodeFromSmaliLine(smaliEl) {
 
 // Wire the toggle button + smali-line click delegation.
 $("#smaliBtn").addEventListener("click", toggleSmaliSync);
+// ✕ in the pane header closes smali (only meaningful while it's open).
+$("#smaliClose")?.addEventListener("click", () => { if (smaliSync.enabled) toggleSmaliSync(); });
 $("#smali").addEventListener("click", (e) => {
   const sl = e.target.closest(".smali-line");
   if (sl) syncCodeFromSmaliLine(sl);
