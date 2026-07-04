@@ -235,7 +235,7 @@ The user-facing features and the dexllm calls behind each:
 | Java decompilation view | `decompileClassJava` (worker) |
 | **↔ smali** toggle & line-sync | `renderMethodSmali`, `decompileMethodJavaWithPc` |
 | Click-to-navigate xref (callers, callees, field get/set, type hierarchy) | the `find*` / `xref*` family in §5 (see [`xref.md`](xref.md)) |
-| **IoC** panel | string / API / class queries (`listValueStrings`, `findCallSitesToApi`, …) |
+| **Indicators** panel (network IOCs + content providers) | `listValueStrings` → classify (URLs/IPs/domains/emails/onion) + match `content://` query URIs against [`content_uris.json`](../content_uris.json); `xrefStringsToClasses` resolves each to its referencing classes so every row navigates to the caller |
 | **Permissions** panel (all protection levels) | [`perm_api.json`](../perm_api.json) (564 permissions) permission→API map cross-referenced against the dex via `findCallSitesToApi`; [`perm_levels.json`](../perm_levels.json) tags each permission's `protectionLevel` so the panel groups/filters by dangerous / signature / normal / internal |
 | Strings tab | `listValueStrings`, `xrefStringsToClasses` |
 | Runtime / Isolated dex modes | multi-source `WasmDexKit` aggregation vs per-dex isolation |
@@ -264,6 +264,7 @@ out of bounds" if the exception was already freed.
 | [`dexllm.js`](../dexllm.js) / [`dexllm.wasm`](../dexllm.wasm) | The Emscripten-compiled dexllm engine + glue. |
 | [`perm_api.json`](../perm_api.json) | Android permission → gated-API dataset (all 564 permissions) for the permissions panel. |
 | [`perm_levels.json`](../perm_levels.json) | Permission → `protectionLevel` map (dangerous / signature / normal / internal / …) driving panel grouping + filters. |
+| [`content_uris.json`](../content_uris.json) | AOSP-assembled `content://` ContentProvider query URIs (SMS / contacts / call-log / …) for the indicators panel's "content providers" group. |
 | [`cmd/dexllm-web/`](../cmd/dexllm-web/) | Go launcher that serves the bundle over `127.0.0.1` for offline / Windows use. |
 | [`dist/dexllm-web.exe`](../dist/) | Prebuilt Windows launcher. |
 | [`docs/`](.) | This doc plus `xref.md` and `d3-pc-line-map.md`. |

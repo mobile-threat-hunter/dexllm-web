@@ -401,6 +401,8 @@
   .iocpill.copied {
     box-shadow:inset 0 0 0 1px var(--brand), 0 0 0 3px var(--brand-soft);
   }
+  .cat-providers { color:#8fd66a; }   /* content:// query URIs — provider access */
+  .iocitem.providers .ival { color:#a6e187; word-break:break-all; }
   .cat-urls,   .iocpill.urls   { color:#ff6a63; }
   .cat-ips,    .iocpill.ips    { color:#ffb070; }
   .cat-domains,.iocpill.domains{ color:#ecc960; }
@@ -912,7 +914,7 @@
   <div id="rightcol">
     <div id="rightcolResize" title="Drag to resize the panel column"></div>
     <div id="iocpanel" class="sidepanel empty">
-      <div class="iocphd"><span id="iocphd">network indicators</span><span class="copybtn" id="copyIoc" title="Copy all network indicators as text">⧉ copy</span></div>
+      <div class="iocphd"><span id="iocphd">indicators</span><span class="copybtn" id="copyIoc" title="Copy all indicators (network + content providers) as text">⧉ copy</span></div>
       <input id="iocfilter" class="pfilter" placeholder="filter indicators…" autocomplete="off">
       <div id="iocpanelbody" class="pbody"></div>
     </div>
@@ -1018,8 +1020,40 @@ const statusEl = $("#status");
 // equivalent gate is a curated `IOC_TLDS` + the `_NONHOST_SUFFIXES` reject set
 // (word-like gTLDs that collide with Java identifiers — `os.name`, `*.support`,
 // codec ids, MIME). A scheme-qualified URL bypasses the gate (`://` proves intent).
-const IOC_CATS = ["urls", "ips", "domains", "emails", "onion"];
+// "providers" = ContentProvider `content://` query URIs (SMS/contacts/call-log/
+// … — the handles ContentResolver.query()/insert()/update()/delete() take). Not
+// a network IOC, but surfaced through the SAME string→class xref so an analyst
+// can jump to the callers. Kept last so its group renders below the network cats.
+const IOC_CATS = ["urls", "ips", "domains", "emails", "onion", "providers"];
+const CAT_LABEL = { providers: "content providers" };   // display override; others use the key
 const MAX_SCAN = 65536;            // per-string cap — bounds adversarial-blob cost
+// A fresh per-class indicator entry, keyed over every IOC_CATS bucket (so adding
+// a category can't leave `e[cat]` undefined at an `.add()` site).
+const newIocEntry = () => Object.fromEntries(IOC_CATS.map(c => [c, new Set()]));
+
+// ---- content:// provider query-URI dataset (AOSP-assembled) ----
+let contentUriMap = null;          // { "content://…": {family, classes[]} }, fetched once
+let contentUriKeys = [];           // sorted key list for substring matching
+async function ensureContentUris() {
+  if (contentUriMap) return;
+  try {
+    contentUriMap = await fetch("content_uris.json").then(r => r.ok ? r.json() : {});
+  } catch (_) { contentUriMap = {}; }
+  contentUriKeys = Object.keys(contentUriMap);
+}
+// Which known provider URIs appear (as substrings) in the app's value strings.
+// xrefStringsToClasses is substring-based, so returning the dataset URI as the
+// value both filters noise (must be a real AOSP provider URI) and still resolves
+// to every class whose string embeds it.
+function detectProviders(strings) {
+  const hits = new Set();
+  if (!contentUriKeys.length) return hits;
+  for (const raw of strings) {
+    if (!raw || raw.indexOf("content://") < 0) continue;
+    for (const k of contentUriKeys) if (raw.includes(k)) hits.add(k);
+  }
+  return hits;
+}
 // Per-string scan cap. Real network IOCs are short; an oversized blob is itself a
 // signal, not a host. Bounds worst-case cost on an adversarial APK.
 
@@ -1174,10 +1208,13 @@ function computeIocs(dkInst, descriptors) {
   for (let i = 0; i < sv.size(); i++) strings.push(sv.get(i));
   sv.delete();
   const buckets = classifyStrings(strings, dexPkgs);
+  buckets.providers = detectProviders(strings);   // content:// query URIs (from the AOSP dataset)
 
-  // flat, deduped value list + the category each value belongs to
+  // flat, deduped value list + the category each value belongs to. Providers go
+  // FIRST so the (few) content:// URIs are never dropped by the XREF_CAP slice.
   const valueCat = new Map();
-  for (const cat of IOC_CATS) for (const v of buckets[cat]) if (!valueCat.has(v)) valueCat.set(v, cat);
+  for (const v of buckets.providers) valueCat.set(v, "providers");
+  for (const cat of IOC_CATS) { if (cat === "providers") continue; for (const v of buckets[cat]) if (!valueCat.has(v)) valueCat.set(v, cat); }
   const values = [...valueCat.keys()];
 
   iocTotals = { total: values.length };
@@ -1202,7 +1239,7 @@ function computeIocs(dkInst, descriptors) {
     iocIndex.push({ value: values[i], cat, classes: [...cls] });
     for (const cd of cls) {
       let e = classIoc.get(cd);
-      if (!e) { e = { urls:new Set(), ips:new Set(), domains:new Set(), emails:new Set(), onion:new Set() }; classIoc.set(cd, e); }
+      if (!e) { e = newIocEntry(); classIoc.set(cd, e); }
       e[cat].add(values[i]);
     }
   }
@@ -1878,13 +1915,14 @@ async function processCurrentDk(label, loadMs, opts) {
   dexInfo = buildDexInfo(rep, perDexCount).concat(preservedExtras);
 
   // network-IOC pass over the full corpus (dumps + apk) — first-wins applied.
-  statusEl.innerHTML = `<b>${label}</b> · scanning for network indicators…`;
+  statusEl.innerHTML = `<b>${label}</b> · scanning for indicators…`;
   classIoc = new Map(); iocTotals = null;
   try {
     const descriptors = allClasses.slice();
     const tv = dk.listExternalTypeRefs();
     for (let i = 0; i < tv.size(); i++) descriptors.push(tv.get(i));
     tv.delete();
+    await ensureContentUris();                  // provider query-URI dataset (once)
     await new Promise(r => setTimeout(r, 0));   // let the "scanning…" status paint
     computeIocs(dk, descriptors);
   } catch (e) { console.error("IOC extraction failed:", e); iocTotals = null; }
@@ -2254,7 +2292,7 @@ function escAttr(s) {
 // Network-indicator / permission status pills (composed from current totals).
 function statusPills() {
   const iocPill = (iocTotals && iocTotals.total)
-    ? ` · <span class="pill bad" title="distinct network indicators recovered from dex strings">${iocTotals.total} IOC${iocTotals.total === 1 ? "" : "s"}</span>`
+    ? ` · <span class="pill bad" title="distinct indicators recovered from dex strings (network + content providers)">${iocTotals.total} IOC${iocTotals.total === 1 ? "" : "s"}</span>`
     : ` · <span class="pill ok">no IOCs</span>`;
   const permPill = permPending
     ? ` · <span class="pill" style="background:#8b949e22;color:var(--muted)">analyzing perms…</span>`
@@ -2472,7 +2510,7 @@ function copyText(text, btn) {
 // IoC panel → one line per indicator: category \t value \t referencing classes.
 function iocClipboardText() {
   if (!iocIndex.length) return "";
-  const lines = [`# network indicators (${iocIndex.length})`];
+  const lines = [`# indicators (${iocIndex.length})`];
   for (const cat of IOC_CATS) {
     for (const it of iocIndex.filter(x => x.cat === cat).sort((a, b) => a.value.localeCompare(b.value))) {
       const cls = (it.classes || []).join(", ");
@@ -2582,7 +2620,7 @@ function renderIocPanel() {
   const panel = $("#iocpanel"), body = $("#iocpanelbody");
   if (!iocIndex.length) { panel.classList.add("empty"); body.innerHTML = ""; return; }
   panel.classList.remove("empty");
-  $("#iocphd").innerHTML = `network indicators <span class="ipcount" title="distinct indicators">${iocIndex.length}</span>`;
+  $("#iocphd").innerHTML = `indicators <span class="ipcount" title="distinct indicators">${iocIndex.length}</span>`;
   const filt = ($("#iocfilter").value || "").toLowerCase().trim();
   body.innerHTML = ""; let shown = 0;
   for (const cat of IOC_CATS) {
@@ -2591,7 +2629,7 @@ function renderIocPanel() {
       .sort((a, b) => a.value.localeCompare(b.value));
     if (!items.length) continue;
     const h = document.createElement("div"); h.className = "iocgrp cat-" + cat;
-    h.textContent = `${cat} (${items.length})`; body.appendChild(h);
+    h.textContent = `${CAT_LABEL[cat] || cat} (${items.length})`; body.appendChild(h);
     for (const it of items) {
       body.appendChild(makeNavRow(it.value, it.cat,
         it.classes.map(c => ({ display: c, cls: c, hint: { needle: it.value } })),
@@ -2782,7 +2820,7 @@ function lazyXrefForIoc(value, cat) {
     // Patch classIoc so the per-class badge updates on next render.
     for (const cd of cls) {
       let e = classIoc.get(cd);
-      if (!e) { e = { urls:new Set(), ips:new Set(), domains:new Set(), emails:new Set(), onion:new Set() }; classIoc.set(cd, e); }
+      if (!e) { e = newIocEntry(); classIoc.set(cd, e); }
       e[cat].add(value);
     }
     return cls.map(c => ({ display: c, cls: c, hint: { needle: value } }));
