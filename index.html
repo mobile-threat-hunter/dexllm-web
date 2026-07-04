@@ -2308,10 +2308,20 @@ function statusPills() {
 async function ensurePermData() {
   if (permApiMap) return;
   try {
-    const [api, levels] = await Promise.all([
+    const [api, levels, supp] = await Promise.all([
       fetch("perm_api.json").then(r => r.ok ? r.json() : {}),
       fetch("perm_levels.json").then(r => r.ok ? r.json() : {}).catch(() => ({})),
+      // Curated app-facing supplement for permission-gated public APIs that carry
+      // NO @RequiresPermission annotation (enforced at runtime, so metalava/source
+      // scrapes miss them) — e.g. SmsManager.sendTextMessage → SEND_SMS. Grounded
+      // in the AOSP enforcement dataset; see perm_api_supplement.json.
+      fetch("perm_api_supplement.json").then(r => r.ok ? r.json() : {}).catch(() => ({})),
     ]);
+    // Merge the supplement into the generated map (dedup per permission).
+    for (const perm of Object.keys(supp || {})) {
+      const merged = new Set([...(api[perm] || []), ...supp[perm]]);
+      api[perm] = [...merged];
+    }
     permApiMap = api; permLevels = levels || {};
   } catch (_) { permApiMap = {}; permLevels = {}; }
 }

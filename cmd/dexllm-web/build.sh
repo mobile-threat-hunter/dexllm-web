@@ -15,7 +15,7 @@ root="$(cd "$here/../.." && pwd)"
 
 # Pull the deployed bundle into static/ for go:embed
 mkdir -p "$here/static"
-for f in index.html worker.js dexllm.js dexllm.wasm perm_api.json perm_levels.json content_uris.json loop.mp4 trans.mp4; do
+for f in index.html worker.js dexllm.js dexllm.wasm perm_api.json perm_levels.json perm_api_supplement.json content_uris.json loop.mp4 trans.mp4; do
   cp "$root/$f" "$here/static/"
 done
 

@@ -1,0 +1,13 @@
+{
+ "android.permission.SEND_SMS": [
+  "android.telephony.SmsManager#sendDataMessage(String, String, short, byte[], android.app.PendingIntent, android.app.PendingIntent)",
+  "android.telephony.SmsManager#sendMultipartTextMessage(String, String, java.util.ArrayList<java.lang.String>, java.util.ArrayList<android.app.PendingIntent>, java.util.ArrayList<android.app.PendingIntent>)",
+  "android.telephony.SmsManager#sendMultipartTextMessage(String, String, java.util.List<java.lang.String>, java.util.List<android.app.PendingIntent>, java.util.List<android.app.PendingIntent>, String, String)",
+  "android.telephony.SmsManager#sendMultipartTextMessage(String, String, java.util.List<java.lang.String>, java.util.List<android.app.PendingIntent>, java.util.List<android.app.PendingIntent>, long)",
+  "android.telephony.SmsManager#sendTextMessage(String, String, String, android.app.PendingIntent, android.app.PendingIntent)",
+  "android.telephony.SmsManager#sendTextMessage(String, String, String, android.app.PendingIntent, android.app.PendingIntent, long)",
+  "android.telephony.gsm.SmsManager#sendDataMessage(String, String, short, byte[], android.app.PendingIntent, android.app.PendingIntent)",
+  "android.telephony.gsm.SmsManager#sendMultipartTextMessage(String, String, java.util.ArrayList<java.lang.String>, java.util.ArrayList<android.app.PendingIntent>, java.util.ArrayList<android.app.PendingIntent>)",
+  "android.telephony.gsm.SmsManager#sendTextMessage(String, String, String, android.app.PendingIntent, android.app.PendingIntent)"
+ ]
+}

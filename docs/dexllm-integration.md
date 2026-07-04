@@ -265,6 +265,7 @@ out of bounds" if the exception was already freed.
 | [`perm_api.json`](../perm_api.json) | Android permission → gated-API dataset (all 564 permissions) for the permissions panel. |
 | [`perm_levels.json`](../perm_levels.json) | Permission → `protectionLevel` map (dangerous / signature / normal / internal / …) driving panel grouping + filters. |
 | [`content_uris.json`](../content_uris.json) | AOSP-assembled `content://` ContentProvider query URIs (SMS / contacts / call-log / …) for the indicators panel's "content providers" group. |
+| [`perm_api_supplement.json`](../perm_api_supplement.json) | Curated app-facing supplement for permission-gated public APIs with **no** `@RequiresPermission` annotation (runtime-enforced, so the metalava/source scrapes miss them) — e.g. `SmsManager.sendTextMessage` → `SEND_SMS`. Grounded in the AOSP enforcement dataset; merged into `perm_api.json` at load. |
 | [`cmd/dexllm-web/`](../cmd/dexllm-web/) | Go launcher that serves the bundle over `127.0.0.1` for offline / Windows use. |
 | [`dist/dexllm-web.exe`](../dist/) | Prebuilt Windows launcher. |
 | [`docs/`](.) | This doc plus `xref.md` and `d3-pc-line-map.md`. |
