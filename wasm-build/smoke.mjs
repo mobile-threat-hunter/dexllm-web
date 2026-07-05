@@ -46,6 +46,16 @@ for (const [label, path] of TESTS) {
   const tv = dk.listExternalTypeRefs();
   console.log("  externalTypeRefs=", tv.size());
   tv.delete();
+  // Issue #13 — engine permission→API→callers join over bundled AOSP data.
+  const pc = dk.permissionCallers(false);
+  const nGroups = pc.length;
+  const nRows = pc.reduce((a, g) => a + g.rows.length, 0);
+  console.log("  permissionCallers groups=", nGroups, " rows=", nRows);
+  // a2dp.Vol references dangerous-permission APIs — the join must be non-empty
+  // there, else the binding is silently returning nothing.
+  if (label.startsWith("a2dp") && nGroups === 0) {
+    console.log("  PERMISSION-CALLERS EMPTY on a2dp (expected non-empty)"); failures++;
+  }
   dk.delete();
 }
 

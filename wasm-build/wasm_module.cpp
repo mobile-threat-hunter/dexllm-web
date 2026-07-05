@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "analysis.h"
 #include "api_ref.h"
 #include "decompiler.h"
 #include "dexitem_code_source.h"
@@ -286,6 +287,42 @@ public:
             arr.set(i++, o);
         }
         return arr;
+    }
+
+    // Issue #13 — dangerous permission → used API → callers, from the engine's
+    // C++ join with the AOSP data BUNDLED into the wasm (dexkit::ext::
+    // PermissionCallers; the perm→API table is compiled in via analysis.cpp's
+    // gen/perm_api_data.h). Identical to Python dangerous_permission_api_callers,
+    // so dexllm-web no longer re-implements this in JS or ships perm_api.json /
+    // perm_levels.json. Non-const: FindCallSitesToApi warms upstream caches.
+    // Returns Array<{perm, protectionLevel, rows: Array<{api, descriptors:[],
+    // callers:[]}>}>.
+    val permissionCallers(bool app_only) {
+        auto to_arr = [](const std::vector<std::string>& v) {
+            val a = val::array();
+            std::size_t k = 0;
+            for (const auto& s : v) a.set(k++, s);
+            return a;
+        };
+        val out = val::array();
+        std::size_t i = 0;
+        for (const auto& g : dexkit::ext::PermissionCallers(ext_, app_only)) {
+            val go = val::object();
+            go.set("perm", g.perm);
+            go.set("protectionLevel", g.protection_level);
+            val rows = val::array();
+            std::size_t j = 0;
+            for (const auto& r : g.rows) {
+                val ro = val::object();
+                ro.set("api", r.api);
+                ro.set("descriptors", to_arr(r.descriptors));
+                ro.set("callers", to_arr(r.callers));
+                rows.set(j++, ro);
+            }
+            go.set("rows", rows);
+            out.set(i++, go);
+        }
+        return out;
     }
 
     // Scan every loaded dex's class static_values for a string-equal match and
@@ -765,6 +802,7 @@ EMSCRIPTEN_BINDINGS(dexllm_wasm) {
         .function("listValueStrings",      &WasmDexKit::listValueStrings)
         .function("listExternalTypeRefs",  &WasmDexKit::listExternalTypeRefs)
         .function("listExternalMethodRefs",&WasmDexKit::listExternalMethodRefs)
+        .function("permissionCallers",     &WasmDexKit::permissionCallers)
         .function("xrefStringsToClasses",  &WasmDexKit::xrefStringsToClasses)
         .function("findClassesWithStaticValueString",
                   &WasmDexKit::findClassesWithStaticValueString)
