@@ -1131,6 +1131,12 @@ function computeIocs(dkInst) {
   classIoc = new Map();
   iocIndex = [];
   const add = (value, cat, classes) => {
+    // Skip indicators with no referencing class — they can't be navigated to
+    // (the panel is click-to-caller) and are almost always misclassification
+    // noise (e.g. identifier-like strings such as `iterator.next` /
+    // `libcore.icu.icu` scanned as domains). Dropping them removes the dead
+    // "— none" rows.
+    if (!classes.length) return;
     iocIndex.push({ value, cat, classes });
     for (const cd of classes) {
       let e = classIoc.get(cd);
