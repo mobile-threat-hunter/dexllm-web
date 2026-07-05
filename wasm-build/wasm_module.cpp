@@ -22,11 +22,13 @@
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "analysis.h"
 #include "api_ref.h"
 #include "decompiler.h"
 #include "dexitem_code_source.h"
@@ -286,6 +288,148 @@ public:
             arr.set(i++, o);
         }
         return arr;
+    }
+
+    // Issue #13 — dangerous permission → used API → callers, from the engine's
+    // C++ join with the AOSP data BUNDLED into the wasm (dexkit::ext::
+    // PermissionCallers; the perm→API table is compiled in via analysis.cpp's
+    // gen/perm_api_data.h). Identical to Python dangerous_permission_api_callers,
+    // so dexllm-web no longer re-implements this in JS or ships perm_api.json /
+    // perm_levels.json. Non-const: FindCallSitesToApi warms upstream caches.
+    // Returns Array<{perm, protectionLevel, rows: Array<{api, descriptors:[],
+    // callers:[]}>}>.
+    val permissionCallers(bool app_only) {
+        auto to_arr = [](const std::vector<std::string>& v) {
+            val a = val::array();
+            std::size_t k = 0;
+            for (const auto& s : v) a.set(k++, s);
+            return a;
+        };
+        val out = val::array();
+        std::size_t i = 0;
+        for (const auto& g : dexkit::ext::PermissionCallers(ext_, app_only)) {
+            val go = val::object();
+            go.set("perm", g.perm);
+            go.set("protectionLevel", g.protection_level);
+            val rows = val::array();
+            std::size_t j = 0;
+            for (const auto& r : g.rows) {
+                val ro = val::object();
+                ro.set("api", r.api);
+                ro.set("descriptors", to_arr(r.descriptors));
+                ro.set("callers", to_arr(r.callers));
+                rows.set(j++, ro);
+            }
+            go.set("rows", rows);
+            out.set(i++, go);
+        }
+        return out;
+    }
+
+    // Issue #13: network IoCs + content:// providers over the SHARED engine
+    // implementation (dexkit::ext::ExtractIocs / DetectContentProviders) and its
+    // bundled public-suffix + provider-URI datasets — so this binding no longer
+    // re-implements the scan in JS or ships its own PSL / content_uris copy.
+    // Shape: { network: [{value, category, classes[]}], providers: [{uri, family,
+    // classes[]}] }, where classes[] are the referencing classes (owner of each
+    // xref method, deduped preserving order) — the navigable "where in the code".
+    val extractIocs() {
+        auto owner = [](const std::string& d) {
+            auto p = d.find("->");
+            return p == std::string::npos ? d : d.substr(0, p);
+        };
+        auto classes_of = [&](const std::vector<std::string>& methods) {
+            val arr = val::array();
+            std::size_t k = 0;
+            std::vector<std::string> seen;
+            for (const auto& m : methods) {
+                std::string c = owner(m);
+                if (std::find(seen.begin(), seen.end(), c) == seen.end()) {
+                    seen.push_back(c);
+                    arr.set(k++, c);
+                }
+            }
+            return arr;
+        };
+
+        val out = val::object();
+        auto r = dexkit::ext::ExtractIocs(ext_, /*with_xref=*/true,
+                                          /*denoise=*/true, /*xref_limit=*/300);
+        val network = val::array();
+        std::size_t ni = 0;
+        auto emit_cat = [&](const std::vector<dexkit::ext::IocIndicator>& rows,
+                            const char* cat) {
+            for (const auto& ind : rows) {
+                val o = val::object();
+                o.set("value", ind.value);
+                o.set("category", std::string(cat));
+                o.set("classes", classes_of(ind.methods));
+                network.set(ni++, o);
+            }
+        };
+        emit_cat(r.urls, "urls");
+        emit_cat(r.ips, "ips");
+        emit_cat(r.domains, "domains");
+        emit_cat(r.emails, "emails");
+        emit_cat(r.onion, "onion");
+        out.set("network", network);
+
+        val providers = val::array();
+        std::size_t pi = 0;
+        for (const auto& h :
+             dexkit::ext::DetectContentProviders(ext_, /*with_xref=*/true,
+                                                 /*xref_limit=*/300)) {
+            val o = val::object();
+            o.set("uri", h.uri);
+            o.set("family", h.family);
+            o.set("classes", classes_of(h.methods));
+            providers.set(pi++, o);
+        }
+        out.set("providers", providers);
+        return out;
+    }
+
+    // Issue #13 (Phase 2): capability profile over the SHARED engine catalog
+    // (dexkit::ext::SummarizeCapabilities / gen/android_api_data.h) — mirrors
+    // dexllm.capability.summarize_capabilities. Shape: { permissions:{p:n},
+    // categories:{c:n}, byCaller:{caller:[perms]}, apiHits:[{apiSignature,
+    // permissions[], categories[], callSiteCount, callers[]}], totalCallSites,
+    // catalogVersion, catalogSize, matchedApis }.
+    val summarizeCapabilities() {
+        auto to_arr = [](const std::vector<std::string>& v) {
+            val a = val::array();
+            std::size_t k = 0;
+            for (const auto& s : v) a.set(k++, s);
+            return a;
+        };
+        auto r = dexkit::ext::SummarizeCapabilities(ext_);
+        val out = val::object();
+        val perms = val::object();
+        for (const auto& [p, n] : r.permissions) perms.set(p, n);
+        out.set("permissions", perms);
+        val cats = val::object();
+        for (const auto& [c, n] : r.categories) cats.set(c, n);
+        out.set("categories", cats);
+        val byCaller = val::object();
+        for (const auto& [caller, ps] : r.by_caller) byCaller.set(caller, to_arr(ps));
+        out.set("byCaller", byCaller);
+        val hits = val::array();
+        std::size_t hi = 0;
+        for (const auto& h : r.api_hits) {
+            val o = val::object();
+            o.set("apiSignature", h.api_signature);
+            o.set("permissions", to_arr(h.permissions));
+            o.set("categories", to_arr(h.categories));
+            o.set("callSiteCount", h.call_site_count);
+            o.set("callers", to_arr(h.callers));
+            hits.set(hi++, o);
+        }
+        out.set("apiHits", hits);
+        out.set("totalCallSites", r.total_call_sites);
+        out.set("catalogVersion", r.catalog_version);
+        out.set("catalogSize", r.catalog_size);
+        out.set("matchedApis", r.matched_apis);
+        return out;
     }
 
     // Scan every loaded dex's class static_values for a string-equal match and
@@ -765,6 +909,9 @@ EMSCRIPTEN_BINDINGS(dexllm_wasm) {
         .function("listValueStrings",      &WasmDexKit::listValueStrings)
         .function("listExternalTypeRefs",  &WasmDexKit::listExternalTypeRefs)
         .function("listExternalMethodRefs",&WasmDexKit::listExternalMethodRefs)
+        .function("permissionCallers",     &WasmDexKit::permissionCallers)
+        .function("extractIocs",           &WasmDexKit::extractIocs)
+        .function("summarizeCapabilities", &WasmDexKit::summarizeCapabilities)
         .function("xrefStringsToClasses",  &WasmDexKit::xrefStringsToClasses)
         .function("findClassesWithStaticValueString",
                   &WasmDexKit::findClassesWithStaticValueString)

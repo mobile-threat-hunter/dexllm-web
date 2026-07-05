@@ -50,6 +50,9 @@ add_library(dexkit_ext STATIC
     "${DEXLLM_ROOT}/native/core_ext/dexkit_ext.cpp"
     "${DEXLLM_ROOT}/native/core_ext/dexitem_code_source.cpp"
     "${DEXLLM_ROOT}/native/core_ext/dex_verifier.cpp"
+    "${DEXLLM_ROOT}/native/core_ext/analysis.cpp"
+    "${DEXLLM_ROOT}/native/core_ext/public_suffix.cpp"
+    "${DEXLLM_ROOT}/native/core_ext/ioc.cpp"
 )
 target_include_directories(dexkit_ext PUBLIC
     "${DEXLLM_ROOT}/native/core_ext/include"
@@ -77,6 +80,7 @@ add_library(dexkit_dad STATIC
     "${DEXLLM_ROOT}/native/dad_cpp/mock_code_source.cpp"
     "${DEXLLM_ROOT}/native/dad_cpp/instruction_dispatch.cpp"
     "${DEXLLM_ROOT}/native/dad_cpp/instruction_accept.cpp"
+    "${DEXLLM_ROOT}/native/dad_cpp/ssa.cpp"
 )
 target_include_directories(dexkit_dad PUBLIC
     "${DEXLLM_ROOT}/native/dad_cpp/include"

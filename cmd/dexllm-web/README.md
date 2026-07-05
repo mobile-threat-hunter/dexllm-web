@@ -38,9 +38,10 @@ GOOS=windows GOARCH=amd64 go build \
 ```
 
 The `static/` directory next to `main.go` holds the embedded assets — copies of
-`index.html`, `worker.js`, `dexllm.js`, `dexllm.wasm`, `perm_api.json`,
-`perm_levels.json`, `content_uris.json`, `loop.mp4`, `trans.mp4` from the repo root. After updating those at the repo
-root (a `chore: refresh wasm` cycle, say), refresh the copies and rebuild.
+`index.html`, `worker.js`, `dexllm.js`, `dexllm.wasm`, `loop.mp4`, `trans.mp4`
+from the repo root. (The permission / content-URI datasets are no longer shipped
+— they're bundled inside `dexllm.wasm` and exposed via the engine API.) After
+updating those at the repo root, refresh the copies and rebuild.
 
 ## Security posture
 

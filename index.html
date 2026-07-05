@@ -838,9 +838,9 @@
 <body>
 <header>
   <h1>dex<span>llm</span></h1>
-  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/7d15640"
+  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/a865531"
      target="_blank" rel="noopener" title="dexllm commit this WASM was built from">
-    v0.1.16 · <code>7d15640</code>
+    v0.1.16+ · <code>a865531</code>
   </a>
   <!-- mode toggle: Runtime = packer-unpack workflow (multi-source, dump
        priority, [all] aggregate). Isolated = each dex as its own tab, no
@@ -933,8 +933,8 @@
      browser has the old dexllm.js cached but pulls the new dexllm.wasm gets
      an ABI mismatch and "engine load failed". Bump this when the WASM is
      rebuilt — it MUST match the version pill above. -->
-<script>window.__DEXLLM_BUILD = "7d15640";</script>
-<script src="dexllm.js?v=7d15640"></script>
+<script>window.__DEXLLM_BUILD = "a865531";</script>
+<script src="dexllm.js?v=a865531"></script>
 <script>
 let Module = null, dk = null, allClasses = [], selectedEl = null;
 // classDescriptor -> { urls:Set, ips:Set, domains:Set, emails:Set, onion:Set }
@@ -944,8 +944,6 @@ let iocIndex = [];               // [{ value, cat, classes:[descriptor,…] }] �
 let permIndex = [];              // [{ perm, level, api, callers:[methodDescriptor,…] }] — permission callers
 let permTotals = null;           // { perms, apis, callers }
 let permPending = false;         // true while the deferred caller analysis runs
-let permApiMap = null;           // permission -> [pkg.Class#method] (full AOSP map, 564 perms), fetched once
-let permLevels = {};             // permission -> base protectionLevel ("dangerous"/"signature"/…)
 
 // Protection-level buckets (severity desc) — drive grouping, colour, and the
 // header checkbox filters. `signatureOrSystem` folds into `signature`; the
@@ -1031,29 +1029,6 @@ const MAX_SCAN = 65536;            // per-string cap — bounds adversarial-blob
 // a category can't leave `e[cat]` undefined at an `.add()` site).
 const newIocEntry = () => Object.fromEntries(IOC_CATS.map(c => [c, new Set()]));
 
-// ---- content:// provider query-URI dataset (AOSP-assembled) ----
-let contentUriMap = null;          // { "content://…": {family, classes[]} }, fetched once
-let contentUriKeys = [];           // sorted key list for substring matching
-async function ensureContentUris() {
-  if (contentUriMap) return;
-  try {
-    contentUriMap = await fetch("content_uris.json").then(r => r.ok ? r.json() : {});
-  } catch (_) { contentUriMap = {}; }
-  contentUriKeys = Object.keys(contentUriMap);
-}
-// Which known provider URIs appear (as substrings) in the app's value strings.
-// xrefStringsToClasses is substring-based, so returning the dataset URI as the
-// value both filters noise (must be a real AOSP provider URI) and still resolves
-// to every class whose string embeds it.
-function detectProviders(strings) {
-  const hits = new Set();
-  if (!contentUriKeys.length) return hits;
-  for (const raw of strings) {
-    if (!raw || raw.indexOf("content://") < 0) continue;
-    for (const k of contentUriKeys) if (raw.includes(k)) hits.add(k);
-  }
-  return hits;
-}
 // Per-string scan cap. Real network IOCs are short; an oversized blob is itself a
 // signal, not a host. Bounds worst-case cost on an adversarial APK.
 
@@ -1117,17 +1092,6 @@ const NAMESPACE_HOSTS = new Set([
 ]);
 const PKG_LABEL = /^[a-z0-9_$]+$/;
 
-function dexPackagePrefixes(descriptors) {
-  const pkgs = new Set();
-  for (const s of descriptors) {
-    const core = s.replace(/^\[+/, "");                       // arrays: [Lx; -> Lx;
-    if (!(core.startsWith("L") && core.endsWith(";") && core.includes("/"))) continue;
-    const labels = core.slice(1, -1).split("/").slice(0, -1).map(p => p.toLowerCase());
-    if (!labels.length || !labels.every(p => PKG_LABEL.test(p))) continue;
-    for (let i = 1; i <= labels.length; i++) pkgs.add(labels.slice(0, i).join("."));
-  }
-  return pkgs;
-}
 const isPackageLike = (host, pkgs) => {
   const low = host.toLowerCase();
   return NAMESPACE_HOSTS.has(low) || pkgs.has(low) || DROP_ROOTS.has(low.split(".")[0]);
@@ -1154,127 +1118,47 @@ function validDomain(host) {
   return true;
 }
 
-function classifyStrings(strings, dexPkgs) {
-  const b = { urls:new Set(), ips:new Set(), domains:new Set(), emails:new Set(), onion:new Set() };
-  for (const raw of strings) {
-    const capped = raw.length <= MAX_SCAN ? raw : raw.slice(0, MAX_SCAN);
-    const s = refang(capped);
-    let m;
-    RE_URL.lastIndex = 0;
-    while ((m = RE_URL.exec(s))) {
-      const url = m[0].replace(/[.,);"']+$/, "");
-      if (NAMESPACE_HOSTS.has(hostOf(url))) continue;          // xmlns URI, not a contacted endpoint
-      b.urls.add(url);
-    }
-    RE_ONION.lastIndex = 0; while ((m = RE_ONION.exec(s))) b.onion.add(m[0].toLowerCase());
-    RE_IPV4.lastIndex  = 0; while ((m = RE_IPV4.exec(s)))  b.ips.add(m[0]);
-    RE_EMAIL.lastIndex = 0; while ((m = RE_EMAIL.exec(s))) b.emails.add(m[0]);
-    RE_HOST.lastIndex  = 0;
-    while ((m = RE_HOST.exec(s))) {
-      const host = m[0].toLowerCase();
-      if (host.endsWith(".onion")) continue;                  // its own bucket
-      if (!validDomain(host)) continue;                       // PSL/word-gTLD gate
-      if (isPackageLike(host, dexPkgs)) continue;             // residual identifier
-      b.domains.add(host);
-    }
-  }
-  // A URL's own host is high-confidence (scheme proves intent) — fold in, but
-  // skip IP-literal hosts (those are in `ips`) and onion (own category). Bypass
-  // the word-gTLD gate; PSL structure check stays.
-  for (const u of b.urls) {
-    const h = hostOf(u);
-    if (!h.includes(".")) continue;
-    if (h.endsWith(".onion")) continue;
-    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(h)) continue;
-    const tail = h.split(".").pop();
-    if (!IOC_TLDS.has(tail)) continue;
-    if (isPackageLike(h, dexPkgs)) continue;
-    b.domains.add(h);
-  }
-  return b;
-}
 
 // Run the whole pipeline against the loaded dk; populates classIoc + iocTotals.
-function computeIocs(dkInst, descriptors) {
+function computeIocs(dkInst) {
+  // Engine-side (dex-analyzer-for-llm#13): dk.extractIocs() runs the network-IoC
+  // scan (URLs/IPs/domains/emails/onion, over the engine's bundled public-suffix
+  // list) AND the content:// provider-URI match (bundled provider dataset), and
+  // resolves each indicator's referencing classes — one call, plain-JS result.
+  // Replaces the old JS scan + shipped datasets (classifyStrings / detectProviders
+  // / xrefStringsToClasses / content_uris.json). Shape:
+  //   { network:[{value,category,classes[]}], providers:[{uri,family,classes[]}] }.
   classIoc = new Map();
   iocIndex = [];
-  const dexPkgs = dexPackagePrefixes(descriptors);
-  // dexllm 0.1.6+: list_strings was removed (identifier noise — type/method/
-  // field names polluted the IOC feed). list_value_strings yields only the
-  // strings the app loads AS DATA: const-string (0x1a/0x1b) operands + static
-  // VALUE_STRING (0x17) field initializers, MUTF-8 → UTF-8 decoded.
-  const sv = dkInst.listValueStrings();
-  const strings = [];
-  for (let i = 0; i < sv.size(); i++) strings.push(sv.get(i));
-  sv.delete();
-  const buckets = classifyStrings(strings, dexPkgs);
-  buckets.providers = detectProviders(strings);   // content:// query URIs (from the AOSP dataset)
-
-  // flat, deduped value list + the category each value belongs to. Providers go
-  // FIRST so the (few) content:// URIs are never dropped by the XREF_CAP slice.
-  const valueCat = new Map();
-  for (const v of buckets.providers) valueCat.set(v, "providers");
-  for (const cat of IOC_CATS) { if (cat === "providers") continue; for (const v of buckets[cat]) if (!valueCat.has(v)) valueCat.set(v, cat); }
-  const values = [...valueCat.keys()];
-
-  iocTotals = { total: values.length };
-  for (const cat of IOC_CATS) iocTotals[cat] = buckets[cat].size;
-  if (!values.length) return;
-
-  // batched xref: value -> [classDescriptors]. Cap the number cross-referenced
-  // so a string-heavy APK doesn't build a huge Aho-Corasick automaton; extras
-  // are still listed (just without class links). Mirrors ioc.py's xref_limit.
-  const XREF_CAP = 400;
-  const toXref = values.slice(0, XREF_CAP);
-  const VS = new Module.VectorString();
-  for (const v of toXref) VS.push_back(v);
-  let perValueClasses;
-  try { perValueClasses = dkInst.xrefStringsToClasses(VS); }
-  finally { VS.delete(); }
-
-  iocIndex = [];
-  for (let i = 0; i < values.length; i++) {
-    const cat = valueCat.get(values[i]);
-    const cls = (i < toXref.length && perValueClasses[i]) ? perValueClasses[i] : [];
-    iocIndex.push({ value: values[i], cat, classes: [...cls] });
-    for (const cd of cls) {
+  const add = (value, cat, classes) => {
+    iocIndex.push({ value, cat, classes });
+    for (const cd of classes) {
       let e = classIoc.get(cd);
       if (!e) { e = newIocEntry(); classIoc.set(cd, e); }
-      e[cat].add(values[i]);
+      e[cat].add(value);
     }
-  }
+  };
+  const r = dkInst.extractIocs();
+  for (const p of r.providers) add(p.uri, "providers", p.classes);   // providers first (panel order)
+  for (const n of r.network) add(n.value, n.category, n.classes);
+  iocTotals = { total: iocIndex.length };
+  for (const cat of IOC_CATS) iocTotals[cat] = 0;
+  for (const it of iocIndex) iocTotals[it.cat] = (iocTotals[it.cat] || 0) + 1;
 }
 const iocCountFor = cd => {
   const e = classIoc.get(cd); if (!e) return 0;
   let n = 0; for (const cat of IOC_CATS) n += e[cat].size; return n;
 };
 
-// ---- permission callers (dexllm.dangerous_permission_api_callers) ----
-// Port of src/dexllm/dangerous_api.py. Join the AOSP permission→API table against
-// the APK's external method refs, then resolve each used gated API to the methods
-// that call it. The table (`perm_api.json`) covers EVERY protection level — 564
-// permissions — not just the dangerous slice; `perm_levels.json` tags each with
-// its protectionLevel so the panel groups/filters by level.
-//
-// Entries are SIGNATURE-PRECISE (`pkg.Class#method(params)`), so overloads with
-// different permission gates are
-// disambiguated. We mirror dangerous_api.py's matching policy: arity is the
-// primary, parse-robust discriminator; exact simple-type matching is only the
-// tiebreak when a (class, method) has multiple overloads of the same arity. A
-// lone overload (of its arity) matches on name alone, so a signature edge case
-// can never drop a real hit.
+// ---- permission callers ----
+// The permission→API→callers join now lives in the engine
+// (WasmDexKit.permissionCallers, dex-analyzer-for-llm#13) over its bundled
+// perm→API table + protection levels; computePerms() just flattens the result
+// into the panel's shape. The old JS join + perm_api.json / perm_levels.json are
+// gone. These small descriptor helpers remain (used by the xref / nav code).
 const descToJava = d => (d.startsWith("L") && d.endsWith(";")) ? d.slice(1, -1).replace(/\//g, ".") : d;
 const classOfMethod = md => md.split("->")[0];   // "Lcls;->m()V" -> "Lcls;"
 
-// Caller prefixes treated as bundled framework / official-library code — a
-// dangerous-API call from here is library plumbing, not app behaviour. Mirrors
-// dangerous_api.py `_FRAMEWORK_CALLER_PREFIXES`.
-const FRAMEWORK_CALLER_PREFIXES = [
-  "Landroidx/", "Landroid/support/", "Landroid/arch/", "Lkotlin/", "Lkotlinx/",
-  "Ljava/", "Ljavax/", "Ldalvik/", "Lcom/google/android/", "Lcom/google/common/",
-  "Lcom/google/gson/",
-];
-const isFrameworkCaller = desc => FRAMEWORK_CALLER_PREFIXES.some(p => desc.startsWith(p));
 
 // ── signature normalisation (mirror of dangerous_api.py) ────────────────────
 // Both sides are reduced to a tuple of SIMPLE type names so a Dalvik proto and
@@ -1371,96 +1255,24 @@ function parseApi(entry) {
   return { cls, name, types: splitTopLevel(params).map(paramSimple) };
 }
 
-// {(class, method): {arity: #distinct overloads of that arity}}
-// Drives the ambiguity check: a (class, method) with one overload — or one
-// overload of a given arity — needs no signature parsing to disambiguate. Dedup
-// is by FULL signature STRING, not the reduced simple-type tuple (two overloads
-// can reduce to the same tuple, e.g. java.util.Date vs java.sql.Date).
-function buildOverloadIndex(apiMap) {
-  const seen = new Map();                  // "cls method" -> Set<sig>
-  for (const sigs of Object.values(apiMap)) {
-    for (const sig of sigs) {
-      const { cls, name, types } = parseApi(sig);
-      if (types === null) continue;
-      const k = cls + " " + name;
-      let s = seen.get(k); if (!s) { s = new Set(); seen.set(k, s); }
-      s.add(sig);
-    }
-  }
-  const out = new Map();
-  for (const [k, sigSet] of seen) {
-    const arity = {};
-    for (const sig of sigSet) {
-      const n = (parseApi(sig).types || []).length;
-      arity[n] = (arity[n] || 0) + 1;
-    }
-    out.set(k, arity);
-  }
-  return out;
-}
 
-// Whether a dex ref realises the dataset signature `types`.
-function refMatches(ref, types, arityMap) {
-  let total = 0;
-  for (const v of Object.values(arityMap)) total += v;
-  if (total <= 1) return true;             // single overload — name match unambiguous
-  const refTypes = dalvikParamTypes(ref.proto);
-  if (refTypes.length !== types.length) return false;
-  if ((arityMap[types.length] || 0) <= 1) return true;   // unique arity in the set
-  return refTypes.join(",") === types.join(",");
-}
 
-// Index APK external method refs by (java_class, method_name). Aliases each
-// `<init>` ref under the class simple name so a dataset constructor entry
-// `Class#SimpleName(...)` matches without rewriting the dataset side.
-function buildExternalIndex(dkInst) {
-  const idx = new Map();
-  const refs = dkInst.listExternalMethodRefs();
-  const add = (cls, name, ref) => {
-    const k = cls + " " + name;
-    let bucket = idx.get(k);
-    if (!bucket) { bucket = []; idx.set(k, bucket); }
-    bucket.push(ref);
-  };
-  for (const r of refs) {
-    const cls = descToJava(r.cls).replace(/\$/g, ".");   // canonicalise inner-class sep
-    add(cls, r.name, r);
-    if (r.name === "<init>") add(cls, cls.split(".").pop(), r);
-  }
-  return idx;
-}
 
 function computePerms(dkInst, appOnly = true) {
+  // Engine-side (dex-analyzer-for-llm#13): dk.permissionCallers() does the whole
+  // permission→API→callers join over the engine's bundled perm→API table +
+  // protection levels (app_only filtering handled in-engine). Replaces the old JS
+  // join + shipped perm_api.json / perm_levels.json. Returns
+  //   [{perm, protectionLevel, rows:[{api, descriptors[], callers[]}]}].
+  // We flatten it into the panel's existing flat permIndex shape.
   permIndex = []; permTotals = null;
-  if (!permApiMap) return;
-  const idx = buildExternalIndex(dkInst);
-  const overloads = buildOverloadIndex(permApiMap);
   const perms = new Set(), callersAll = new Set();
-  for (const perm of Object.keys(permApiMap)) {
-    const level = levelBucket(permLevels[perm] || "unknown");
-    for (const sig of permApiMap[perm]) {
-      const { cls, name, types } = parseApi(sig);
-      if (types === null) continue;                  // field/constant entry
-      const refs = idx.get(cls + " " + name);
-      if (!refs) continue;
-      const arityMap = overloads.get(cls + " " + name) || {};
-      const matched = refs.filter(r => refMatches(r, types, arityMap));
-      if (!matched.length) continue;
-      const callers = new Set();
-      for (const r of matched) {
-        const desc = r.cls + "->" + r.name + r.proto;
-        const cs = dkInst.findCallSitesToApi(desc);
-        for (let i = 0; i < cs.size(); i++) {
-          const caller = cs.get(i);
-          if (appOnly && isFrameworkCaller(caller)) continue;
-          callers.add(caller);
-        }
-        cs.delete();
-      }
-      if (callers.size) {
-        permIndex.push({ perm, level, api: sig, callers: [...callers] });
-        perms.add(perm); callers.forEach(c => callersAll.add(c));
-      }
+  for (const g of dkInst.permissionCallers(appOnly)) {
+    const level = levelBucket(g.protectionLevel || "unknown");
+    for (const row of g.rows) {
+      if (!row.callers.length) continue;
+      permIndex.push({ perm: g.perm, level, api: row.api, callers: row.callers });
+      perms.add(g.perm); for (const c of row.callers) callersAll.add(c);
     }
   }
   permTotals = { perms: perms.size, apis: permIndex.length, callers: callersAll.size };
@@ -1918,13 +1730,8 @@ async function processCurrentDk(label, loadMs, opts) {
   statusEl.innerHTML = `<b>${label}</b> · scanning for indicators…`;
   classIoc = new Map(); iocTotals = null;
   try {
-    const descriptors = allClasses.slice();
-    const tv = dk.listExternalTypeRefs();
-    for (let i = 0; i < tv.size(); i++) descriptors.push(tv.get(i));
-    tv.delete();
-    await ensureContentUris();                  // provider query-URI dataset (once)
     await new Promise(r => setTimeout(r, 0));   // let the "scanning…" status paint
-    computeIocs(dk, descriptors);
+    computeIocs(dk);
   } catch (e) { console.error("IOC extraction failed:", e); iocTotals = null; }
 
   permIndex = []; permTotals = null; permPending = true;
@@ -2103,11 +1910,7 @@ function activateIsolatedTab(did) {
   // globals, restores them. computeIocs writes to module-level vars
   // (classIoc/iocIndex/iocTotals), so we capture the result by save/restore.
   if (iso.ioc === null) {
-    const descriptors = iso.classes.slice();
-    const tv = iso.dk.listExternalTypeRefs();
-    for (let i = 0; i < tv.size(); i++) descriptors.push(tv.get(i));
-    tv.delete();
-    computeIocs(iso.dk, descriptors);
+    computeIocs(iso.dk);
     iso.ioc = { classIoc, iocIndex, iocTotals };
   }
   classIoc = iso.ioc.classIoc;
@@ -2127,8 +1930,6 @@ function activateIsolatedTab(did) {
     permIndex = []; permTotals = null; permPending = true;
     renderPermPanel();
     setTimeout(async () => {
-      if (viewMode !== "isolated" || selectedDex !== key) return;
-      await ensurePermData();
       if (viewMode !== "isolated" || selectedDex !== key) return;
       computePerms(iso.dk, true);
       iso.perm = { permIndex, permTotals };
@@ -2302,19 +2103,6 @@ function statusPills() {
   return iocPill + permPill;
 }
 
-// Load the full permission→API map + protection-level table once. Both are
-// static assets; a failed fetch leaves an empty map so the panel degrades to
-// "no permissions" rather than throwing.
-async function ensurePermData() {
-  if (permApiMap) return;
-  try {
-    const [api, levels] = await Promise.all([
-      fetch("perm_api.json").then(r => r.ok ? r.json() : {}),
-      fetch("perm_levels.json").then(r => r.ok ? r.json() : {}).catch(() => ({})),
-    ]);
-    permApiMap = api; permLevels = levels || {};
-  } catch (_) { permApiMap = {}; permLevels = {}; }
-}
 
 // Deferred permission caller mapping (the expensive L2 step). Maps EVERY
 // protection level in one pass; the header checkboxes filter the view only.
@@ -2322,7 +2110,6 @@ async function analyzePerms(statusHead) {
   permIndex = []; permTotals = null; permPending = true;
   renderPermPanel();
   try {
-    await ensurePermData();
     await new Promise(r => setTimeout(r, 0));
     computePerms(dk);
   } catch (e) { console.error("permission mapping failed:", e); permTotals = null; }
@@ -2633,8 +2420,7 @@ function renderIocPanel() {
     for (const it of items) {
       body.appendChild(makeNavRow(it.value, it.cat,
         it.classes.map(c => ({ display: c, cls: c, hint: { needle: it.value } })),
-        "classes",
-        it.classes.length ? null : lazyXrefForIoc(it.value, it.cat)));
+        "classes"));
       shown++;
     }
   }
@@ -2785,47 +2571,6 @@ function makeNavRow(label, cat, targets, noun, lazy) {
   return wrap;
 }
 
-// Lazy xref helper for IoC rows that landed in iocIndex with no precomputed
-// classes. Two fallback paths:
-//   1. xrefStringsToClasses — same engine as the bulk pass, runs on just this
-//      one value (covers IoCs past the up-front XREF_CAP).
-//   2. findClassesWithStaticValueString — scans every class's static_values
-//      EncodedArray for a VALUE_STRING match. Covers the "ioc is in a static
-//      field initializer only" case that the L7 string-class search NEVER hits
-//      (it searches method code, not class metadata). The typical example:
-//      `BuildConfig.VERSION_NAME = "2.12.9.2"`. Without this, the IP / domain
-//      / URL would forever read "— none" even though the class is right there.
-//
-// Whatever target it finds, the `hint.needle` carries the IoC value itself, so
-// locateAndGlow finds the line containing the literal — including the field
-// declaration line for the static-initializer case.
-function lazyXrefForIoc(value, cat) {
-  return async () => {
-    if (!dk) return [];
-    // Path 1: method-code xref (Aho-Corasick over const-string operands).
-    const VS = new Module.VectorString();
-    VS.push_back(value);
-    let perValueClasses;
-    try { perValueClasses = dk.xrefStringsToClasses(VS); }
-    finally { VS.delete(); }
-    let cls = (perValueClasses && perValueClasses[0]) || [];
-    // Path 2: static-initializer scan when path 1 came back empty.
-    if (!cls.length) {
-      const r = dk.findClassesWithStaticValueString(value);
-      const arr = [];
-      for (let i = 0; i < r.size(); i++) arr.push(r.get(i));
-      r.delete();
-      cls = arr;
-    }
-    // Patch classIoc so the per-class badge updates on next render.
-    for (const cd of cls) {
-      let e = classIoc.get(cd);
-      if (!e) { e = newIocEntry(); classIoc.set(cd, e); }
-      e[cat].add(value);
-    }
-    return cls.map(c => ({ display: c, cls: c, hint: { needle: value } }));
-  };
-}
 
 // Jump to a class by descriptor. Reveals/highlights its tree row when visible;
 // always shows the code + IOC bar. `hint` (optional) glows the gated-API line.
