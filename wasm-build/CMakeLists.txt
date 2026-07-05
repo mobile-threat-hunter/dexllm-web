@@ -51,6 +51,8 @@ add_library(dexkit_ext STATIC
     "${DEXLLM_ROOT}/native/core_ext/dexitem_code_source.cpp"
     "${DEXLLM_ROOT}/native/core_ext/dex_verifier.cpp"
     "${DEXLLM_ROOT}/native/core_ext/analysis.cpp"
+    "${DEXLLM_ROOT}/native/core_ext/public_suffix.cpp"
+    "${DEXLLM_ROOT}/native/core_ext/ioc.cpp"
 )
 target_include_directories(dexkit_ext PUBLIC
     "${DEXLLM_ROOT}/native/core_ext/include"

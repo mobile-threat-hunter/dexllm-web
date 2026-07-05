@@ -22,6 +22,7 @@
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <string>
@@ -322,6 +323,69 @@ public:
             go.set("rows", rows);
             out.set(i++, go);
         }
+        return out;
+    }
+
+    // Issue #13: network IoCs + content:// providers over the SHARED engine
+    // implementation (dexkit::ext::ExtractIocs / DetectContentProviders) and its
+    // bundled public-suffix + provider-URI datasets — so this binding no longer
+    // re-implements the scan in JS or ships its own PSL / content_uris copy.
+    // Shape: { network: [{value, category, classes[]}], providers: [{uri, family,
+    // classes[]}] }, where classes[] are the referencing classes (owner of each
+    // xref method, deduped preserving order) — the navigable "where in the code".
+    val extractIocs() {
+        auto owner = [](const std::string& d) {
+            auto p = d.find("->");
+            return p == std::string::npos ? d : d.substr(0, p);
+        };
+        auto classes_of = [&](const std::vector<std::string>& methods) {
+            val arr = val::array();
+            std::size_t k = 0;
+            std::vector<std::string> seen;
+            for (const auto& m : methods) {
+                std::string c = owner(m);
+                if (std::find(seen.begin(), seen.end(), c) == seen.end()) {
+                    seen.push_back(c);
+                    arr.set(k++, c);
+                }
+            }
+            return arr;
+        };
+
+        val out = val::object();
+        auto r = dexkit::ext::ExtractIocs(ext_, /*with_xref=*/true,
+                                          /*denoise=*/true, /*xref_limit=*/300);
+        val network = val::array();
+        std::size_t ni = 0;
+        auto emit_cat = [&](const std::vector<dexkit::ext::IocIndicator>& rows,
+                            const char* cat) {
+            for (const auto& ind : rows) {
+                val o = val::object();
+                o.set("value", ind.value);
+                o.set("category", std::string(cat));
+                o.set("classes", classes_of(ind.methods));
+                network.set(ni++, o);
+            }
+        };
+        emit_cat(r.urls, "urls");
+        emit_cat(r.ips, "ips");
+        emit_cat(r.domains, "domains");
+        emit_cat(r.emails, "emails");
+        emit_cat(r.onion, "onion");
+        out.set("network", network);
+
+        val providers = val::array();
+        std::size_t pi = 0;
+        for (const auto& h :
+             dexkit::ext::DetectContentProviders(ext_, /*with_xref=*/true,
+                                                 /*xref_limit=*/300)) {
+            val o = val::object();
+            o.set("uri", h.uri);
+            o.set("family", h.family);
+            o.set("classes", classes_of(h.methods));
+            providers.set(pi++, o);
+        }
+        out.set("providers", providers);
         return out;
     }
 
@@ -803,6 +867,7 @@ EMSCRIPTEN_BINDINGS(dexllm_wasm) {
         .function("listExternalTypeRefs",  &WasmDexKit::listExternalTypeRefs)
         .function("listExternalMethodRefs",&WasmDexKit::listExternalMethodRefs)
         .function("permissionCallers",     &WasmDexKit::permissionCallers)
+        .function("extractIocs",           &WasmDexKit::extractIocs)
         .function("xrefStringsToClasses",  &WasmDexKit::xrefStringsToClasses)
         .function("findClassesWithStaticValueString",
                   &WasmDexKit::findClassesWithStaticValueString)
