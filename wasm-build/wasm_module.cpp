@@ -389,6 +389,49 @@ public:
         return out;
     }
 
+    // Issue #13 (Phase 2): capability profile over the SHARED engine catalog
+    // (dexkit::ext::SummarizeCapabilities / gen/android_api_data.h) — mirrors
+    // dexllm.capability.summarize_capabilities. Shape: { permissions:{p:n},
+    // categories:{c:n}, byCaller:{caller:[perms]}, apiHits:[{apiSignature,
+    // permissions[], categories[], callSiteCount, callers[]}], totalCallSites,
+    // catalogVersion, catalogSize, matchedApis }.
+    val summarizeCapabilities() {
+        auto to_arr = [](const std::vector<std::string>& v) {
+            val a = val::array();
+            std::size_t k = 0;
+            for (const auto& s : v) a.set(k++, s);
+            return a;
+        };
+        auto r = dexkit::ext::SummarizeCapabilities(ext_);
+        val out = val::object();
+        val perms = val::object();
+        for (const auto& [p, n] : r.permissions) perms.set(p, n);
+        out.set("permissions", perms);
+        val cats = val::object();
+        for (const auto& [c, n] : r.categories) cats.set(c, n);
+        out.set("categories", cats);
+        val byCaller = val::object();
+        for (const auto& [caller, ps] : r.by_caller) byCaller.set(caller, to_arr(ps));
+        out.set("byCaller", byCaller);
+        val hits = val::array();
+        std::size_t hi = 0;
+        for (const auto& h : r.api_hits) {
+            val o = val::object();
+            o.set("apiSignature", h.api_signature);
+            o.set("permissions", to_arr(h.permissions));
+            o.set("categories", to_arr(h.categories));
+            o.set("callSiteCount", h.call_site_count);
+            o.set("callers", to_arr(h.callers));
+            hits.set(hi++, o);
+        }
+        out.set("apiHits", hits);
+        out.set("totalCallSites", r.total_call_sites);
+        out.set("catalogVersion", r.catalog_version);
+        out.set("catalogSize", r.catalog_size);
+        out.set("matchedApis", r.matched_apis);
+        return out;
+    }
+
     // Scan every loaded dex's class static_values for a string-equal match and
     // return the descriptors of the declaring classes. Plugs the IoC gap:
     // xrefStringsToClasses uses method-code search (Aho-Corasick over const-
@@ -868,6 +911,7 @@ EMSCRIPTEN_BINDINGS(dexllm_wasm) {
         .function("listExternalMethodRefs",&WasmDexKit::listExternalMethodRefs)
         .function("permissionCallers",     &WasmDexKit::permissionCallers)
         .function("extractIocs",           &WasmDexKit::extractIocs)
+        .function("summarizeCapabilities", &WasmDexKit::summarizeCapabilities)
         .function("xrefStringsToClasses",  &WasmDexKit::xrefStringsToClasses)
         .function("findClassesWithStaticValueString",
                   &WasmDexKit::findClassesWithStaticValueString)
