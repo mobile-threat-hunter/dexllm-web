@@ -39,8 +39,8 @@ so a redeploy never serves a stale wasm against a fresh glue file
 ([`index.html:851`](../index.html#L851)):
 
 ```html
-<script>window.__DEXLLM_BUILD = "36a578a";</script>
-<script src="dexllm.js?v=36a578a"></script>
+<script>window.__DEXLLM_BUILD = "4dc17f6";</script>
+<script src="dexllm.js?v=4dc17f6"></script>
 ```
 
 The main thread instantiates the module with a `locateFile` hook so the wasm
