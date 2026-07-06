@@ -2717,11 +2717,17 @@ function smaliInvokesFrom(useDk, methodDesc) {
   const invokes = [];
   // Each line looks like
   //   `<offset>: invoke-<kind> {regs}, Lcls;->name(proto)Ret`
-  // We grab the target after the last `, ` per line.
-  const RE = /^\s*(?:0x[0-9a-f]+\s*:\s*)?invoke-([a-z\/-]+)\s*\{[^}]*\}\s*,\s*(L[\w\/$]+;->[^\s(]+\([^)]*\)[^\s]+)/i;
+  // We keep the invoke KIND and the register list so a click can be matched to
+  // the EXACT invoke (its receiver register / static-ness), not just its name.
+  const RE = /^\s*(?:0x[0-9a-f]+\s*:\s*)?invoke-([a-z\/-]+)\s*\{([^}]*)\}\s*,\s*(L[\w\/$]+;->[^\s(]+\([^)]*\)[^\s]+)/i;
   for (const line of smali.split("\n")) {
     const m = line.match(RE);
-    if (m) invokes.push({ kind: m[1], descriptor: m[2] });
+    if (!m) continue;
+    const kind = m[1].toLowerCase();
+    // First register: the receiver for instance invokes (`{vRecv, vArg…}` or a
+    // `{vLo .. vHi}` range). Static invokes have no receiver — first reg is arg0.
+    const firstReg = (m[2].split(/\s*(?:,|\.\.)\s*/)[0] || "").trim() || null;
+    invokes.push({ kind, descriptor: m[3], isStatic: kind.startsWith("static"), firstReg });
   }
   _smaliInvokesCache.set(methodDesc, invokes);
   return invokes;
@@ -3049,14 +3055,43 @@ function smaliFieldsFrom(useDk, methodDesc) {
   try { smali = useDk.renderMethodSmali(methodDesc); }
   catch (_) { _smaliFieldsCache.set(methodDesc, []); return []; }
   const accesses = [];
-  // baksmali-style: `iget v0, v1, Lcls;->name:Type` or `sput-object v0, Lcls;->name:Type`.
-  const RE = /^\s*(?:0x[0-9a-f]+\s*:\s*)?([is](?:get|put)[a-z\-]*)\b[^,]*,(?:[^,]*,)?\s*(L[\w\/$]+;->[a-zA-Z_$<][\w$]*:[^\s,)}]+)/i;
+  // baksmali-style: `iget v0, v1, Lcls;->name:Type` (instance — 2nd reg v1 is the
+  // OBJECT) or `sput-object v0, Lcls;->name:Type` (static — no object register).
+  // We keep the object register + static-ness so a click can be matched to the
+  // EXACT access, not just its field name.
+  const RE = /^\s*(?:0x[0-9a-f]+\s*:\s*)?([is](?:get|put)[a-z\-]*)\b[^,]*?,\s*(?:([vp]\d+)\s*,\s*)?(L[\w\/$]+;->[a-zA-Z_$<][\w$]*:[^\s,)}]+)/i;
   for (const ln of smali.split("\n")) {
     const m = ln.match(RE);
-    if (m) accesses.push({ op: m[1].toLowerCase(), descriptor: m[2] });
+    if (!m) continue;
+    const op = m[1].toLowerCase();
+    accesses.push({ op, descriptor: m[3], isStatic: op[0] === "s", objReg: m[2] || null });
   }
   _smaliFieldsCache.set(methodDesc, accesses);
   return accesses;
+}
+
+// Among field accesses named `fieldName`, keep the one(s) whose OBJECT matches
+// the clicked `recv.fieldName` — mirror of narrowInvokesByReceiver, using the
+// smali object register / static-ness and the decompiler's resolved class:
+//   Cls.field  → the static access on class Cls
+//   reg.field  → an instance access whose object register is reg
+//   this.field / field → an access on the current class
+function narrowFieldsByReceiver(accesses, line, fieldName, currentCls) {
+  const esc = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const m = line.match(new RegExp("([A-Za-z_$][\\w$.]*)\\s*\\.\\s*" + esc + "\\b"));
+  if (!m) return accesses.filter(a => a.descriptor.startsWith(currentCls + "->"));
+  const recv = m[1];
+  const reg = regNumOf(recv);
+  if (reg != null) {
+    const byReg = accesses.filter(a => !a.isStatic && regNumOf(a.objReg) === reg);
+    return byReg.length ? byReg : accesses.filter(a => !a.isStatic);
+  }
+  if (recv === "this") return accesses.filter(a => a.descriptor.startsWith(currentCls + "->"));
+  if (/^[A-Z]/.test(recv.split(".").pop())) {
+    const cls = "L" + recv.replace(/\./g, "/") + ";";
+    return accesses.filter(a => a.descriptor.startsWith(cls + "->"));
+  }
+  return [];
 }
 
 function navigateToFieldDeclFromUsage(currentCls, lineIdx, fieldName, anchor) {
@@ -3065,11 +3100,15 @@ function navigateToFieldDeclFromUsage(currentCls, lineIdx, fieldName, anchor) {
   let matches = [];
   if (callerDesc) {
     const accesses = smaliFieldsFrom(useDk, callerDesc);
-    for (const a of accesses) {
-      const namePart = (a.descriptor.split("->")[1] || "").split(":")[0];
-      if (namePart === fieldName) matches.push(a.descriptor);
+    let matchAcc = accesses.filter(a => ((a.descriptor.split("->")[1] || "").split(":")[0]) === fieldName);
+    // Same field name can be read/written on DIFFERENT objects in one method
+    // (`this.x` and `other.x`); pin the access the click refers to via the smali
+    // object register / static class instead of listing every same-named field.
+    if (matchAcc.length > 1) {
+      const narrowed = narrowFieldsByReceiver(matchAcc, codeLineCache[lineIdx] || "", fieldName, currentCls);
+      if (narrowed.length) matchAcc = narrowed;
     }
-    matches = [...new Set(matches)];
+    matches = [...new Set(matchAcc.map(a => a.descriptor))];
   }
   // Fallback: same-class field-by-name match (catches `count` referenced
   // directly in a method that the smali parse missed — rare).
@@ -4220,6 +4259,40 @@ function findCalleesFromMethod(useDk, callerDesc, calleeName) {
   return out;
 }
 
+// Register number behind a decompiled local/param token — `p18`→18, `v0_18`→0
+// (the base register, dropping any SSA `_N` suffix). Matches the smali register
+// list. null for anything that isn't a `vN`/`pN` register.
+function regNumOf(tok) {
+  const m = /^[vp](\d+)/.exec((tok || "").replace(/_.*/, ""));
+  return m ? +m[1] : null;
+}
+
+// Among invokes named `name`, keep the one(s) whose RECEIVER matches the clicked
+// call — using smali ground truth (static-ness + receiver register) and the
+// decompiler's own resolved class, never argument-count guessing:
+//   Cls.name(  → the invoke on class Cls (decompiler already resolved it)
+//   reg.name(  → a non-static invoke whose receiver register is reg
+//   this.name( / name( → an invoke on the current class
+// Returns [] when the receiver can't be read (caller then keeps all matches).
+function narrowInvokesByReceiver(matches, line, name, currentCls) {
+  const at = line.indexOf(name + "(");
+  if (at < 0) return [];
+  const rm = line.slice(0, at).match(/([A-Za-z_$][\w$.]*)\s*\.\s*$/);
+  if (!rm) return matches.filter(iv => iv.descriptor.startsWith(currentCls + "->"));
+  const recv = rm[1];
+  const reg = regNumOf(recv);
+  if (reg != null) {
+    const byReg = matches.filter(iv => !iv.isStatic && regNumOf(iv.firstReg) === reg);
+    return byReg.length ? byReg : matches.filter(iv => !iv.isStatic);
+  }
+  if (recv === "this") return matches.filter(iv => iv.descriptor.startsWith(currentCls + "->"));
+  if (/^[A-Z]/.test(recv.split(".").pop())) {
+    const cls = "L" + recv.replace(/\./g, "/") + ";";
+    return matches.filter(iv => iv.descriptor.startsWith(cls + "->"));
+  }
+  return [];
+}
+
 function navigateToCalleeMethod(currentCls, name, line, lineIdx, anchor) {
   const useDk = activeQueryDk();
   // 1) SMALI path — the dex-bytecode-faithful answer. Find the enclosing
@@ -4228,13 +4301,21 @@ function navigateToCalleeMethod(currentCls, name, line, lineIdx, anchor) {
   const callerDesc = findEnclosingMethodDescriptor(currentCls, lineIdx, useDk);
   if (callerDesc) {
     const invokes = smaliInvokesFrom(useDk, callerDesc);
-    const matches = invokes.filter(iv => {
+    let matches = invokes.filter(iv => {
       const after = iv.descriptor.indexOf("->");
       if (after < 0) return false;
       const rest = iv.descriptor.slice(after + 2);
       const open = rest.indexOf("(");
       return open > 0 && rest.slice(0, open) === name;
     });
+    // A name can be invoked more than once in a method with DIFFERENT receivers —
+    // loadBitmap holds both `AndroidUtilities.getPath(uri)` (invoke-static) and
+    // `uri.getPath()` (invoke-virtual). Pin the invoke the click refers to from
+    // the smali facts (receiver register / static-ness), not a text heuristic.
+    if (matches.length > 1) {
+      const narrowed = narrowInvokesByReceiver(matches, line, name, currentCls);
+      if (narrowed.length) matches = narrowed;
+    }
     if (matches.length === 1) {
       const d = matches[0].descriptor;                                   // Lcls;->name(proto)Ret
       const targetCls = d.split("->")[0];
@@ -4242,8 +4323,8 @@ function navigateToCalleeMethod(currentCls, name, line, lineIdx, anchor) {
       return _navigateAfterClassCheck(targetCls, name, proto);
     }
     if (matches.length > 1) {
-      // Multiple invokes of methods named `name` from this caller — e.g.
-      // `obj.equals(x)` and `other.equals(y)`. Surface a picker.
+      // Still ambiguous (same receiver, real overloads, or a variable receiver
+      // the text can't pin) — surface a picker.
       showCalleePicker(matches.map(iv => iv.descriptor), name, anchor);
       return;
     }
@@ -4309,9 +4390,12 @@ function _navigateAfterClassCheck(targetCls, name, proto) {
     }
   } else {
     if (dk.locateClassDex(targetCls) < 0 && targetCls !== currentClass) {
-      // Target class isn't loaded in any source — silently fall back to a
-      // same-class search so the user still gets something useful.
-      navigateToClass(currentClass, { needle: name, proto });
+      // Target class has no source in the APK (framework/external, e.g.
+      // android.net.Uri.getPath()). There's nothing to jump to — say so
+      // instead of a misleading same-class text search that would glow an
+      // unrelated same-named method in the current class.
+      const cn = targetCls.replace(/^L/, "").replace(/;$/, "").replace(/\//g, ".");
+      flashToast(name + "() is external — " + cn);
       return;
     }
   }
