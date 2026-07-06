@@ -39,8 +39,8 @@ GOOS=windows GOARCH=amd64 go build \
 
 The `static/` directory next to `main.go` holds the embedded assets — copies of
 `index.html`, `worker.js`, `dexllm.js`, `dexllm.wasm`, `loop.mp4`, and the
-outro clips `trans.mp4` / `trans2.mp4` / `trans3.mp4` (one is picked at random
-per drop) from the repo root. (The permission / content-URI datasets are no longer shipped
+outro clips `trans.mp4` / `trans2.mp4` (one is picked at random per drop) from
+the repo root. (The permission / content-URI datasets are no longer shipped
 — they're bundled inside `dexllm.wasm` and exposed via the engine API.) After
 updating those at the repo root, refresh the copies and rebuild.
 

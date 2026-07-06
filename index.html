@@ -1419,7 +1419,7 @@ const TRANS_RATE = 2.0;
 // Pool of outro clips — one is picked at random per drop so repeated loads
 // feel varied. All play at the same TRANS_RATE. Only the chosen clip is
 // fetched (src set on demand), so the extra clips don't weigh down page load.
-const TRANS_SRCS = ["trans.mp4", "trans2.mp4", "trans3.mp4"];
+const TRANS_SRCS = ["trans.mp4", "trans2.mp4"];
 
 let transTimer = null;
 function startTransition() {
