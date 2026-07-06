@@ -1416,14 +1416,31 @@ const TRANS_RATE = 2.0;
     ev => document.addEventListener(ev, retry, { once: false, passive: true }));
 })();
 
+// Pool of outro clips — one is picked at random per drop so repeated loads
+// feel varied. All play at the same TRANS_RATE. Only the chosen clip is
+// fetched (src set on demand), so the extra clips don't weigh down page load.
+const TRANS_SRCS = ["trans.mp4", "trans2.mp4", "trans3.mp4"];
+
 let transTimer = null;
 function startTransition() {
   const loop = $("#loopvid"), trans = $("#transvid");
   if (loop) loop.style.display = "none";
   trans.style.display = "block";
-  try { trans.currentTime = 0; trans.playbackRate = TRANS_RATE; } catch (_) {}
+  // Swap in a random clip unless it's already the loaded one (then just replay).
+  const chosen = TRANS_SRCS[Math.floor(Math.random() * TRANS_SRCS.length)];
+  const cur = trans.getAttribute("src") || trans.currentSrc || "";
+  if (!cur.endsWith(chosen)) {
+    trans.setAttribute("src", chosen);
+    try { trans.load(); } catch (_) {}
+  }
+  const setRate = () => { try { trans.playbackRate = TRANS_RATE; } catch (_) {} };
+  // playbackRate can be reset by load(); reassert it once the new clip's data
+  // is ready as well as immediately.
+  trans.addEventListener("loadeddata", setRate, { once: true });
+  try { trans.currentTime = 0; } catch (_) {}
+  setRate();
   const p = trans.play(); if (p && p.catch) p.catch(() => {});
-  try { trans.playbackRate = TRANS_RATE; } catch (_) {}
+  setRate();
   return new Promise(resolve => {
     let done = false;
     const finish = () => { if (done) return; done = true; clearTimeout(transTimer); resolve(); };
