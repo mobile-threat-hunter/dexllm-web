@@ -2365,6 +2365,15 @@ function highlight(code) {
       if (KW_PRIM.has(t)) cls = "tk-typ";        // primitives group with class types
       else if (KW_LIT.has(t)) cls = "tk-lit";    // true / false / null
       else if (JAVA_KW.has(t)) cls = "tk-key";
+      // A member call `recv.Name(...)` is a METHOD regardless of Name's casing. Must
+      // come BEFORE the uppercase→Constant/Type heuristics: obfuscators name methods
+      // `Z`, `A`, `Q0`, and a single-uppercase or ALL_CAPS name followed by `(` and
+      // preceded by `.` would otherwise be stolen by tk-con/tk-typ, so the callee-xref
+      // (which only fires on tk-fun) never runs. `new Cls(` has no preceding `.`, so
+      // constructors stay tk-typ. Bounded slices keep this O(1) per token.
+      else if (/^\s*\(/.test(code.slice(last, last + 4)) &&
+               (code[m.index - 1] === "." || /\.\s*$/.test(code.slice(Math.max(0, m.index - 6), m.index))))
+        cls = "tk-fun";
       else if (t.length > 1 && /^[A-Z][A-Z0-9_]*$/.test(t)) cls = "tk-con";
       else if (/^[A-Z]/.test(t)) cls = "tk-typ"; // Type / constructor (even if a call)
       else if (/^([vp]\d|[ms][A-Z])/.test(t)) cls = "tk-var";   // v1/p5 locals+params, mX/sX fields
@@ -4376,6 +4385,34 @@ $("#code").addEventListener("click", (e) => {
   if (smaliSync.enabled) {
     const info = getLineForElement(e.target, e);
     if (info) syncSmaliFromCodeLine(info.idx);
+  }
+  // ── smali-first method dispatch (class-agnostic) ──────────────────────────
+  // The tokenizer's tk-* class is a COLORING hint, not ground truth. Obfuscators
+  // name methods `Z`, `A`, `Q0`, and the uppercase→Type/Constant heuristics
+  // mislabel those as tk-typ/tk-con, which used to route the click to the wrong
+  // (constructor/field) path so the callee-xref never ran. Here we decide method
+  // call vs. declaration from the LINE CONTEXT (`name(` shape) instead — the
+  // resolution itself is already smali-based (invoke-*). Anything followed by `(`
+  // that isn't a `new X(` or a constructor declaration is a method:
+  //   • method-declaration header → callers popup
+  //   • otherwise (a call site)   → callee jump (resolved via the enclosing
+  //                                 method's invoke-* lines)
+  // Constructors, fields, types, strings (not `name(`) fall through untouched.
+  const mTok = e.target.closest(".tk-fun, .tk-typ, .tk-con, .tk-ide, .tk-var");
+  if (mTok) {
+    const mName = mTok.textContent;
+    const mInfo = getLineForElement(mTok);
+    if (mInfo && /^[A-Za-z_$][\w$]*$/.test(mName)) {
+      const at = mInfo.line.indexOf(mName + "(");
+      if (at >= 0 &&
+          !isNewCtorContext(mInfo.line, at, mName.length) &&
+          !isCtorDeclaration(mInfo.line, mName, at, currentClass)) {
+        e.stopPropagation();
+        if (isMethodDeclaration(mInfo.line, mName)) showCallersFor(currentClass, mName, mTok);
+        else navigateToCalleeMethod(currentClass, mName, mInfo.line, mInfo.idx);
+        return;
+      }
+    }
   }
   // Field tokens: .tk-var (Android-prefix mX/sX, or DAD's vN/pN locals/params)
   // and .tk-ide (any other identifier — `count` etc.). We try the field path
