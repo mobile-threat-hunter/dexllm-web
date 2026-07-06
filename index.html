@@ -4418,8 +4418,68 @@ function navigateToConstructor(name, lineIdx, anchor) {
   flashToast("'" + name + "' constructor not found");
 }
 
+// ── span-independent click resolution ──────────────────────────────────────
+// caller/callee used to require a .tk-* token under the cursor. That breaks in
+// two real cases the tokenizer can't serve:
+//   1. the plain-large render path (class > 200k chars) emits NO per-token
+//      spans at all, so nothing was clickable;
+//   2. R8 / Kotlin synthetic names carry '-' (`-$$Nest$mFoo`, `access$-getX`),
+//      which the identifier regex splits, so a click landed on half a name.
+// So we resolve the identifier from the RAW line text + caret column instead of
+// the DOM split. #code is white-space:pre monospace with no tabs in DAD's
+// output, so (clientX → column) is linear and mode-independent.
+function measureCharW(code) {
+  const probe = document.createElement("span");
+  probe.textContent = "0000000000";
+  probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre;left:-9999px;top:0";
+  code.appendChild(probe);
+  const w = probe.getBoundingClientRect().width / 10;
+  probe.remove();
+  return w > 0 ? w : 7.5;
+}
+const WORD_CH = /[A-Za-z0-9_$-]/;                  // '-' included for R8 synthetics
+function wordAtCol(line, col) {
+  const n = line.length;
+  if (col < 0) col = 0;
+  let i = col, j = col;
+  if (i >= n || !WORD_CH.test(line[i])) {          // click just past a word's end
+    if (col > 0 && WORD_CH.test(line[col - 1])) i = j = col - 1;
+    else return null;
+  }
+  while (i > 0 && WORD_CH.test(line[i - 1])) i--;
+  while (j < n && WORD_CH.test(line[j])) j++;
+  const name = line.slice(i, j);
+  // Never a method/field name: pure number, or no letter/_/$ at all.
+  if (/^\d/.test(name) || !/[A-Za-z_$]/.test(name)) return null;
+  return { name, start: i, end: j };
+}
+function codeWordAtEvent(e) {
+  const info = getLineForElement(e.target, e);
+  if (!info) return null;
+  const code = $("#code");
+  const codeR = code.getBoundingClientRect();
+  const padLeft = parseFloat(getComputedStyle(code).paddingLeft) || 0;
+  const col = Math.floor(((e.clientX - codeR.left) + code.scrollLeft - padLeft) / measureCharW(code));
+  const w = wordAtCol(info.line, col);
+  if (!w) return null;
+  return { name: w.name, line: info.line, idx: info.idx, start: w.start, end: w.end };
+}
+// Popup anchor: the clicked span when it's a tight inline element, else a
+// zero-size rect at the cursor (plain mode has no per-token element).
+function eventAnchor(e) {
+  const t = e.target;
+  if (t && t.nodeType === 1 && t !== $("#code") && !t.classList.contains("chunk")) {
+    const r = t.getBoundingClientRect();
+    if (r.width && r.height && r.width < 400) return t;
+  }
+  const x = e.clientX, y = e.clientY;
+  return { getBoundingClientRect: () => ({ left: x, right: x, top: y, bottom: y, width: 0, height: 0, x, y }) };
+}
+const IS_KW = (t) => JAVA_KW.has(t) || KW_PRIM.has(t) || KW_LIT.has(t);
+
 // Click delegation on #code: route to caller popup, callee navigation, or
-// constructor jump depending on the clicked token's class + line context.
+// constructor jump. Method + field xref resolve span-independently (see above);
+// string / type / constructor xref stay span-based (highlight mode only).
 $("#code").addEventListener("click", (e) => {
   if (!currentClass) return;
   // D-3 smali sync runs ALONGSIDE the other dispatches — if the smali pane
@@ -4429,73 +4489,44 @@ $("#code").addEventListener("click", (e) => {
     const info = getLineForElement(e.target, e);
     if (info) syncSmaliFromCodeLine(info.idx);
   }
-  // ── smali-first method dispatch (class-agnostic) ──────────────────────────
-  // The tokenizer's tk-* class is a COLORING hint, not ground truth. Obfuscators
-  // name methods `Z`, `A`, `Q0`, and the uppercase→Type/Constant heuristics
-  // mislabel those as tk-typ/tk-con, which used to route the click to the wrong
-  // (constructor/field) path so the callee-xref never ran. Here we decide method
-  // call vs. declaration from the LINE CONTEXT (`name(` shape) instead — the
-  // resolution itself is already smali-based (invoke-*). Anything followed by `(`
-  // that isn't a `new X(` or a constructor declaration is a method:
-  //   • method-declaration header → callers popup
-  //   • otherwise (a call site)   → callee jump (resolved via the enclosing
-  //                                 method's invoke-* lines)
-  // Constructors, fields, types, strings (not `name(`) fall through untouched.
-  const mTok = e.target.closest(".tk-fun, .tk-typ, .tk-con, .tk-ide, .tk-var");
-  if (mTok) {
-    const mName = mTok.textContent;
-    const mInfo = getLineForElement(mTok);
-    if (mInfo && /^[A-Za-z_$][\w$]*$/.test(mName)) {
-      const at = mInfo.line.indexOf(mName + "(");
-      if (at >= 0 &&
-          !isNewCtorContext(mInfo.line, at, mName.length) &&
-          !isCtorDeclaration(mInfo.line, mName, at, currentClass)) {
-        e.stopPropagation();
-        if (isMethodDeclaration(mInfo.line, mName)) showCallersFor(currentClass, mName, mTok);
-        else navigateToCalleeMethod(currentClass, mName, mInfo.line, mInfo.idx);
-        return;
-      }
-    }
-  }
-  // Field tokens: .tk-var (Android-prefix mX/sX, or DAD's vN/pN locals/params)
-  // and .tk-ide (any other identifier — `count` etc.). We try the field path
-  // first; if the click is on a local/param the smali fallback yields no
-  // matches and we silently no-op (locals route nowhere meaningful yet).
-  const fldT = e.target.closest(".tk-var, .tk-con, .tk-ide");
-  if (fldT && !e.target.closest(".tk-fun, .tk-typ")) {
-    const name = fldT.textContent;
-    const info = getLineForElement(fldT);
-    if (!info) return;
-    // DAD's renamed locals/params (`v1`, `p5`, `v0_3`) are never fields — bail
-    // before doing wasm work so a click on a local doesn't trigger a query.
-    if (/^[vp]\d/.test(name)) return;
-    if (isFieldDeclLine(info.line, name)) {
-      e.stopPropagation();
-      showFieldXrefFor(currentClass, name, fldT);
-      return;
-    }
-    // Usage context — only act if there IS an enclosing method (otherwise
-    // a click in the class header / static-block area would fire a fruitless
-    // smali render).
-    if (findEnclosingMethodName(info.idx)) {
-      e.stopPropagation();
-      navigateToFieldDeclFromUsage(currentClass, info.idx, name);
-      return;
-    }
-  }
-  // Method tokens: declaration → callers popup; call site → callee jump.
-  const funT = e.target.closest(".tk-fun");
-  if (funT) {
+  // The clicked identifier, resolved from raw text + caret (span-independent).
+  const word = codeWordAtEvent(e);
+
+  // ── method / constructor dispatch: an identifier immediately followed by '('
+  //    Resolved from LINE CONTEXT (the `name(` shape), not the tokenizer's tk-*
+  //    colour — obfuscators name methods `Z`/`Q0` and R8 emits '-'-bearing
+  //    synthetics, both of which the span split gets wrong. Works in the
+  //    plain-large render mode too (no spans at all). Resolution is smali-based.
+  //      new X(          → constructor jump          (word at the clicked spot)
+  //      ClassName(args) → callers of <init> popup   (declaration header)
+  //      name( header    → callers popup
+  //      name( call site → callee jump (via the enclosing method's invokes)
+  if (word && !IS_KW(word.name) && /^\s*\(/.test(word.line.slice(word.end))) {
+    const nm = word.name, at = word.start;
     e.stopPropagation();
-    const name = funT.textContent;
-    const info = getLineForElement(funT);
-    if (!info) return;
-    if (isMethodDeclaration(info.line, name)) {
-      showCallersFor(currentClass, name, funT);
-    } else {
-      navigateToCalleeMethod(currentClass, name, info.line, info.idx);
-    }
+    if (isNewCtorContext(word.line, at, nm.length)) navigateToConstructor(nm, word.idx, eventAnchor(e));
+    else if (isCtorDeclaration(word.line, nm, at, currentClass)) showCallersFor(currentClass, "<init>", eventAnchor(e));
+    else if (isMethodDeclaration(word.line, nm)) showCallersFor(currentClass, nm, eventAnchor(e));
+    else navigateToCalleeMethod(currentClass, nm, word.line, word.idx);
     return;
+  }
+  // ── field dispatch (span-independent) ─────────────────────────────────────
+  // Declaration line → get/set xref popup; usage → jump to the declaration.
+  // Skip type/string/annotation spans (own handlers below), vN/pN locals, and
+  // anything followed by '(' (a call, handled above — never a field).
+  if (word && !IS_KW(word.name) && !/^[vp]\d/.test(word.name) &&
+      !/^\s*\(/.test(word.line.slice(word.end)) &&
+      !e.target.closest(".tk-typ, .tk-str, .tk-ann")) {
+    if (isFieldDeclLine(word.line, word.name)) {
+      e.stopPropagation();
+      showFieldXrefFor(currentClass, word.name, eventAnchor(e));
+      return;
+    }
+    if (findEnclosingMethodName(word.idx)) {
+      e.stopPropagation();
+      navigateToFieldDeclFromUsage(currentClass, word.idx, word.name);
+      return;
+    }
   }
   // String literals: click → list of methods referencing that exact string.
   const strT = e.target.closest(".tk-str");
