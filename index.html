@@ -2694,11 +2694,10 @@ function receiverClassOf(line, name, lineIdx) {
   // whose last segment is uppercase.
   const lastSeg = path.split(".").pop();
   if (/^[A-Z]/.test(lastSeg)) return "L" + path.replace(/\./g, "/") + ";";
-  // Variable receiver — infer type via reverse scan.
-  if (lineIdx != null) {
-    const t = inferVariableType(path, lineIdx);
-    if (t) return t;
-  }
+  // Variable receiver (`builder.build()`) — its declared type would need a
+  // reverse scan. The smali path (invoke-*) already resolves these exactly
+  // whenever the call is in bytecode, so this fallback is only reached for
+  // text-only references; return null and let the same-class search handle it.
   return null;
 }
 
@@ -3060,7 +3059,7 @@ function smaliFieldsFrom(useDk, methodDesc) {
   return accesses;
 }
 
-function navigateToFieldDeclFromUsage(currentCls, lineIdx, fieldName) {
+function navigateToFieldDeclFromUsage(currentCls, lineIdx, fieldName, anchor) {
   const useDk = activeQueryDk();
   const callerDesc = findEnclosingMethodDescriptor(currentCls, lineIdx, useDk);
   let matches = [];
@@ -3102,7 +3101,7 @@ function navigateToFieldDeclFromUsage(currentCls, lineIdx, fieldName) {
     return;
   }
   // Multiple — picker (same chrome as callee picker).
-  showCalleePicker(matches, fieldName);
+  showCalleePicker(matches, fieldName, anchor);
 }
 
 // ── Shared row helpers (framework markers, call graph) ────────────────────
@@ -4221,7 +4220,7 @@ function findCalleesFromMethod(useDk, callerDesc, calleeName) {
   return out;
 }
 
-function navigateToCalleeMethod(currentCls, name, line, lineIdx) {
+function navigateToCalleeMethod(currentCls, name, line, lineIdx, anchor) {
   const useDk = activeQueryDk();
   // 1) SMALI path — the dex-bytecode-faithful answer. Find the enclosing
   //    method, render its smali, look for invoke-* lines whose method name
@@ -4245,7 +4244,7 @@ function navigateToCalleeMethod(currentCls, name, line, lineIdx) {
     if (matches.length > 1) {
       // Multiple invokes of methods named `name` from this caller — e.g.
       // `obj.equals(x)` and `other.equals(y)`. Surface a picker.
-      showCalleePicker(matches.map(iv => iv.descriptor), name);
+      showCalleePicker(matches.map(iv => iv.descriptor), name, anchor);
       return;
     }
   }
@@ -4261,17 +4260,23 @@ function navigateToCalleeMethod(currentCls, name, line, lineIdx) {
 
 // Picker — reuses the callers popup chrome. Each item navigates to the
 // chosen overload / receiver class.
-function showCalleePicker(descriptors, name) {
+function showCalleePicker(descriptors, name, anchor) {
   const pop = $("#callerpop");
   $("#callerpop-method").textContent = name;
   const body = $("#callerpop-body");
   body.innerHTML = "";
   pop.classList.add("show");
-  // Anchor near the current selection; recenter at the cursor's last
-  // mouse position approximated by the viewer's top-left.
-  const viewer = $("#viewer").getBoundingClientRect();
-  pop.style.left = Math.max(12, viewer.left + 40) + "px";
-  pop.style.top  = Math.max(80, viewer.top + 60) + "px";
+  // Anchor below the clicked token (consistent with the callers / field / string
+  // popups). Falls back to the viewer's top-left only when no anchor is given.
+  if (anchor && anchor.getBoundingClientRect) {
+    const r = anchor.getBoundingClientRect();
+    pop.style.left = Math.max(12, Math.min(window.innerWidth - 500, r.left)) + "px";
+    pop.style.top  = (r.bottom + 6) + "px";
+  } else {
+    const viewer = $("#viewer").getBoundingClientRect();
+    pop.style.left = Math.max(12, viewer.left + 40) + "px";
+    pop.style.top  = Math.max(80, viewer.top + 60) + "px";
+  }
   const head = document.createElement("div");
   head.className = "callerpop-empty";
   head.style.color = "var(--fg-3)";
@@ -4306,11 +4311,14 @@ function _navigateAfterClassCheck(targetCls, name, proto) {
     if (dk.locateClassDex(targetCls) < 0 && targetCls !== currentClass) {
       // Target class isn't loaded in any source — silently fall back to a
       // same-class search so the user still gets something useful.
-      navigateToClass(currentClass, { needle: name, scope: name, proto, scopeProto: proto });
+      navigateToClass(currentClass, { needle: name, proto });
       return;
     }
   }
-  navigateToClass(targetCls, { needle: name, scope: name, proto, scopeProto: proto });
+  // Callee navigation seeks the DECLARATION of `name` — no `scope`. Passing
+  // scope:name here made the fallback (when findDecl misses) search AFTER the
+  // first `name(` occurrence and land on another method's call site instead.
+  navigateToClass(targetCls, { needle: name, proto });
 }
 
 // Brief floating toast for inline navigation failures (mainly Isolated's
@@ -4401,7 +4409,7 @@ function navigateToConstructor(name, lineIdx, anchor) {
     return _navigateAfterClassCheck(targetCls, name);
   }
   if (matches.length > 1) {
-    showCalleePicker(matches.map(iv => iv.descriptor), name);
+    showCalleePicker(matches.map(iv => iv.descriptor), name, anchor);
     return;
   }
   // Last resort: ask dexkit for any class whose name ends with /Name; and let
@@ -4412,7 +4420,7 @@ function navigateToConstructor(name, lineIdx, anchor) {
   cands.delete();
   if (arr.length === 1) return _navigateAfterClassCheck(arr[0], name);
   if (arr.length > 1) {
-    showCalleePicker(arr.map(d => d + "-><init>(...)"), name);
+    showCalleePicker(arr.map(d => d + "-><init>(...)"), name, anchor);
     return;
   }
   flashToast("'" + name + "' constructor not found");
@@ -4507,7 +4515,7 @@ $("#code").addEventListener("click", (e) => {
     if (isNewCtorContext(word.line, at, nm.length)) navigateToConstructor(nm, word.idx, eventAnchor(e));
     else if (isCtorDeclaration(word.line, nm, at, currentClass)) showCallersFor(currentClass, "<init>", eventAnchor(e));
     else if (isMethodDeclaration(word.line, nm)) showCallersFor(currentClass, nm, eventAnchor(e));
-    else navigateToCalleeMethod(currentClass, nm, word.line, word.idx);
+    else navigateToCalleeMethod(currentClass, nm, word.line, word.idx, eventAnchor(e));
     return;
   }
   // ── field dispatch (span-independent) ─────────────────────────────────────
@@ -4524,7 +4532,7 @@ $("#code").addEventListener("click", (e) => {
     }
     if (findEnclosingMethodName(word.idx)) {
       e.stopPropagation();
-      navigateToFieldDeclFromUsage(currentClass, word.idx, word.name);
+      navigateToFieldDeclFromUsage(currentClass, word.idx, word.name, eventAnchor(e));
       return;
     }
   }
@@ -4571,7 +4579,7 @@ $("#code").addEventListener("click", (e) => {
       showTypeHierarchyFor(resolved, typT);
     } else if (resolved && resolved.ambiguous) {
       e.stopPropagation();
-      showCalleePicker(resolved.ambiguous, tokenText);
+      showCalleePicker(resolved.ambiguous, tokenText, typT);
     }
   }
 });
@@ -4884,6 +4892,11 @@ function locateAndGlow(hint) {
   let target = -1;
   // Overload-precise target: land on the declaration of `needle` matching `proto`.
   if (needle && proto) target = findDecl(needle, proto);
+  // Declaration sought (proto given) but no proto/arity match — e.g. the header
+  // wraps lines, or generics/arrays defeat the simple-type compare. Land on ANY
+  // declaration of `needle` before the plain-text fallback below, which would
+  // otherwise wrongly hit a CALL site in some other method.
+  if (target < 0 && needle && proto) target = lines.findIndex(l => isMethodDeclaration(l, needle));
   if (target < 0 && needle) {
     if (scopeLine >= 0) {
       let skip = occurrence - 1;
