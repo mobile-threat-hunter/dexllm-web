@@ -102,7 +102,7 @@ target_compile_options(dexllm PRIVATE
 target_link_options(dexllm PRIVATE
     -lembind
     -fexceptions
-    -O3
+    -O0    # link WITHOUT wasm-opt: at -O2/-O3 wasm-opt pathologically blew up (~45GB RSS, 5h+) on the 1.4MB perm codegen table (issue #14); -O0 skips it. Compile stays -O3 so per-function codegen is unaffected; only whole-module post-opt is skipped (larger wasm, negligible runtime diff for this in-browser tool).
     "SHELL:-s MODULARIZE=1"
     "SHELL:-s EXPORT_NAME=createDexllm"
     "SHELL:-s EXPORTED_RUNTIME_METHODS=['FS','getExceptionMessage']"
