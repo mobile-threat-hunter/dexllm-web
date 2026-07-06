@@ -2977,17 +2977,34 @@ function showFieldXrefFor(cls, fieldName, anchor) {
           body.appendChild(e);
           return;
         }
+        // `Lpkg/Outer$Inner;` -> `Outer$Inner` (Java ctor headers use the
+        // binary simple name, so <init> can be scoped by it).
+        const clsSimple = (c) => { const s = c.replace(/^L/, "").replace(/;$/, ""); return s.slice(s.lastIndexOf("/") + 1); };
+        const occ = {};
         for (const desc of list) {
           const item = document.createElement("div");
           item.className = "callerpop-item";
           const targetCls = desc.split("->")[0];
           const ext = isExternalClass(useDk, targetCls) ? externalBadgeHtml() : "";
-          item.innerHTML = ext + escAttr(desc);
-          item.title = desc;
           const targetMethod = methodOfDescriptor(desc);
+          // The same method can read/write a field at several sites — each is
+          // its own row; occurrence N glows the Nth access instead of every
+          // row landing on the first one.
+          const occurrence = (occ[desc] = (occ[desc] || 0) + 1);
+          const dupTag = list.filter(d => d === desc).length > 1
+            ? ` <span style="color:var(--fg-3);font-size:10px">#${occurrence}</span>` : "";
+          item.innerHTML = ext + escAttr(desc) + dupTag;
+          item.title = desc;
+          // Signature-precise scope so an overloaded reader/writer — or one
+          // whose name collides with a `.get(`-style call earlier in the class
+          // — glows the RIGHT method body. Constructors render as `ClassName(`
+          // in Java, so map <init> to the simple class name; scopeProto then
+          // disambiguates overloaded ctors.
+          const scopeProto = desc.slice(desc.indexOf("("), desc.lastIndexOf(")") + 1);
+          const scope = targetMethod === "<init>" ? clsSimple(targetCls) : targetMethod;
           item.onclick = () => {
             pop.classList.remove("show");
-            navigateToClass(targetCls, { needle: fieldName, scope: targetMethod });
+            navigateToClass(targetCls, { needle: fieldName, scope, scopeProto, occurrence });
           };
           body.appendChild(item);
         }
