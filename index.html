@@ -2365,6 +2365,15 @@ function highlight(code) {
       if (KW_PRIM.has(t)) cls = "tk-typ";        // primitives group with class types
       else if (KW_LIT.has(t)) cls = "tk-lit";    // true / false / null
       else if (JAVA_KW.has(t)) cls = "tk-key";
+      // A member call `recv.Name(...)` is a METHOD regardless of Name's casing. Must
+      // come BEFORE the uppercase→Constant/Type heuristics: obfuscators name methods
+      // `Z`, `A`, `Q0`, and a single-uppercase or ALL_CAPS name followed by `(` and
+      // preceded by `.` would otherwise be stolen by tk-con/tk-typ, so the callee-xref
+      // (which only fires on tk-fun) never runs. `new Cls(` has no preceding `.`, so
+      // constructors stay tk-typ. Bounded slices keep this O(1) per token.
+      else if (/^\s*\(/.test(code.slice(last, last + 4)) &&
+               (code[m.index - 1] === "." || /\.\s*$/.test(code.slice(Math.max(0, m.index - 6), m.index))))
+        cls = "tk-fun";
       else if (t.length > 1 && /^[A-Z][A-Z0-9_]*$/.test(t)) cls = "tk-con";
       else if (/^[A-Z]/.test(t)) cls = "tk-typ"; // Type / constructor (even if a call)
       else if (/^([vp]\d|[ms][A-Z])/.test(t)) cls = "tk-var";   // v1/p5 locals+params, mX/sX fields
@@ -4191,8 +4200,10 @@ function navigateToCalleeMethod(currentCls, name, line, lineIdx) {
       return open > 0 && rest.slice(0, open) === name;
     });
     if (matches.length === 1) {
-      const targetCls = matches[0].descriptor.split("->")[0];
-      return _navigateAfterClassCheck(targetCls, name);
+      const d = matches[0].descriptor;                                   // Lcls;->name(proto)Ret
+      const targetCls = d.split("->")[0];
+      const proto = d.slice(d.indexOf("("), d.lastIndexOf(")") + 1);     // exact overload signature
+      return _navigateAfterClassCheck(targetCls, name, proto);
     }
     if (matches.length > 1) {
       // Multiple invokes of methods named `name` from this caller — e.g.
@@ -4235,15 +4246,19 @@ function showCalleePicker(descriptors, name) {
     item.textContent = desc;
     item.title = desc;
     const targetCls = desc.split("->")[0];
+    const proto = desc.slice(desc.indexOf("("), desc.lastIndexOf(")") + 1);   // exact overload
     item.onclick = () => {
       pop.classList.remove("show");
-      _navigateAfterClassCheck(targetCls, name);
+      _navigateAfterClassCheck(targetCls, name, proto);
     };
     body.appendChild(item);
   }
 }
 
-function _navigateAfterClassCheck(targetCls, name) {
+function _navigateAfterClassCheck(targetCls, name, proto) {
+  // `proto` (Dalvik `(params)` of the resolved invoke, optional) lets the glow
+  // pinpoint the exact OVERLOAD in the target class instead of the first method
+  // named `name`. Threaded into the hint; locateAndGlow uses it when present.
   if (viewMode === "isolated") {
     const iso = isolated.get(selectedDex);
     if (iso && iso.classes && !iso.classes.includes(targetCls)) {
@@ -4254,11 +4269,11 @@ function _navigateAfterClassCheck(targetCls, name) {
     if (dk.locateClassDex(targetCls) < 0 && targetCls !== currentClass) {
       // Target class isn't loaded in any source — silently fall back to a
       // same-class search so the user still gets something useful.
-      navigateToClass(currentClass, { needle: name, scope: name });
+      navigateToClass(currentClass, { needle: name, scope: name, proto });
       return;
     }
   }
-  navigateToClass(targetCls, { needle: name, scope: name });
+  navigateToClass(targetCls, { needle: name, scope: name, proto });
 }
 
 // Brief floating toast for inline navigation failures (mainly Isolated's
@@ -4376,6 +4391,34 @@ $("#code").addEventListener("click", (e) => {
   if (smaliSync.enabled) {
     const info = getLineForElement(e.target, e);
     if (info) syncSmaliFromCodeLine(info.idx);
+  }
+  // ── smali-first method dispatch (class-agnostic) ──────────────────────────
+  // The tokenizer's tk-* class is a COLORING hint, not ground truth. Obfuscators
+  // name methods `Z`, `A`, `Q0`, and the uppercase→Type/Constant heuristics
+  // mislabel those as tk-typ/tk-con, which used to route the click to the wrong
+  // (constructor/field) path so the callee-xref never ran. Here we decide method
+  // call vs. declaration from the LINE CONTEXT (`name(` shape) instead — the
+  // resolution itself is already smali-based (invoke-*). Anything followed by `(`
+  // that isn't a `new X(` or a constructor declaration is a method:
+  //   • method-declaration header → callers popup
+  //   • otherwise (a call site)   → callee jump (resolved via the enclosing
+  //                                 method's invoke-* lines)
+  // Constructors, fields, types, strings (not `name(`) fall through untouched.
+  const mTok = e.target.closest(".tk-fun, .tk-typ, .tk-con, .tk-ide, .tk-var");
+  if (mTok) {
+    const mName = mTok.textContent;
+    const mInfo = getLineForElement(mTok);
+    if (mInfo && /^[A-Za-z_$][\w$]*$/.test(mName)) {
+      const at = mInfo.line.indexOf(mName + "(");
+      if (at >= 0 &&
+          !isNewCtorContext(mInfo.line, at, mName.length) &&
+          !isCtorDeclaration(mInfo.line, mName, at, currentClass)) {
+        e.stopPropagation();
+        if (isMethodDeclaration(mInfo.line, mName)) showCallersFor(currentClass, mName, mTok);
+        else navigateToCalleeMethod(currentClass, mName, mInfo.line, mInfo.idx);
+        return;
+      }
+    }
   }
   // Field tokens: .tk-var (Android-prefix mX/sX, or DAD's vN/pN locals/params)
   // and .tk-ide (any other identifier — `count` etc.). We try the field path
@@ -4734,7 +4777,36 @@ function locateAndGlow(hint) {
   if (scope && !scope.startsWith("<"))   // skip <init>/<clinit>
     scopeLine = lines.findIndex(l => l.includes(scope + "("));
   let target = -1;
-  if (needle) {
+  // Overload-precise glow: with the resolved invoke's Dalvik proto, land on the
+  // DECLARATION of `needle` whose param simple-types match (Z(String) vs Z(int)),
+  // falling back to an arity match — instead of the first same-name method.
+  if (needle && hint.proto) {
+    const want = dalvikParamTypes(hint.proto);
+    const declParams = (line, from) => {
+      const open = line.indexOf("(", from);
+      if (open < 0) return null;
+      let depth = 0, close = -1;
+      for (let i = open; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === "(") depth++;
+        else if (ch === ")" && --depth === 0) { close = i; break; }
+      }
+      if (close < 0) return null;                       // header wraps lines — skip
+      const inner = line.slice(open + 1, close).trim();
+      return inner ? splitTopLevel(inner).map(paramSimple) : [];
+    };
+    let arityHit = -1;
+    for (let i = 0; i < lines.length; i++) {
+      const li = lines[i].indexOf(needle + "(");
+      if (li < 0 || !isMethodDeclaration(lines[i], needle)) continue;
+      const got = declParams(lines[i], li + needle.length);
+      if (!got || got.length !== want.length) continue;
+      if (arityHit < 0) arityHit = i;
+      if (got.every((t, k) => t === want[k])) { target = i; break; }   // exact type match wins
+    }
+    if (target < 0) target = arityHit;                                  // arity-only fallback
+  }
+  if (target < 0 && needle) {
     if (scopeLine >= 0) {
       let skip = occurrence - 1;
       for (let i = scopeLine + 1; i < lines.length; i++) {
