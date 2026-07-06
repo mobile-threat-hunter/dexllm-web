@@ -4200,8 +4200,10 @@ function navigateToCalleeMethod(currentCls, name, line, lineIdx) {
       return open > 0 && rest.slice(0, open) === name;
     });
     if (matches.length === 1) {
-      const targetCls = matches[0].descriptor.split("->")[0];
-      return _navigateAfterClassCheck(targetCls, name);
+      const d = matches[0].descriptor;                                   // Lcls;->name(proto)Ret
+      const targetCls = d.split("->")[0];
+      const proto = d.slice(d.indexOf("("), d.lastIndexOf(")") + 1);     // exact overload signature
+      return _navigateAfterClassCheck(targetCls, name, proto);
     }
     if (matches.length > 1) {
       // Multiple invokes of methods named `name` from this caller — e.g.
@@ -4244,15 +4246,19 @@ function showCalleePicker(descriptors, name) {
     item.textContent = desc;
     item.title = desc;
     const targetCls = desc.split("->")[0];
+    const proto = desc.slice(desc.indexOf("("), desc.lastIndexOf(")") + 1);   // exact overload
     item.onclick = () => {
       pop.classList.remove("show");
-      _navigateAfterClassCheck(targetCls, name);
+      _navigateAfterClassCheck(targetCls, name, proto);
     };
     body.appendChild(item);
   }
 }
 
-function _navigateAfterClassCheck(targetCls, name) {
+function _navigateAfterClassCheck(targetCls, name, proto) {
+  // `proto` (Dalvik `(params)` of the resolved invoke, optional) lets the glow
+  // pinpoint the exact OVERLOAD in the target class instead of the first method
+  // named `name`. Threaded into the hint; locateAndGlow uses it when present.
   if (viewMode === "isolated") {
     const iso = isolated.get(selectedDex);
     if (iso && iso.classes && !iso.classes.includes(targetCls)) {
@@ -4263,11 +4269,11 @@ function _navigateAfterClassCheck(targetCls, name) {
     if (dk.locateClassDex(targetCls) < 0 && targetCls !== currentClass) {
       // Target class isn't loaded in any source — silently fall back to a
       // same-class search so the user still gets something useful.
-      navigateToClass(currentClass, { needle: name, scope: name });
+      navigateToClass(currentClass, { needle: name, scope: name, proto });
       return;
     }
   }
-  navigateToClass(targetCls, { needle: name, scope: name });
+  navigateToClass(targetCls, { needle: name, scope: name, proto });
 }
 
 // Brief floating toast for inline navigation failures (mainly Isolated's
@@ -4771,7 +4777,36 @@ function locateAndGlow(hint) {
   if (scope && !scope.startsWith("<"))   // skip <init>/<clinit>
     scopeLine = lines.findIndex(l => l.includes(scope + "("));
   let target = -1;
-  if (needle) {
+  // Overload-precise glow: with the resolved invoke's Dalvik proto, land on the
+  // DECLARATION of `needle` whose param simple-types match (Z(String) vs Z(int)),
+  // falling back to an arity match — instead of the first same-name method.
+  if (needle && hint.proto) {
+    const want = dalvikParamTypes(hint.proto);
+    const declParams = (line, from) => {
+      const open = line.indexOf("(", from);
+      if (open < 0) return null;
+      let depth = 0, close = -1;
+      for (let i = open; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === "(") depth++;
+        else if (ch === ")" && --depth === 0) { close = i; break; }
+      }
+      if (close < 0) return null;                       // header wraps lines — skip
+      const inner = line.slice(open + 1, close).trim();
+      return inner ? splitTopLevel(inner).map(paramSimple) : [];
+    };
+    let arityHit = -1;
+    for (let i = 0; i < lines.length; i++) {
+      const li = lines[i].indexOf(needle + "(");
+      if (li < 0 || !isMethodDeclaration(lines[i], needle)) continue;
+      const got = declParams(lines[i], li + needle.length);
+      if (!got || got.length !== want.length) continue;
+      if (arityHit < 0) arityHit = i;
+      if (got.every((t, k) => t === want[k])) { target = i; break; }   // exact type match wins
+    }
+    if (target < 0) target = arityHit;                                  // arity-only fallback
+  }
+  if (target < 0 && needle) {
     if (scopeLine >= 0) {
       let skip = occurrence - 1;
       for (let i = scopeLine + 1; i < lines.length; i++) {
