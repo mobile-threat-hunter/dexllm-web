@@ -2868,7 +2868,10 @@ function showCallersFor(cls, name, anchor) {
             : (isCtor ? simpleCls : name);
           // occurrence: skip the first (occurrence-1) matches so the glow
           // lands on the right `needle(` instance in the caller's body.
-          navigateToClass(callerCls, { needle, scope: callerMethod, occurrence: c.occurrence });
+          // scopeProto = the caller method's signature so an overloaded caller
+          // (get(Context) vs get(ISP,Context)) scopes to the RIGHT overload.
+          const callerProto = c.desc.slice(c.desc.indexOf("("), c.desc.lastIndexOf(")") + 1);
+          navigateToClass(callerCls, { needle, scope: callerMethod, scopeProto: callerProto, occurrence: c.occurrence });
         };
         body.appendChild(item);
       }
@@ -4269,11 +4272,11 @@ function _navigateAfterClassCheck(targetCls, name, proto) {
     if (dk.locateClassDex(targetCls) < 0 && targetCls !== currentClass) {
       // Target class isn't loaded in any source — silently fall back to a
       // same-class search so the user still gets something useful.
-      navigateToClass(currentClass, { needle: name, scope: name, proto });
+      navigateToClass(currentClass, { needle: name, scope: name, proto, scopeProto: proto });
       return;
     }
   }
-  navigateToClass(targetCls, { needle: name, scope: name, proto });
+  navigateToClass(targetCls, { needle: name, scope: name, proto, scopeProto: proto });
 }
 
 // Brief floating toast for inline navigation failures (mainly Isolated's
@@ -4769,43 +4772,53 @@ function measureCodeLh(code) {
 function locateAndGlow(hint) {
   const lines = codeLineCache;
   if (!lines.length || !hint) return;
-  const { needle, scope } = hint;
+  const { needle, scope, proto, scopeProto } = hint;
   // occurrence (1-based, default 1): skip the first (occurrence-1) matches so
   // the caller popup's "× N of M" rows each glow their own call site.
   const occurrence = Math.max(1, hint.occurrence || 1);
-  let scopeLine = -1;
-  if (scope && !scope.startsWith("<"))   // skip <init>/<clinit>
-    scopeLine = lines.findIndex(l => l.includes(scope + "("));
-  let target = -1;
-  // Overload-precise glow: with the resolved invoke's Dalvik proto, land on the
-  // DECLARATION of `needle` whose param simple-types match (Z(String) vs Z(int)),
-  // falling back to an arity match — instead of the first same-name method.
-  if (needle && hint.proto) {
-    const want = dalvikParamTypes(hint.proto);
-    const declParams = (line, from) => {
-      const open = line.indexOf("(", from);
-      if (open < 0) return null;
-      let depth = 0, close = -1;
-      for (let i = open; i < line.length; i++) {
-        const ch = line[i];
-        if (ch === "(") depth++;
-        else if (ch === ")" && --depth === 0) { close = i; break; }
-      }
-      if (close < 0) return null;                       // header wraps lines — skip
-      const inner = line.slice(open + 1, close).trim();
-      return inner ? splitTopLevel(inner).map(paramSimple) : [];
-    };
+
+  // Simple-type params declared on a method-header line (null if it wraps).
+  const declParams = (line, from) => {
+    const open = line.indexOf("(", from);
+    if (open < 0) return null;
+    let depth = 0, close = -1;
+    for (let i = open; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === "(") depth++;
+      else if (ch === ")" && --depth === 0) { close = i; break; }
+    }
+    if (close < 0) return null;                          // header wraps lines — skip
+    const inner = line.slice(open + 1, close).trim();
+    return inner ? splitTopLevel(inner).map(paramSimple) : [];
+  };
+  // Line index of the DECLARATION of `name` whose signature matches the Dalvik
+  // `protoStr` (exact simple-types > arity). -1 if none. Lets an overloaded
+  // target OR scope land on the right overload instead of the first same-name one.
+  const findDecl = (name, protoStr) => {
+    const want = dalvikParamTypes(protoStr);
     let arityHit = -1;
     for (let i = 0; i < lines.length; i++) {
-      const li = lines[i].indexOf(needle + "(");
-      if (li < 0 || !isMethodDeclaration(lines[i], needle)) continue;
-      const got = declParams(lines[i], li + needle.length);
+      const li = lines[i].indexOf(name + "(");
+      if (li < 0 || !isMethodDeclaration(lines[i], name)) continue;
+      const got = declParams(lines[i], li + name.length);
       if (!got || got.length !== want.length) continue;
       if (arityHit < 0) arityHit = i;
-      if (got.every((t, k) => t === want[k])) { target = i; break; }   // exact type match wins
+      if (got.every((t, k) => t === want[k])) return i;  // exact type match wins
     }
-    if (target < 0) target = arityHit;                                  // arity-only fallback
+    return arityHit;                                      // arity-only fallback (or -1)
+  };
+
+  // Scope = caller/enclosing method to search within. Signature-precise when a
+  // proto is given (disambiguates overloaded scopes: get(Context) vs
+  // get(ISP,Context)); else first same-name header.
+  let scopeLine = -1;
+  if (scope && !scope.startsWith("<")) {                  // skip <init>/<clinit>
+    if (scopeProto) scopeLine = findDecl(scope, scopeProto);
+    if (scopeLine < 0) scopeLine = lines.findIndex(l => l.includes(scope + "("));
   }
+  let target = -1;
+  // Overload-precise target: land on the declaration of `needle` matching `proto`.
+  if (needle && proto) target = findDecl(needle, proto);
   if (target < 0 && needle) {
     if (scopeLine >= 0) {
       let skip = occurrence - 1;
