@@ -335,6 +335,7 @@
     padding:4.5px 16px; cursor:pointer; white-space:nowrap; overflow:hidden;
     text-overflow:ellipsis; position:relative;
     transition:background 180ms var(--e-out), color 180ms var(--e-out);
+    content-visibility:auto;
   }
   .cls::before {
     content:""; position:absolute; left:0; top:0; bottom:0; width:2px;
@@ -354,6 +355,7 @@
     padding:4.5px 16px; cursor:pointer; white-space:nowrap; overflow:hidden;
     text-overflow:ellipsis; user-select:none;
     transition:background 180ms var(--e-out), color 180ms var(--e-out);
+    content-visibility:auto;
   }
   .pkg:hover { background:rgba(255,255,255,0.025); }
   .pkg .tw { display:inline-block; width:13px; color:var(--fg-3); transition:color 200ms var(--e-out); }
@@ -2239,6 +2241,66 @@ function iocTitle(cd) {
     .map(cat => `${cat}: ${[...e[cat]].join(", ")}`).join("\n");
 }
 
+// ---- Virtual scrolling state ----
+let virtualList = {
+  enabled: true,
+  itemHeight: 22, // px height of each row
+  allRows: [], // flattened array of all rows {el, depth, type}
+  container: listEl,
+  scrollTimer: null,
+};
+
+// Collect all rows from tree (for virtual scrolling)
+function collectRows(node, rows, depth, expand) {
+  const pkgs = [...node.children.values()].sort((a,b)=>a.seg.localeCompare(b.seg));
+  for (const p of pkgs) {
+    const { label, node:eff } = compress(p);
+    const el = makePkgRow(label, eff, depth, expand);
+    rows.push({ el, depth, type: 'pkg', label, eff });
+  }
+  const cs = node.classes.slice().sort((a,b)=>a.label.localeCompare(b.label));
+  for (const c of cs) {
+    const el = makeClassRow(c, depth);
+    rows.push({ el, depth, type: 'cls' });
+  }
+}
+
+// Render virtual scroll list (only visible items)
+let virtualListCache = new Map(); // cache rendered elements
+function updateVirtualList() {
+  const container = virtualList.container;
+  if (!virtualList.allRows.length) return;
+
+  const scrollTop = container.scrollTop;
+  const clientHeight = container.clientHeight;
+  const padding = 5;
+
+  const startIdx = Math.max(0, Math.floor(scrollTop / virtualList.itemHeight) - padding);
+  const endIdx = Math.min(virtualList.allRows.length, Math.ceil((scrollTop + clientHeight) / virtualList.itemHeight) + padding);
+
+  // Update spacer
+  container.style.paddingTop = (startIdx * virtualList.itemHeight) + 'px';
+
+  // Get all currently rendered indices
+  const rendered = new Set();
+  const elements = container.querySelectorAll('[data-vs-idx]');
+  for (const el of elements) {
+    const idx = parseInt(el.dataset.vsIdx);
+    rendered.add(idx);
+    if (idx < startIdx || idx >= endIdx) el.remove(); // Remove out-of-view
+  }
+
+  // Add newly visible items
+  for (let i = startIdx; i < endIdx; i++) {
+    if (rendered.has(i)) continue;
+    const row = virtualList.allRows[i];
+    if (!row || !row.el) continue;
+    const cloned = row.el.cloneNode(true);
+    cloned.dataset.vsIdx = i;
+    container.appendChild(cloned);
+  }
+}
+
 function renderList(filter) {
   const f = filter.toLowerCase().trim();
   // Scope pool: "all" uses the deduped union (runtime aggregate). A per-dex
@@ -2268,10 +2330,39 @@ function renderList(filter) {
   countEl.textContent = f ? `${items.length} / ${scopeLabel}` : scopeLabel;
   const expand = !!f && items.length <= 1500;
   const root = buildTree(items);
-  listEl.innerHTML = "";
-  const frag = document.createDocumentFragment();
-  appendChildren(root, frag, 0, expand);
-  listEl.appendChild(frag);
+
+  // Use virtual scrolling for large lists (>300 items)
+  if (items.length > 300 && virtualList.enabled) {
+    listEl.innerHTML = "";
+    listEl.style.paddingTop = "0px";
+    virtualList.allRows = [];
+    collectRows(root, virtualList.allRows, 0, expand);
+    virtualList.container = listEl;
+
+    // Render initial batch
+    const endIdx = Math.min(60, virtualList.allRows.length);
+    for (let i = 0; i < endIdx; i++) {
+      const cloned = virtualList.allRows[i].el.cloneNode(true);
+      cloned.dataset.vsIdx = i;
+      listEl.appendChild(cloned);
+    }
+
+    // Setup scroll listener
+    listEl.scrollTop = 0;
+    if (virtualList.scrollTimer) clearTimeout(virtualList.scrollTimer);
+    listEl.onscroll = () => {
+      if (virtualList.scrollTimer) clearTimeout(virtualList.scrollTimer);
+      virtualList.scrollTimer = setTimeout(updateVirtualList, 16);
+    };
+  } else {
+    // Fallback: traditional rendering for small lists
+    listEl.style.paddingTop = "0px";
+    listEl.innerHTML = "";
+    const frag = document.createDocumentFragment();
+    appendChildren(root, frag, 0, expand);
+    listEl.appendChild(frag);
+    listEl.onscroll = null;
+  }
 }
 let searchTimer = null;
 $("#search").addEventListener("input", e => {
