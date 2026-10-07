@@ -558,6 +558,29 @@ public:
         return arr;
     }
 
+    // The FORWARD direction: every invoke INSIDE the given method, with the
+    // callee resolved from the invoke's method_idx. The JS side previously had
+    // to recover this by regex-parsing rendered smali (`smaliInvokesFrom`) and
+    // then guessing which invoke a click meant from the receiver text; here the
+    // `offset` is the bytecode offset of the invoke itself, so pairing it with
+    // decompileMethodJavaWithPc's pcMap pins the exact invoke a source line
+    // refers to without reading any text. `opcode` is the invoke-* family byte:
+    // 0x6E~0x72 plus the /range forms 0x74~0x78, so static-ness is
+    // `opcode == 0x71 || opcode == 0x77` — do NOT test 0x71 alone.
+    // Empty for external / bodyless / unresolved methods.
+    val findCallSitesFromMethod(const std::string& method_descriptor) {
+        val arr = val::array();
+        std::size_t i = 0;
+        for (const auto& cs : ext_.FindCallSitesFromMethod(method_descriptor)) {
+            val o = val::object();
+            o.set("callee", cs.callee_descriptor);
+            o.set("offset", static_cast<int>(cs.bytecode_offset));
+            o.set("opcode", static_cast<int>(cs.invoke_opcode));
+            arr.set(i++, o);
+        }
+        return arr;
+    }
+
     // ── field xref. dexkit carries L2.5 reverse maps `field_get_method_ids`
     // and `field_put_method_ids` keyed by field_idx — exact, instruction-faithful
     // (iget*/sget* vs iput*/sput*), so the JS side can distinguish READERS from
@@ -919,6 +942,7 @@ EMSCRIPTEN_BINDINGS(dexllm_wasm) {
         .function("extractDexBytes",       &WasmDexKit::extractDexBytes)
         .function("findCallSitesToApi",    &WasmDexKit::findCallSitesToApi)
         .function("findCallSitesWithOffset", &WasmDexKit::findCallSitesWithOffset)
+        .function("findCallSitesFromMethod", &WasmDexKit::findCallSitesFromMethod)
         .function("listClassFieldDescriptors", &WasmDexKit::listClassFieldDescriptors)
         .function("findFieldGetMethods",   &WasmDexKit::findFieldGetMethods)
         .function("findFieldPutMethods",   &WasmDexKit::findFieldPutMethods)

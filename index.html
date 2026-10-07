@@ -3919,6 +3919,26 @@ function _methodHeaderLine(fromLineIdx, methodSimpleName) {
   return -1;
 }
 
+// Class-view line index → the method-local line number DAD's pcMap uses.
+// Shared by the smali sync and the callee-offset narrowing so the two can't
+// drift on the +2 convention or on the <init>/<clinit> name translation.
+function _methodLocalLineFor(methodDesc, codeLineIdx) {
+  const cls = methodDesc.split("->")[0];
+  const dexName = methodOfDescriptor(methodDesc);
+  const classSimple = (cls.match(/\/?([A-Za-z_$][\w$]*);$/) || ["", ""])[1];
+  // DAD's class-view emits `<init>` as `ClassName(...)` and `<clinit>` as
+  // `static ClassName()` — both translate to the class simple name. The
+  // walkback then matches `<modifier-prefix> classSimple(`. For <clinit>,
+  // the modifier is "static" so the regular walk catches it correctly.
+  const viewName = (dexName === "<init>" || dexName === "<clinit>") ? classSimple : dexName;
+  const headerLine = _methodHeaderLine(codeLineIdx, viewName);
+  if (headerLine < 0) return { localLine: -1, headerLine: -1, dexName, classSimple };
+  // DAD's DecompileMethod source begins with a leading "\n" — its Writer
+  // counts that as line 1, putting the signature on line 2. So the class-
+  // view's header line corresponds to method-local line 2 (not 1).
+  return { localLine: (codeLineIdx - headerLine) + 2, headerLine, dexName, classSimple };
+}
+
 // Smali syntax highlighter. Splits each line into the offset prefix, the
 // opcode, register operands, the type/method/field descriptor target, and
 // any trailing literal. Each piece gets a .smali-* span so the CSS palette
@@ -4107,26 +4127,11 @@ function syncSmaliFromCodeLine(codeLineIdx) {
   const useDk = activeQueryDk();
   const methodDesc = _findMethodDescForSync(currentClass, codeLineIdx, useDk);
   if (!methodDesc) return;
-  // Header simple name as it appears in DAD's class-view text: descriptors
-  // use `<init>` / `<clinit>`, but DAD writes constructors as the class
-  // simple name and static-init as `static`.
-  const cls = methodDesc.split("->")[0];
-  const dexName = methodOfDescriptor(methodDesc);
-  const classSimple = (cls.match(/\/?([A-Za-z_$][\w$]*);$/) || ["", ""])[1];
-  // DAD's class-view emits `<init>` as `ClassName(...)` and `<clinit>` as
-  // `static ClassName()` — both translate to the class simple name. The
-  // walkback then matches `<modifier-prefix> classSimple(`. For <clinit>,
-  // the modifier is "static" so the regular walk catches it correctly.
-  let viewName = dexName;
-  if (dexName === "<init>" || dexName === "<clinit>") viewName = classSimple;
-  const headerLine = _methodHeaderLine(codeLineIdx, viewName);
+  const { localLine: methodLocalLine, headerLine, dexName } =
+    _methodLocalLineFor(methodDesc, codeLineIdx);
   if (headerLine < 0) return;
   const cache = _loadMethodForSync(methodDesc);
   if (!cache) return;
-  // DAD's DecompileMethod source begins with a leading "\n" — its Writer
-  // counts that as line 1, putting the signature on line 2. So the class-
-  // view's header line corresponds to method-local line 2 (not 1).
-  const methodLocalLine = (codeLineIdx - headerLine) + 2;
   // Exact match → glow. Else: the dex op semantically "active" on this Java
   // line is the most-recent entry whose line is <= clicked line (= the last
   // op emitted by the source). For lines BEFORE the first pcMap entry
@@ -4293,6 +4298,42 @@ function narrowInvokesByReceiver(matches, line, name, currentCls) {
   return [];
 }
 
+// Among invokes named `name`, keep the one(s) the CLICKED SOURCE LINE actually
+// emitted — from the engine's forward xref (a bytecode offset per invoke) joined
+// to DAD's pcMap, reading no text at all. Runs only AFTER the receiver pass, as
+// a tie-breaker, because it is the weaker signal: pcMap is sparse (only ~36% of
+// invoke offsets appear in it verbatim), so invokes are attributed to the line
+// of their nearest PRECEDING entry — the rule syncCodeFromSmaliLine uses — and
+// an invoke whose own line has no entry therefore lands on an earlier line.
+// That misattribution is why ordering matters: `sb.append(fmt(x)).append(32)`
+// has two same-named callees on one source line and the join can surface just
+// the wrong one. Returns [] when inconclusive so the caller falls through.
+function narrowInvokesByClickedLine(useDk, callerDesc, matches, name, lineIdx) {
+  if (typeof useDk.findCallSitesFromMethod !== "function") return [];
+  const { localLine } = _methodLocalLineFor(callerDesc, lineIdx);
+  if (localLine < 0) return [];
+  const cache = _loadMethodForSync(callerDesc);
+  if (!cache || !cache.pcMap.length) return [];
+  let sites;
+  try { sites = useDk.findCallSitesFromMethod(callerDesc); } catch (_) { return []; }
+  const wanted = new Set();
+  for (const cs of sites) {
+    if (cs.offset < 0) continue;
+    const after = cs.callee.indexOf("->");
+    if (after < 0) continue;
+    const rest = cs.callee.slice(after + 2);
+    const open = rest.indexOf("(");
+    if (open <= 0 || rest.slice(0, open) !== name) continue;
+    let best = null;
+    for (const e of cache.pcMap) {
+      if (e.offset <= cs.offset && (!best || e.offset > best.offset)) best = e;
+    }
+    if (best && best.line === localLine) wanted.add(cs.callee);
+  }
+  if (!wanted.size) return [];
+  return matches.filter(iv => wanted.has(iv.descriptor));
+}
+
 function navigateToCalleeMethod(currentCls, name, line, lineIdx, anchor) {
   const useDk = activeQueryDk();
   // 1) SMALI path — the dex-bytecode-faithful answer. Find the enclosing
@@ -4315,6 +4356,15 @@ function navigateToCalleeMethod(currentCls, name, line, lineIdx, anchor) {
     if (matches.length > 1) {
       const narrowed = narrowInvokesByReceiver(matches, line, name, currentCls);
       if (narrowed.length) matches = narrowed;
+    }
+    // Receiver facts left it ambiguous (real overloads on one receiver, or a
+    // receiver the text can't pin) — break the tie with the bytecode offset of
+    // each invoke. Strictly last: measured against a2dp.Vol, offset-first would
+    // have overridden 3 of 228 receiver-resolved sites with a WRONG answer,
+    // while offset-last resolves 87 sites the receiver pass could not.
+    if (matches.length > 1) {
+      const byLine = narrowInvokesByClickedLine(useDk, callerDesc, matches, name, lineIdx);
+      if (byLine.length) matches = byLine;
     }
     if (matches.length === 1) {
       const d = matches[0].descriptor;                                   // Lcls;->name(proto)Ret
