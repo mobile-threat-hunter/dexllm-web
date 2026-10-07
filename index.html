@@ -372,6 +372,14 @@
     border:1px solid rgba(239,79,74,0.30); letter-spacing:0.02em;
   }
   .pkg .ioc-badge { font-weight:500; }
+  /* Android component candidate tag (A/S/R/P/DA/…) — colour carries the kind,
+     so it stays legible next to the red IoC count badge. */
+  .comp-badge {
+    display:inline-block; margin-left:8px; padding:0 6px; border-radius:4px;
+    font-size:9px; font-weight:700; line-height:15px; vertical-align:middle;
+    letter-spacing:0.06em; background:rgba(255,255,255,0.04);
+    border:1px solid currentColor;
+  }
   #iocbar {
     padding:0;
     max-height:30vh; overflow:auto;
@@ -941,6 +949,7 @@
       <div id="permtabs" class="permtabs">
         <span class="permtab on" data-tab="perms" title="Permissions exercised through real gated-API call sites">permissions</span>
         <span class="permtab" data-tab="caps" title="Behavioural capability profile from the engine's bundled API catalog">capabilities</span>
+        <span class="permtab" data-tab="comps" title="Classes whose superclass chain reaches an Android component base — candidates, because AndroidManifest.xml isn't reachable from the dex bytes">components</span>
       </div>
       <div id="permlevels" class="permlevels"></div>
       <input id="permfilter" class="pfilter" placeholder="filter APIs / callers…" autocomplete="off">
@@ -993,7 +1002,35 @@ let activePermLevels = new Set(PERM_LEVELS.map(l => l.key));
 // rows can never surface in the permission→API→caller join.
 let capReport = null;            // the engine's report, or null when unmapped
 let activeCapCats = new Set();   // categories currently shown (all, once mapped)
-let permTab = "perms";           // "perms" | "caps" — which view the panel shows
+let permTab = "perms";           // "perms" | "caps" | "comps" — the panel's view
+
+// ── Android component candidates ────────────────────────────────────────────
+// "Candidates", not components: the engine is handed the APK's dex bytes only,
+// so AndroidManifest.xml is out of reach and we can't tell a declared component
+// from a class that merely extends one. What we CAN do is walk the superclass
+// chain, which is also how a class that is never declared (registered at
+// runtime, or dead) still shows up — usually the interesting case.
+//
+// Ordered MOST SPECIFIC FIRST: DeviceAdminReceiver extends BroadcastReceiver,
+// and JobService / AccessibilityService / VpnService / NotificationListener-
+// Service all extend Service, so every one of them matches its generic base
+// too. First match wins, which keeps a device-admin out of the plain receiver
+// bucket where its significance would be lost.
+const COMPONENT_BASES = [
+  { base: "Landroid/app/admin/DeviceAdminReceiver;",                   kind: "device-admin",   tag: "DA", color: "#ff5e5e" },
+  { base: "Landroid/accessibilityservice/AccessibilityService;",       kind: "accessibility",  tag: "AX", color: "#ff5e5e" },
+  { base: "Landroid/service/notification/NotificationListenerService;", kind: "notif-listener", tag: "NL", color: "#ff8a4c" },
+  { base: "Landroid/net/VpnService;",                                  kind: "vpn",            tag: "VPN", color: "#ff8a4c" },
+  { base: "Landroid/app/job/JobService;",                              kind: "job",            tag: "J",  color: "#c08cff" },
+  { base: "Landroid/app/Application;",                                 kind: "application",    tag: "APP", color: "#c08cff" },
+  { base: "Landroid/content/ContentProvider;",                         kind: "provider",       tag: "P",  color: "#46c98b" },
+  { base: "Landroid/content/BroadcastReceiver;",                       kind: "receiver",       tag: "R",  color: "#5db4ff" },
+  { base: "Landroid/app/Service;",                                     kind: "service",        tag: "S",  color: "#3fc6d8" },
+  { base: "Landroid/app/Activity;",                                    kind: "activity",       tag: "A",  color: "#6ba1ff" },
+];
+let componentIndex = new Map();  // classDescriptor -> the winning COMPONENT_BASES entry
+let componentGroups = new Map(); // kind -> [classDescriptor, …]
+let activeCompKinds = new Set(); // kinds currently shown (all, once detected)
 
 // ── multi-source state ──────────────────────────────────────────────────────
 // Track every source the current DexKit was built from so we can rebuild when
@@ -1312,6 +1349,41 @@ function computePerms(dkInst, appOnly = true) {
     }
   }
   permTotals = { perms: perms.size, apis: permIndex.length, callers: callersAll.size };
+}
+
+// Component candidates. findClassesBySuperclass only reports DIRECT subclasses,
+// so each base needs a BFS to its transitive closure — on a modern app that is
+// the difference between 6 and 16 activities, since everything sits behind
+// AppCompatActivity → FragmentActivity → ComponentActivity → Activity. The
+// whole sweep costs ~12ms, so it runs inline with the class list rather than in
+// the deferred pass; the sidebar badges need it before the first render.
+function computeComponents(dkInst) {
+  componentIndex = new Map();
+  componentGroups = new Map();
+  for (const entry of COMPONENT_BASES) {
+    const found = [];
+    const seen = new Set([entry.base]);
+    let frontier = [entry.base];
+    while (frontier.length) {
+      const next = [];
+      for (const cls of frontier) {
+        let subs;
+        try { subs = dkInst.findClassesBySuperclass(cls); } catch (_) { continue; }
+        for (let i = 0; i < subs.size(); i++) {
+          const s = subs.get(i);
+          if (seen.has(s)) continue;
+          seen.add(s); next.push(s);
+          // A more specific base already claimed it (bases are ordered
+          // specific-first), so don't double-list it under the generic one.
+          if (!componentIndex.has(s)) { componentIndex.set(s, entry); found.push(s); }
+        }
+        subs.delete();
+      }
+      frontier = next;
+    }
+    if (found.length) componentGroups.set(entry.kind, found.sort());
+  }
+  activeCompKinds = new Set(componentGroups.keys());
 }
 
 // Capability profile — the engine walks its bundled catalog and resolves each
@@ -1813,6 +1885,11 @@ async function processCurrentDk(label, loadMs, opts) {
     await new Promise(r => setTimeout(r, 0));   // let the "scanning…" status paint
     computeIocs(dk);
   } catch (e) { console.error("IOC extraction failed:", e); iocTotals = null; }
+  try { computeComponents(dk); }
+  catch (e) {
+    console.error("component detection failed:", e);
+    componentIndex = new Map(); componentGroups = new Map(); activeCompKinds = new Set();
+  }
 
   permIndex = []; permTotals = null; capReport = null; permPending = true;
 
@@ -1997,6 +2074,20 @@ function activateIsolatedTab(did) {
   iocIndex = iso.ioc.iocIndex;
   iocTotals = iso.ioc.iocTotals;
 
+  // Components stay eager (unlike perms) — the sidebar badges render with the
+  // class list, so deferring them would paint the tree twice.
+  if (!iso.comp) {
+    try { computeComponents(iso.dk); }
+    catch (e) {
+      console.error("component detection failed:", e);
+      componentIndex = new Map(); componentGroups = new Map(); activeCompKinds = new Set();
+    }
+    iso.comp = { componentIndex, componentGroups, activeCompKinds };
+  }
+  componentIndex = iso.comp.componentIndex;
+  componentGroups = iso.comp.componentGroups;
+  activeCompKinds = iso.comp.activeCompKinds;
+
   // Lazy perm — deferred so the UI paints before the L2 work starts. The
   // current-tab guard (closure over `key`) bails if the user switched away
   // mid-flight, so we don't clobber the panel with a stale result. Uses
@@ -2046,12 +2137,15 @@ function isolatedStatusHead(did) {
 // Save / restore the runtime-aggregate panel state across mode switches so
 // the heavy initial compute isn't redone every toggle.
 function snapshotPanels() {
-  return { classIoc, iocIndex, iocTotals, permIndex, permTotals, permPending, capReport, activeCapCats };
+  return { classIoc, iocIndex, iocTotals, permIndex, permTotals, permPending, capReport, activeCapCats,
+           componentIndex, componentGroups, activeCompKinds };
 }
 function restorePanels(s) {
   classIoc = s.classIoc; iocIndex = s.iocIndex; iocTotals = s.iocTotals;
   permIndex = s.permIndex; permTotals = s.permTotals; permPending = s.permPending;
   capReport = s.capReport; activeCapCats = s.activeCapCats;
+  componentIndex = s.componentIndex; componentGroups = s.componentGroups;
+  activeCompKinds = s.activeCompKinds;
 }
 
 // Switch between runtime and isolated modes. The heavy lifting:
@@ -2286,6 +2380,15 @@ function makeClassRow(c, depth) {
   div.style.paddingLeft = (8 + depth * 14 + 16) + "px";
   const name = document.createElement("span"); name.textContent = c.label;
   div.append(name); div.title = c.desc;
+  const comp = componentIndex.get(c.desc);
+  if (comp) {
+    const cb = document.createElement("span"); cb.className = "comp-badge";
+    cb.textContent = comp.tag;
+    cb.style.color = comp.color;
+    cb.style.borderColor = comp.color + "55";
+    cb.title = `${comp.kind} candidate — extends ${descToJava(comp.base)}`;
+    div.append(cb);
+  }
   const n = iocCountFor(c.desc);
   if (n > 0) {
     const b = document.createElement("span"); b.className = "ioc-badge";
@@ -2425,18 +2528,33 @@ function capClipboardText() {
   return lines.join("\n");
 }
 
+// Components panel → kind \t base \t class descriptor.
+function compClipboardText() {
+  if (!componentGroups.size) return "";
+  const total = [...componentGroups.values()].reduce((n, l) => n + l.length, 0);
+  const lines = [`# component candidates (${total}) — superclass chain only, AndroidManifest.xml NOT consulted`];
+  for (const entry of COMPONENT_BASES) {
+    const list = componentGroups.get(entry.kind);
+    if (!list) continue;
+    for (const desc of list) lines.push([entry.kind, entry.base, desc].join("\t"));
+  }
+  return lines.join("\n");
+}
+
 $("#copyCode")?.addEventListener("click", () => {
   if (currentClass && codeLineCache.length) copyText(codeLineCache.join("\n"), $("#copyCode"));
 });
 $("#copyIoc")?.addEventListener("click", () => copyText(iocClipboardText(), $("#copyIoc")));
-$("#copyPerm")?.addEventListener("click", () =>
-  copyText(permTab === "caps" ? capClipboardText() : permClipboardText(), $("#copyPerm")));
+$("#copyPerm")?.addEventListener("click", () => copyText(
+  permTab === "caps" ? capClipboardText()
+  : permTab === "comps" ? compClipboardText()
+  : permClipboardText(), $("#copyPerm")));
 
 for (const t of document.querySelectorAll("#permtabs .permtab")) {
   t.addEventListener("click", () => {
     if (permTab === t.dataset.tab) return;
     permTab = t.dataset.tab;
-    $("#permfilter").value = "";   // the two views index different text
+    $("#permfilter").value = "";   // the views index different text
     renderPermPanel();
   });
 }
@@ -2605,11 +2723,9 @@ function renderCapPanel(panel, body) {
   if (!capReport || !capReport.apiHits.length) {
     $("#permlevels").innerHTML = "";
     $("#permhd2").textContent = "capabilities";
-    // Nothing analyzed at all (no file yet) — hide the panel exactly as the
-    // permissions view does, rather than showing an empty frame. But keep it up
-    // whenever the OTHER view has content, or hiding it would take the tab bar
-    // with it and strand the user.
-    if (!capReport && !permPending && !permIndex.length) {
+    // Nothing analyzed at all (no file yet) — hide the panel rather than show an
+    // empty frame.
+    if (!permPanelHasContent()) {
       panel.classList.add("empty"); body.innerHTML = ""; return;
     }
     panel.classList.remove("empty");
@@ -2665,15 +2781,88 @@ function renderCapPanel(panel, body) {
   }
 }
 
+// Kind filter chips for the components view, in COMPONENT_BASES order so the
+// most specific (and most interesting) kinds lead.
+function renderCompKinds() {
+  const bar = $("#permlevels");
+  bar.innerHTML = "";
+  for (const entry of COMPONENT_BASES) {
+    const list = componentGroups.get(entry.kind);
+    if (!list || !list.length) continue;
+    const chip = document.createElement("span");
+    chip.className = "permlvlchip" + (activeCompKinds.has(entry.kind) ? " on" : "");
+    chip.title = `${entry.kind} — extends ${descToJava(entry.base)} · click to toggle`;
+    chip.innerHTML = `<span class="dot" style="background:${entry.color}"></span>${escAttr(entry.kind)} <span class="lc">${list.length}</span>`;
+    chip.onclick = () => {
+      if (activeCompKinds.has(entry.kind)) activeCompKinds.delete(entry.kind);
+      else activeCompKinds.add(entry.kind);
+      renderPermPanel();
+    };
+    bar.appendChild(chip);
+  }
+}
+
+// The three views share one panel frame, and `.sidepanel.empty{display:none}`
+// takes the tab bar down with it. So a view may only collapse the frame when NO
+// view has anything — otherwise an empty permissions list would make the
+// capabilities and components tabs unreachable.
+function permPanelHasContent() {
+  return permPending || permIndex.length > 0 || componentGroups.size > 0 ||
+         !!(capReport && capReport.apiHits.length);
+}
+
+// component candidates — grouped by kind, each row navigating to the class.
+function renderCompPanel(panel, body) {
+  $("#permhd2").textContent = "components";
+  if (!componentGroups.size) {
+    $("#permlevels").innerHTML = "";
+    if (!permPanelHasContent()) {
+      panel.classList.add("empty"); body.innerHTML = ""; return;
+    }
+    panel.classList.remove("empty");
+    body.innerHTML = '<div class="permsec" style="color:var(--muted)">no class extends an Android component base</div>';
+    return;
+  }
+  panel.classList.remove("empty");
+  renderCompKinds();
+  const filt = ($("#permfilter").value || "").toLowerCase().trim();
+  body.innerHTML = "";
+  let shown = 0;
+  for (const entry of COMPONENT_BASES) {
+    if (!activeCompKinds.has(entry.kind)) continue;
+    const all = componentGroups.get(entry.kind);
+    if (!all) continue;
+    const list = filt ? all.filter(d => d.toLowerCase().includes(filt)) : all;
+    if (!list.length) continue;
+    shown += list.length;
+    const hd = document.createElement("div"); hd.className = "permlvlhd";
+    hd.style.color = entry.color;
+    hd.innerHTML = `<span class="dot" style="background:${entry.color}"></span>${escAttr(entry.kind)} · ${list.length} class${list.length === 1 ? "" : "es"}`;
+    hd.title = `extends ${descToJava(entry.base)}`;
+    body.appendChild(hd);
+    for (const desc of list) {
+      const nav = makeNavRow(descToJava(desc), "perm", [{ display: desc, cls: desc }], "classes");
+      body.appendChild(nav);
+      const row = nav.querySelector(".iocitem");
+      if (row) row.title = `${desc}\n${entry.kind} candidate — extends ${descToJava(entry.base)}`;
+    }
+  }
+  const total = [...componentGroups.values()].reduce((n, l) => n + l.length, 0);
+  $("#permhd2").innerHTML = `components <span class="ipcount" title="candidate classes shown of ${total} found · declaration in AndroidManifest.xml is NOT verified">${shown}</span>`;
+  if (!shown) { const d = document.createElement("div"); d.className = "permsec"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); }
+}
+
 // permission callers — separate panel, grouped by protection level then permission
 function renderPermPanel() {
   const panel = $("#permpanel"), body = $("#permpanelbody");
   for (const t of document.querySelectorAll("#permtabs .permtab")) {
     t.classList.toggle("on", t.dataset.tab === permTab);
   }
-  $("#permfilter").placeholder = permTab === "caps"
-    ? "filter capabilities / callers…" : "filter APIs / callers…";
+  $("#permfilter").placeholder = permTab === "caps" ? "filter capabilities / callers…"
+    : permTab === "comps" ? "filter component classes…"
+    : "filter APIs / callers…";
   if (permTab === "caps") return renderCapPanel(panel, body);
+  if (permTab === "comps") return renderCompPanel(panel, body);
   if (!permIndex.length) {
     $("#permlevels").innerHTML = "";
     if (permPending) {                       // analysis still running — show progress
@@ -2682,16 +2871,15 @@ function renderPermPanel() {
       body.innerHTML = '<div class="permsec" style="color:var(--muted)">analyzing callers…</div>';
       return;
     }
-    // An APK can exercise zero permission-gated APIs yet still have capability
-    // hits (REFLECTION, STORAGE, … are un-gated). Hiding the panel would hide
-    // the tab bar with it and make that profile unreachable, so stay visible.
-    if (capReport && capReport.apiHits.length) {
-      panel.classList.remove("empty");
-      $("#permhd2").textContent = "permissions";
-      body.innerHTML = '<div class="permsec" style="color:var(--muted)">no permission-gated API calls — see <b>capabilities</b></div>';
-      return;
-    }
-    panel.classList.add("empty"); body.innerHTML = ""; return;
+    if (!permPanelHasContent()) { panel.classList.add("empty"); body.innerHTML = ""; return; }
+    // An APK can exercise zero permission-gated APIs and still have capability
+    // hits (REFLECTION, STORAGE, … are un-gated) or component candidates, so
+    // stay visible and point at the tab that does have rows.
+    panel.classList.remove("empty");
+    $("#permhd2").textContent = "permissions";
+    const other = (capReport && capReport.apiHits.length) ? "capabilities" : "components";
+    body.innerHTML = `<div class="permsec" style="color:var(--muted)">no permission-gated API calls — see <b>${other}</b></div>`;
+    return;
   }
   panel.classList.remove("empty");
   renderPermLevels();
