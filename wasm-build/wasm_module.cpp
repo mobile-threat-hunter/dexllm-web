@@ -35,6 +35,7 @@
 #include "dexkit_ext.h"
 #include "dex_item.h"      // for GetReader, GetStrings, GetImage
 #include "slicer/reader.h" // dex::ClassDef, dataPtr, ClassDefs
+#include "web_analysis.h"  // vendor/: IoC / provider / capability (ex-analysis.h)
 
 using emscripten::class_;
 using emscripten::function;

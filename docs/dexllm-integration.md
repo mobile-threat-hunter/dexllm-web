@@ -39,8 +39,8 @@ so a redeploy never serves a stale wasm against a fresh glue file
 ([`index.html:851`](../index.html#L851)):
 
 ```html
-<script>window.__DEXLLM_BUILD = "c3ec1a1";</script>
-<script src="dexllm.js?v=c3ec1a1"></script>
+<script>window.__DEXLLM_BUILD = "3ca7d90";</script>
+<script src="dexllm.js?v=3ca7d90"></script>
 ```
 
 The main thread instantiates the module with a `locateFile` hook so the wasm
@@ -262,7 +262,7 @@ out of bounds" if the exception was already freed.
 | [`index.html`](../index.html) | The entire app: UI, main-thread engine instance, xref, panels, rendering (~4.6k lines). |
 | [`worker.js`](../worker.js) | Background decompile worker + multi-source DexKit mirror. |
 | [`dexllm.js`](../dexllm.js) / [`dexllm.wasm`](../dexllm.wasm) | The Emscripten-compiled dexllm engine + glue. The AOSP datasets (perm→API table, protection levels, public-suffix list, `content://` URIs) are **bundled inside the wasm** and exposed via `permissionCallers()` / `extractIocs()` — the web app no longer ships or joins them (dex-analyzer-for-llm#13). |
-| [`wasm-build/`](../wasm-build/) | The embind project (`wasm_module.cpp` + `CMakeLists.txt`) that builds `dexllm.js`/`.wasm` against a dexllm checkout. |
+| [`wasm-build/`](../wasm-build/) | The embind project (`wasm_module.cpp` + `CMakeLists.txt`) that builds `dexllm.js`/`.wasm` against a dexllm checkout. [`wasm-build/vendor/`](../wasm-build/vendor/) holds the IoC / content-provider / capability engine, which dexllm dropped from its core in `4b085d8` as web-only — see its README. `permissionCallers()` still comes from dexllm itself. |
 | [`cmd/dexllm-web/`](../cmd/dexllm-web/) | Go launcher that serves the bundle over `127.0.0.1` for offline / Windows use. |
 | [`dist/dexllm-web.exe`](../dist/) | Prebuilt Windows launcher. |
 | [`docs/`](.) | This doc plus `xref.md` and `d3-pc-line-map.md`. |

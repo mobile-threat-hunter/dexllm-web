@@ -51,8 +51,6 @@ add_library(dexkit_ext STATIC
     "${DEXLLM_ROOT}/native/core_ext/dexitem_code_source.cpp"
     "${DEXLLM_ROOT}/native/core_ext/dex_verifier.cpp"
     "${DEXLLM_ROOT}/native/core_ext/analysis.cpp"
-    "${DEXLLM_ROOT}/native/core_ext/public_suffix.cpp"
-    "${DEXLLM_ROOT}/native/core_ext/ioc.cpp"
 )
 target_include_directories(dexkit_ext PUBLIC
     "${DEXLLM_ROOT}/native/core_ext/include"
@@ -60,6 +58,22 @@ target_include_directories(dexkit_ext PUBLIC
 )
 target_link_libraries(dexkit_ext PUBLIC dexkit_static)
 target_compile_options(dexkit_ext PRIVATE -fexceptions)
+
+# web_engine — the IoC / content-provider / capability ports, vendored from
+# dexllm c3ec1a1 (see vendor/include/web_analysis.h). dexllm 4b085d8 dropped
+# these from its core because only this web build consumed them, so they live
+# here now. Kept a SEPARATE target so dexkit_ext above stays a faithful mirror
+# of dexllm's own source list.
+add_library(web_engine STATIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/ioc.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/public_suffix.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/web_analysis.cpp"
+)
+target_include_directories(web_engine PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/include"
+)
+target_link_libraries(web_engine PUBLIC dexkit_ext)
+target_compile_options(web_engine PRIVATE -fexceptions)
 
 # dexkit_dad — same source list as DEXLLM_ROOT/CMakeLists.txt
 add_library(dexkit_dad STATIC
@@ -80,7 +94,6 @@ add_library(dexkit_dad STATIC
     "${DEXLLM_ROOT}/native/dad_cpp/mock_code_source.cpp"
     "${DEXLLM_ROOT}/native/dad_cpp/instruction_dispatch.cpp"
     "${DEXLLM_ROOT}/native/dad_cpp/instruction_accept.cpp"
-    "${DEXLLM_ROOT}/native/dad_cpp/ssa.cpp"
 )
 target_include_directories(dexkit_dad PUBLIC
     "${DEXLLM_ROOT}/native/dad_cpp/include"
@@ -90,7 +103,7 @@ target_compile_options(dexkit_dad PRIVATE -fexceptions)
 
 # Embind binding (this file).
 add_executable(dexllm wasm_module.cpp)
-target_link_libraries(dexllm PRIVATE dexkit_ext dexkit_dad)
+target_link_libraries(dexllm PRIVATE dexkit_ext dexkit_dad web_engine)
 
 # Single-threaded, ES module, modularised, growable memory, zlib for apk
 # central-directory deflate, exceptions for the slicer's SLICER_CHECK throws.
