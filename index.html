@@ -516,6 +516,19 @@
   .permlevels {
     display:flex; flex-wrap:wrap; gap:6px; padding:8px 12px 2px;
   }
+  .permtabs { display:flex; gap:2px; padding:6px 12px 0; }
+  .permtab {
+    cursor:pointer; user-select:none; padding:4px 10px 5px;
+    font:600 10px/1.4 var(--f-ui); letter-spacing:.07em; text-transform:uppercase;
+    color:var(--fg-3); border-radius:5px 5px 0 0;
+    box-shadow:inset 0 -1px 0 var(--line-1);
+    transition:color 160ms var(--e-out), background 160ms var(--e-out), box-shadow 160ms var(--e-out);
+  }
+  .permtab:hover { color:var(--fg-2); background:rgba(255,255,255,0.025); }
+  .permtab.on {
+    color:var(--fg); background:var(--bg-3);
+    box-shadow:inset 0 -2px 0 var(--brand);
+  }
   .permlvlchip {
     display:inline-flex; align-items:center; gap:5px; cursor:pointer;
     padding:3px 9px; border-radius:999px; user-select:none;
@@ -920,7 +933,15 @@
     </div>
     <div id="panelSplit" title="Drag to resize the two panels"></div>
     <div id="permpanel" class="sidepanel empty">
-      <div class="iocphd"><span id="permhd2">permissions</span><span class="copybtn" id="copyPerm" title="Copy all permission callers as text">⧉ copy</span></div>
+      <div class="iocphd"><span id="permhd2">permissions</span><span class="copybtn" id="copyPerm" title="Copy the active tab as text">⧉ copy</span></div>
+      <!-- Two views over the same panel body. permissions = the permission→API→
+           caller join; capabilities = the engine's behavioural catalog, which
+           also covers un-gated signals (REFLECTION, DYNAMIC, STORAGE, …) that
+           have no permission and so never appear in the permissions view. -->
+      <div id="permtabs" class="permtabs">
+        <span class="permtab on" data-tab="perms" title="Permissions exercised through real gated-API call sites">permissions</span>
+        <span class="permtab" data-tab="caps" title="Behavioural capability profile from the engine's bundled API catalog">capabilities</span>
+      </div>
       <div id="permlevels" class="permlevels"></div>
       <input id="permfilter" class="pfilter" placeholder="filter APIs / callers…" autocomplete="off">
       <div id="permpanelbody" class="pbody"></div>
@@ -964,6 +985,15 @@ const levelBucket = lvl =>
 // permission, not just the dangerous slice); the checkboxes narrow the view
 // WITHOUT recomputing — computePerms always maps every level once.
 let activePermLevels = new Set(PERM_LEVELS.map(l => l.key));
+
+// ── capability profile (WasmDexKit.summarizeCapabilities) ───────────────────
+// Second view of the permissions panel. Distinct from permIndex: the catalog
+// tags each API with behavioural CATEGORIES, and most of them carry no
+// permission at all (REFLECTION, DYNAMIC, STORAGE, PACKAGE_INFO…), so these
+// rows can never surface in the permission→API→caller join.
+let capReport = null;            // the engine's report, or null when unmapped
+let activeCapCats = new Set();   // categories currently shown (all, once mapped)
+let permTab = "perms";           // "perms" | "caps" — which view the panel shows
 
 // ── multi-source state ──────────────────────────────────────────────────────
 // Track every source the current DexKit was built from so we can rebuild when
@@ -1282,6 +1312,33 @@ function computePerms(dkInst, appOnly = true) {
     }
   }
   permTotals = { perms: perms.size, apis: permIndex.length, callers: callersAll.size };
+}
+
+// Capability profile — the engine walks its bundled catalog and resolves each
+// API's call sites itself, so this is a single call. Measured at 2–4ms even on
+// an 11MB APK (vs ~40ms for permissionCallers), hence it rides along in the
+// same deferred pass rather than getting its own.
+function computeCaps(dkInst) {
+  const r = dkInst.summarizeCapabilities();
+  // Normalise to plain JS up front: the embind val crosses into snapshotPanels
+  // and the isolated-tab cache, both of which outlive the call, and apiHits
+  // entries are re-sorted below.
+  capReport = {
+    categories: { ...r.categories },
+    permissions: { ...r.permissions },
+    catalogVersion: r.catalogVersion,
+    catalogSize: r.catalogSize,
+    matchedApis: r.matchedApis,
+    totalCallSites: r.totalCallSites,
+    apiHits: Array.from(r.apiHits, h => ({
+      apiSignature: h.apiSignature,
+      permissions: Array.from(h.permissions),
+      categories: Array.from(h.categories),
+      callSiteCount: h.callSiteCount,
+      callers: Array.from(h.callers),
+    })),
+  };
+  activeCapCats = new Set(Object.keys(capReport.categories));
 }
 
 createDexllm({ locateFile: (f) => f + "?v=" + window.__DEXLLM_BUILD }).then(m => {
@@ -1757,7 +1814,7 @@ async function processCurrentDk(label, loadMs, opts) {
     computeIocs(dk);
   } catch (e) { console.error("IOC extraction failed:", e); iocTotals = null; }
 
-  permIndex = []; permTotals = null; permPending = true;
+  permIndex = []; permTotals = null; capReport = null; permPending = true;
 
   const dumpPill = dumpedSources.length
     ? ` · <span class="pill bad" title="runtime-dumped dexes loaded with priority over the original APK">${dumpedSources.length} dump${dumpedSources.length === 1 ? "" : "s"}</span>`
@@ -1948,14 +2005,18 @@ function activateIsolatedTab(did) {
   if (iso.perm) {
     permIndex = iso.perm.permIndex;
     permTotals = iso.perm.permTotals;
+    capReport = iso.perm.capReport;
+    activeCapCats = iso.perm.activeCapCats;
     permPending = false;
   } else {
-    permIndex = []; permTotals = null; permPending = true;
+    permIndex = []; permTotals = null; capReport = null; permPending = true;
     renderPermPanel();
     setTimeout(async () => {
       if (viewMode !== "isolated" || selectedDex !== key) return;
       computePerms(iso.dk, true);
-      iso.perm = { permIndex, permTotals };
+      try { computeCaps(iso.dk); }
+      catch (e) { console.error("capability mapping failed:", e); capReport = null; }
+      iso.perm = { permIndex, permTotals, capReport, activeCapCats };
       iso.permLoaded = true;
       permPending = false;
       renderPermPanel();
@@ -1985,11 +2046,12 @@ function isolatedStatusHead(did) {
 // Save / restore the runtime-aggregate panel state across mode switches so
 // the heavy initial compute isn't redone every toggle.
 function snapshotPanels() {
-  return { classIoc, iocIndex, iocTotals, permIndex, permTotals, permPending };
+  return { classIoc, iocIndex, iocTotals, permIndex, permTotals, permPending, capReport, activeCapCats };
 }
 function restorePanels(s) {
   classIoc = s.classIoc; iocIndex = s.iocIndex; iocTotals = s.iocTotals;
   permIndex = s.permIndex; permTotals = s.permTotals; permPending = s.permPending;
+  capReport = s.capReport; activeCapCats = s.activeCapCats;
 }
 
 // Switch between runtime and isolated modes. The heavy lifting:
@@ -2130,12 +2192,14 @@ function statusPills() {
 // Deferred permission caller mapping (the expensive L2 step). Maps EVERY
 // protection level in one pass; the header checkboxes filter the view only.
 async function analyzePerms(statusHead) {
-  permIndex = []; permTotals = null; permPending = true;
+  permIndex = []; permTotals = null; capReport = null; permPending = true;
   renderPermPanel();
   try {
     await new Promise(r => setTimeout(r, 0));
     computePerms(dk);
   } catch (e) { console.error("permission mapping failed:", e); permTotals = null; }
+  try { computeCaps(dk); }
+  catch (e) { console.error("capability mapping failed:", e); capReport = null; }
   permPending = false;
   renderPermPanel();
   statusEl.innerHTML = statusHead + statusPills();
@@ -2343,11 +2407,39 @@ function permClipboardText() {
   return lines.join("\n");
 }
 
+// Capabilities panel → category \t api \t sites \t permissions \t callers.
+// Flat and un-filtered (mirrors permClipboardText, which also dumps everything
+// rather than the current view).
+function capClipboardText() {
+  if (!capReport || !capReport.apiHits.length) return "";
+  const lines = [
+    `# capabilities — catalog ${capReport.catalogVersion}, ${capReport.matchedApis}/${capReport.catalogSize} APIs matched, ${capReport.totalCallSites} call sites`,
+  ];
+  for (const [cat, n] of Object.entries(capReport.categories).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))) {
+    lines.push(`# ${cat}\t${n} invocations`);
+  }
+  for (const h of capReport.apiHits) {
+    lines.push([h.categories.join(","), h.apiSignature, h.callSiteCount,
+                h.permissions.join(","), h.callers.join("; ")].join("\t"));
+  }
+  return lines.join("\n");
+}
+
 $("#copyCode")?.addEventListener("click", () => {
   if (currentClass && codeLineCache.length) copyText(codeLineCache.join("\n"), $("#copyCode"));
 });
 $("#copyIoc")?.addEventListener("click", () => copyText(iocClipboardText(), $("#copyIoc")));
-$("#copyPerm")?.addEventListener("click", () => copyText(permClipboardText(), $("#copyPerm")));
+$("#copyPerm")?.addEventListener("click", () =>
+  copyText(permTab === "caps" ? capClipboardText() : permClipboardText(), $("#copyPerm")));
+
+for (const t of document.querySelectorAll("#permtabs .permtab")) {
+  t.addEventListener("click", () => {
+    if (permTab === t.dataset.tab) return;
+    permTab = t.dataset.tab;
+    $("#permfilter").value = "";   // the two views index different text
+    renderPermPanel();
+  });
+}
 
 // ---- lightweight Java syntax highlighter (dependency-free) ----
 const KW_PRIM = new Set("boolean byte char double float int long short void var".split(" "));
@@ -2483,15 +2575,120 @@ function renderPermLevels() {
   }
 }
 
+// Category filter chips for the capabilities view. Unlike protection levels
+// there's no fixed severity list — categories are whatever the catalog tagged,
+// so they're ordered by invocation count (loudest behaviour first).
+function renderCapCats() {
+  const bar = $("#permlevels");
+  bar.innerHTML = "";
+  const cats = Object.entries(capReport.categories)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  for (const [cat, n] of cats) {
+    const chip = document.createElement("span");
+    chip.className = "permlvlchip" + (activeCapCats.has(cat) ? " on" : "");
+    chip.title = `${cat} — ${n} invocation${n === 1 ? "" : "s"} · click to toggle`;
+    chip.innerHTML = `<span class="dot" style="background:var(--brand)"></span>${escAttr(capLabel(cat))} <span class="lc">${n}</span>`;
+    chip.onclick = () => {
+      if (activeCapCats.has(cat)) activeCapCats.delete(cat); else activeCapCats.add(cat);
+      renderPermPanel();
+    };
+    bar.appendChild(chip);
+  }
+}
+
+const capLabel = cat => cat.toLowerCase().replace(/_/g, " ");
+
+// capability profile — grouped by category, then the catalog APIs under it. An
+// API tagged with several categories appears under each; that duplication is
+// the catalog's own view of the API, not a bug.
+function renderCapPanel(panel, body) {
+  if (!capReport || !capReport.apiHits.length) {
+    $("#permlevels").innerHTML = "";
+    $("#permhd2").textContent = "capabilities";
+    // Nothing analyzed at all (no file yet) — hide the panel exactly as the
+    // permissions view does, rather than showing an empty frame. But keep it up
+    // whenever the OTHER view has content, or hiding it would take the tab bar
+    // with it and strand the user.
+    if (!capReport && !permPending && !permIndex.length) {
+      panel.classList.add("empty"); body.innerHTML = ""; return;
+    }
+    panel.classList.remove("empty");
+    const why = permPending ? "analyzing capabilities…"
+      : !capReport ? "capability profile unavailable"
+      : `no catalog API matched (catalog ${capReport.catalogVersion}, ${capReport.catalogSize} APIs)`;
+    body.innerHTML = `<div class="permsec" style="color:var(--muted)">${escAttr(why)}</div>`;
+    return;
+  }
+  panel.classList.remove("empty");
+  renderCapCats();
+  const filt = ($("#permfilter").value || "").toLowerCase().trim();
+  body.innerHTML = "";
+  const byCat = new Map();
+  let shown = 0;
+  for (const h of capReport.apiHits) {
+    const hay = (h.apiSignature + " " + h.permissions.join(" ")).toLowerCase();
+    if (filt && !hay.includes(filt) && !h.callers.some(c => c.toLowerCase().includes(filt))) continue;
+    let any = false;
+    for (const cat of h.categories) {
+      if (!activeCapCats.has(cat)) continue;
+      if (!byCat.has(cat)) byCat.set(cat, []);
+      byCat.get(cat).push(h);
+      any = true;
+    }
+    if (any) shown++;
+  }
+  $("#permhd2").innerHTML = `capabilities <span class="ipcount" title="catalog APIs shown · ${capReport.matchedApis} of ${capReport.catalogSize} matched (catalog ${capReport.catalogVersion}) · ${capReport.totalCallSites} call sites">${shown}</span>`;
+  if (!byCat.size) { const d = document.createElement("div"); d.className = "permsec"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); return; }
+  const cats = [...byCat.keys()].sort((a, b) =>
+    (capReport.categories[b] || 0) - (capReport.categories[a] || 0) || a.localeCompare(b));
+  for (const cat of cats) {
+    const hits = byCat.get(cat);
+    const sites = hits.reduce((n, h) => n + h.callSiteCount, 0);
+    const ch = document.createElement("div"); ch.className = "permlvlhd";
+    ch.style.color = "var(--brand)";
+    ch.innerHTML = `<span class="dot" style="background:var(--brand)"></span>${escAttr(capLabel(cat))} · ${hits.length} api${hits.length === 1 ? "" : "s"} · ${sites} site${sites === 1 ? "" : "s"}`;
+    body.appendChild(ch);
+    for (const h of hits) {
+      // apiSignature is a Dalvik descriptor (Lcls;->name(proto)Ret), unlike the
+      // permissions view's dotted "cls#name(Types)" rows.
+      const name = methodNameOf(h.apiSignature);
+      const label = simpleName(descToJava(classOfMethod(h.apiSignature))) + "#" + name;
+      const nav = makeNavRow(label, "perm", h.callers.slice().sort().map(c => ({
+        display: c, cls: classOfMethod(c),
+        hint: { needle: name, scope: methodNameOf(c) },
+      })), "callers");
+      body.appendChild(nav);
+      const row = nav.querySelector(".iocitem");
+      if (row) row.title = `${h.apiSignature}\n${h.callSiteCount} call site${h.callSiteCount === 1 ? "" : "s"}` +
+        (h.permissions.length ? `\nrequires: ${h.permissions.join(", ")}` : "\nno permission required");
+    }
+  }
+}
+
 // permission callers — separate panel, grouped by protection level then permission
 function renderPermPanel() {
   const panel = $("#permpanel"), body = $("#permpanelbody");
+  for (const t of document.querySelectorAll("#permtabs .permtab")) {
+    t.classList.toggle("on", t.dataset.tab === permTab);
+  }
+  $("#permfilter").placeholder = permTab === "caps"
+    ? "filter capabilities / callers…" : "filter APIs / callers…";
+  if (permTab === "caps") return renderCapPanel(panel, body);
   if (!permIndex.length) {
     $("#permlevels").innerHTML = "";
     if (permPending) {                       // analysis still running — show progress
       panel.classList.remove("empty");
       $("#permhd2").textContent = "permissions";
       body.innerHTML = '<div class="permsec" style="color:var(--muted)">analyzing callers…</div>';
+      return;
+    }
+    // An APK can exercise zero permission-gated APIs yet still have capability
+    // hits (REFLECTION, STORAGE, … are un-gated). Hiding the panel would hide
+    // the tab bar with it and make that profile unreachable, so stay visible.
+    if (capReport && capReport.apiHits.length) {
+      panel.classList.remove("empty");
+      $("#permhd2").textContent = "permissions";
+      body.innerHTML = '<div class="permsec" style="color:var(--muted)">no permission-gated API calls — see <b>capabilities</b></div>';
       return;
     }
     panel.classList.add("empty"); body.innerHTML = ""; return;

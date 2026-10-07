@@ -201,6 +201,7 @@ actually invoked across [`index.html`](../index.html) and
 | Method | Used for |
 |---|---|
 | `findCallSitesToApi(desc)` / `findCallSitesWithOffset(...)` | Caller popups for a method / API. |
+| `findCallSitesFromMethod(desc)` | The FORWARD direction — every invoke inside a method as `{callee, offset, opcode}`. Joined to `decompileMethodJavaWithPc`'s pcMap to break callee ties the receiver text can't. |
 | `findMethodsByName` / `findMethodsUsingString` | Method search & string→method links. |
 | `findFieldGetMethods` / `findFieldPutMethods` | Field **READ BY / WRITTEN BY** popups. |
 | `findClassesByName` / `findClassesBySuperclass` / `findClassesImplementing` | Class search & hierarchy navigation. |
@@ -236,6 +237,7 @@ The user-facing features and the dexllm calls behind each:
 | **↔ smali** toggle & line-sync | `renderMethodSmali`, `decompileMethodJavaWithPc` |
 | Click-to-navigate xref (callers, callees, field get/set, type hierarchy) | the `find*` / `xref*` family in §5 (see [`xref.md`](xref.md)) |
 | **Indicators** panel (network IOCs + content providers) | `WasmDexKit.extractIocs()` — one engine call returns `{network:[{value,category,classes[]}], providers:[{uri,family,classes[]}]}`, with the public-suffix list + content-URI dataset **bundled in the engine**. Each row navigates to the caller. |
+| **Capabilities** tab (same panel as permissions) | `WasmDexKit.summarizeCapabilities()` — one call returns the behavioural profile over the engine's **bundled** API catalog: `{categories, permissions, apiHits:[{apiSignature, permissions[], categories[], callSiteCount, callers[]}], byCaller, catalogVersion, catalogSize, matchedApis, totalCallSites}`. Covers un-gated behaviour (REFLECTION, DYNAMIC, STORAGE…) that the permissions view structurally cannot show. |
 | **Permissions** panel (all protection levels) | `WasmDexKit.permissionCallers(appOnly)` — the engine does the whole permission→API→callers join over its **bundled** perm→API table + protection levels, returning `[{perm, protectionLevel, rows:[{api, descriptors[], callers[]}]}]`. The panel groups/filters by dangerous / signature / normal / internal. |
 | Strings tab | `listValueStrings`, `xrefStringsToClasses` |
 | Runtime / Isolated dex modes | multi-source `WasmDexKit` aggregation vs per-dex isolation |
@@ -261,7 +263,7 @@ out of bounds" if the exception was already freed.
 |---|---|
 | [`index.html`](../index.html) | The entire app: UI, main-thread engine instance, xref, panels, rendering (~4.6k lines). |
 | [`worker.js`](../worker.js) | Background decompile worker + multi-source DexKit mirror. |
-| [`dexllm.js`](../dexllm.js) / [`dexllm.wasm`](../dexllm.wasm) | The Emscripten-compiled dexllm engine + glue. The AOSP datasets (perm→API table, protection levels, public-suffix list, `content://` URIs) are **bundled inside the wasm** and exposed via `permissionCallers()` / `extractIocs()` — the web app no longer ships or joins them (dex-analyzer-for-llm#13). |
+| [`dexllm.js`](../dexllm.js) / [`dexllm.wasm`](../dexllm.wasm) | The Emscripten-compiled dexllm engine + glue. The AOSP datasets (perm→API table, protection levels, public-suffix list, `content://` URIs) are **bundled inside the wasm** and exposed via `permissionCallers()` / `extractIocs()` / `summarizeCapabilities()` — the web app no longer ships or joins them (dex-analyzer-for-llm#13). |
 | [`wasm-build/`](../wasm-build/) | The embind project (`wasm_module.cpp` + `CMakeLists.txt`) that builds `dexllm.js`/`.wasm` against a dexllm checkout. [`wasm-build/vendor/`](../wasm-build/vendor/) holds the IoC / content-provider / capability engine, which dexllm dropped from its core in `4b085d8` as web-only — see its README. `permissionCallers()` still comes from dexllm itself. |
 | [`cmd/dexllm-web/`](../cmd/dexllm-web/) | Go launcher that serves the bundle over `127.0.0.1` for offline / Windows use. |
 | [`dist/dexllm-web.exe`](../dist/) | Prebuilt Windows launcher. |
