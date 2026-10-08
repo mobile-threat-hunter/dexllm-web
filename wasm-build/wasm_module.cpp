@@ -108,8 +108,16 @@ void WasmScanEncodedValueStrings(const uint8_t*& p, const uint8_t* end,
 
 class WasmDexKit {
 public:
+    // lenient=true — the web app is pointed at packed and obfuscated samples far
+    // more often than at clean builds, and strict VerifyInsns rejects the whole
+    // dex over bytecode a real device would happily run, leaving the analyst with
+    // nothing to look at. ART-structural-equivalent mode is the honest bar: if
+    // the device would load it, so do we. The reader paths are already written
+    // for unverified input (the bounds guards in dex_item.cpp and dataflow.cpp
+    // exist precisely for this), so garbage method bodies degrade that method
+    // rather than the load. Rejections still surface per-dex in verifyReport().
     explicit WasmDexKit(const std::string& path)
-        : ext_(path, /*lenient=*/false),
+        : ext_(path, /*lenient=*/true),
           decompiler_(std::make_unique<dexkit::dad::Decompiler>(
               ext_.GetCodeSource())) {}
 

@@ -958,13 +958,15 @@
   </div>
 </main>
 
-<!-- Cache-bust both dexllm.js and dexllm.wasm by the dexllm commit SHA. Keeping
-     the JS+WASM pair consistent matters because a returning visitor whose
-     browser has the old dexllm.js cached but pulls the new dexllm.wasm gets
-     an ABI mismatch and "engine load failed". Bump this when the WASM is
-     rebuilt — it MUST match the version pill above. -->
-<script>window.__DEXLLM_BUILD = "3ca7d90";</script>
-<script src="dexllm.js?v=3ca7d90"></script>
+<!-- Cache-bust both dexllm.js and dexllm.wasm. Keeping the JS+WASM pair
+     consistent matters because a returning visitor whose browser has the old
+     dexllm.js cached but pulls the new dexllm.wasm gets an ABI mismatch and
+     "engine load failed". Bump on EVERY wasm rebuild — which is not the same as
+     every dexllm bump, since wasm_module.cpp can change on its own. The base is
+     the dexllm commit (matching the version pill above) and `-N` counts rebuilds
+     against that same commit; -2 is the lenient single-path load. -->
+<script>window.__DEXLLM_BUILD = "3ca7d90-2";</script>
+<script src="dexllm.js?v=3ca7d90-2"></script>
 <script>
 let Module = null, dk = null, allClasses = [], selectedEl = null;
 // classDescriptor -> { urls:Set, ips:Set, domains:Set, emails:Set, onion:Set }
@@ -1643,8 +1645,9 @@ async function loadFile(file) {
 // Build a fresh multi-source DexKit over [dumps..., original]. dumps go FIRST
 // so first-wins resolution makes their classes win a collision (mirrors ART
 // after a packer unpack — `add_dumped_dexes(prefer=True)` in dexllm proper).
-// lenient=true so a partially-decrypted dump still loads under ART-structural-
-// equivalent verification. The worker mirrors this on its own thread.
+// Both branches verify leniently (ART-structural-equivalent, VerifyInsns off):
+// the multi-source ctor is told so explicitly, the single-path one defaults that
+// way in wasm_module.cpp. The worker mirrors this on its own thread.
 function rebuildDk() {
   if (dk) { try { dk.delete(); } catch (_) {} dk = null; }
   if (!dumpedSources.length) {
@@ -1687,8 +1690,9 @@ async function addDumpedDex(file) {
 
   // Probe the dump as a isolated DexKit just to capture its slot count
   // (attempted dexes), then dispose — the worker will keep its own isolated
-  // for per-dex decompile routing. lenient is implicit; partial decrypts will
-  // be lenient-loaded on the multi-source rebuild below.
+  // for per-dex decompile routing. Lenient like every other load here, which
+  // matters most for this path: a dump is the likeliest thing to be a partial
+  // decrypt, and a strict probe would reject it before the rebuild ever ran.
   const t0 = performance.now();
   let slotCount;
   try {
@@ -1840,9 +1844,13 @@ async function processCurrentDk(label, loadMs, opts) {
   const rep = dk.verifyReport();
   let nbad = 0; const n = rep.length;
   for (let i = 0; i < n; i++) if (!rep[i].valid) nbad++;
+  // Loads are lenient, so "verified" is the ART-structural bar (VerifyInsns
+  // off) — say so in the tooltip rather than implying a full verify.
+  const vtitle = "ART-structural-equivalent verification (VerifyInsns off), " +
+                 "so malformed method bodies fail per-method rather than rejecting the dex";
   const vpill = nbad === 0
-    ? `<span class="pill ok">verified ✓</span>`
-    : `<span class="pill bad">${nbad}/${n} dex rejected</span>`;
+    ? `<span class="pill ok" title="${vtitle}">verified ✓</span>`
+    : `<span class="pill bad" title="${vtitle}">${nbad}/${n} dex rejected</span>`;
 
   // Per-dex class listing — listClassesInDex returns ALL classes declared in
   // each specific dex, NOT first-wins-deduped. So a class declared in both a

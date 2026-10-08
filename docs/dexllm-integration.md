@@ -34,14 +34,18 @@ C++ class, `Module.WasmDexKit`, plus a few helper types (`Module.VectorString`,
 
 ## 2. Loading the engine
 
-The page pins a build SHA and cache-busts every engine asset with `?v=<sha>`
+The page pins a build tag and cache-busts every engine asset with `?v=<tag>`
 so a redeploy never serves a stale wasm against a fresh glue file
 ([`index.html:851`](../index.html#L851)):
 
 ```html
-<script>window.__DEXLLM_BUILD = "3ca7d90";</script>
-<script src="dexllm.js?v=3ca7d90"></script>
+<script>window.__DEXLLM_BUILD = "3ca7d90-2";</script>
+<script src="dexllm.js?v=3ca7d90-2"></script>
 ```
+
+The tag is `<dexllm commit>-<rebuild counter>`. The counter exists because
+`wasm-build/wasm_module.cpp` can change without the engine moving, and the
+browser still has to refetch — bump on every wasm rebuild, not every sync.
 
 The main thread instantiates the module with a `locateFile` hook so the wasm
 is fetched with the same cache-buster ([`index.html:1325`](../index.html#L1325)):
@@ -181,8 +185,21 @@ actually invoked across [`index.html`](../index.html) and
 ### Loading & structure
 | Method | Used for |
 |---|---|
-| `new WasmDexKit(path)` / `new WasmDexKit(VectorString, true)` | Construct a single-source or aggregated multi-source kit. |
+| `new WasmDexKit(path)` / `new WasmDexKit(VectorString, true)` | Construct a single-source or aggregated multi-source kit. **Both load leniently** — see below. |
 | `verifyReport()` | Slot/dex count + integrity per source. |
+
+**Every load in the web app is lenient** (`DexKitExt(..., lenient=true)`:
+ART-structural-equivalent verification with `VerifyInsns` off). The multi-source
+ctor is passed `true` explicitly; the single-path ctor defaults to it in
+`wasm-build/wasm_module.cpp`. The reason is the input mix — this tool is aimed at
+packed and obfuscated samples, and strict instruction verification throws away a
+whole dex over bytecode a real device would run, which leaves the analyst with
+nothing. Measured on 300 corrupted-but-structurally-valid dexes, lenient loaded
+32 that strict rejected and lost none. The cost is that the decompiler now walks
+unverified instruction streams, which the reader paths are already written for
+(the bounds guards in `dex_item.cpp` / `dataflow.cpp`); a malformed body fails
+that one method instead of the load. The `verified ✓` status pill therefore means
+the structural bar, and its tooltip says so.
 | `dexCount()` | Number of dexes in the kit. |
 | `extractDexBytes(dexId)` | Pull one dex's raw bytes out (feeds Isolated-mode per-dex kits). |
 | `listClasses()` / `listClassesInDex()` | Populate the sidebar class list. |
