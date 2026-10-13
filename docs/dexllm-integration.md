@@ -36,11 +36,11 @@ C++ class, `Module.WasmDexKit`, plus a few helper types (`Module.VectorString`,
 
 The page pins a build tag and cache-busts every engine asset with `?v=<tag>`
 so a redeploy never serves a stale wasm against a fresh glue file
-([`index.html:851`](../index.html#L851)):
+([`index.html:968`](../index.html#L968)):
 
 ```html
-<script>window.__DEXLLM_BUILD = "3ca7d90-2";</script>
-<script src="dexllm.js?v=3ca7d90-2"></script>
+<script>window.__DEXLLM_BUILD = "db51c67-1";</script>
+<script src="dexllm.js?v=db51c67-1"></script>
 ```
 
 The tag is `<dexllm commit>-<rebuild counter>`. The counter exists because
@@ -48,7 +48,7 @@ The tag is `<dexllm commit>-<rebuild counter>`. The counter exists because
 browser still has to refetch — bump on every wasm rebuild, not every sync.
 
 The main thread instantiates the module with a `locateFile` hook so the wasm
-is fetched with the same cache-buster ([`index.html:1325`](../index.html#L1325)):
+is fetched with the same cache-buster ([`index.html:1467`](../index.html#L1467)):
 
 ```js
 createDexllm({ locateFile: (f) => f + "?v=" + window.__DEXLLM_BUILD }).then(m => {
@@ -104,13 +104,14 @@ main → worker: { id, type: "init",     buildSha }
                { id, type: "addDump",   bytes, label, vfs }
                { id, type: "addIsolated", bytes, vfs, key }
                { id, type: "decompile", cls, sourceIdx, isolatedKey }
+               { id, type: "extractIocs", sourceIdx, isolatedKey }
                { id, type: "reset" }
 worker → main: { id, ok: true,  result }
                { id, ok: false, error }
 ```
 
 The main-thread side is a thin promise wrapper
-([`index.html:1365`](../index.html#L1365)):
+([`index.html:1507`](../index.html#L1507)):
 
 ```js
 const worker = new Worker("worker.js?v=" + window.__DEXLLM_BUILD);
@@ -125,7 +126,7 @@ wcall({ type: "init", buildSha: window.__DEXLLM_BUILD });
 ```
 
 The worker **serializes all messages through a single in-order queue**
-([`worker.js:208`](../worker.js#L208)) so a `decompile` posted immediately
+([`worker.js:233`](../worker.js#L233)) so a `decompile` posted immediately
 after `load` is guaranteed to see the VFS file already written — handlers can't
 race.
 
@@ -143,18 +144,45 @@ race.
    ```
 
    The identical bytes are also handed to the worker via `wcall({type:"load", …})`
-   so both instances hold the same source ([`worker.js:140`](../worker.js#L140)).
+   so both instances hold the same source ([`worker.js:141`](../worker.js#L141)).
 
 2. **Structural analysis (main thread, instant).** The app calls DexKit query
-   methods to populate the class list, string tables, IoC panel, and
-   dangerous-permission panel — see the API map in §5.
+   methods to populate the class list, component badges and the dex tab strip —
+   see the API map in §5. This is the first paint, and it is the only part of
+   load the user waits on.
 
-3. **Decompile on demand (worker, async).** Clicking a class sends
+3. **Deferred passes (async).** The two expensive whole-corpus passes are kicked
+   off without being awaited, so the class tree is interactive while they run,
+   and each patches its own panel in when it lands:
+
+   - **Indicators** — `extractIocs()` walks every string in every dex. It runs
+     in the **worker**, because the engine call is synchronous and on the main
+     thread it froze the page before the tree had painted, throwing away the
+     benefit of the engine parsing lazily. It cost ~8 s on a 40k-class APK —
+     the overwhelming majority of load — and also overflowed the worker's JS
+     stack there, Chrome giving a worker half the main thread's. Both went away
+     when the vendored engine stopped issuing one full-corpus search per
+     indicator (`wasm-build/vendor/ioc.cpp`, `XrefMethods`): ~230 ms on the same
+     APK. The result is small and already plain arrays, so it structured-clones
+     as-is ([`worker.js:204`](../worker.js#L204)).
+   - **Permissions / capabilities** — `permissionCallers()` +
+     `summarizeCapabilities()`, still on the main thread behind a `setTimeout`.
+
+   Both carry a *pending* flag that the status pills and panels render honestly
+   rather than showing a premature zero. The indicator scan additionally carries
+   a generation token (`iocGen`), since dropping another file mid-scan must
+   discard the in-flight result instead of painting it over the new corpus.
+   Because the worker runs one job at a time, a class clicked mid-scan queues
+   behind it — deliberate, as a second worker would mean a third parsed copy of
+   the corpus, and the wait is never longer than the old behaviour of blocking
+   the tree itself.
+
+4. **Decompile on demand (worker, async).** Clicking a class sends
    `wcall({type:"decompile", cls, sourceIdx})`; the worker runs
    `dk.decompileClassJava(cls)` off the UI thread and posts the Java text back
-   ([`worker.js:170`](../worker.js#L170)).
+   ([`worker.js:185`](../worker.js#L185)).
 
-4. **Render + tokenize.** The main thread syntax-highlights the returned Java
+5. **Render + tokenize.** The main thread syntax-highlights the returned Java
    into clickable `.tk-*` tokens, which the xref subsystem hangs navigation on
    (see [`xref.md`](xref.md)).
 
@@ -168,11 +196,11 @@ routing stays consistent:
   into one `WasmDexKit(VectorString, true)`. Sources are ordered **dumps first,
   original last**, so on a class collision the unpacked/dumped class wins
   (first-wins) — mirroring ART after a packer unpacks
-  ([`worker.js:121` `rebuildDk()`](../worker.js#L121)).
+  ([`worker.js:122` `rebuildDk()`](../worker.js#L122)).
 - **Isolated mode** (`addIsolatedDex` → `addIsolated`): each `classes*.dex`
   gets its **own** single-dex `WasmDexKit`, keyed by global dex id, so per-dex
   IoC / permission panels are truly isolated with no first-wins aggregation
-  ([`worker.js:187`](../worker.js#L187)).
+  ([`worker.js:212`](../worker.js#L212)).
 
 ---
 
@@ -253,7 +281,7 @@ The user-facing features and the dexllm calls behind each:
 | Java decompilation view | `decompileClassJava` (worker) |
 | **↔ smali** toggle & line-sync | `renderMethodSmali`, `decompileMethodJavaWithPc` |
 | Click-to-navigate xref (callers, callees, field get/set, type hierarchy) | the `find*` / `xref*` family in §5 (see [`xref.md`](xref.md)) |
-| **Indicators** panel (network IOCs + content providers) | `WasmDexKit.extractIocs()` — one engine call returns `{network:[{value,category,classes[]}], providers:[{uri,family,classes[]}]}`, with the public-suffix list + content-URI dataset **bundled in the engine**. Each row navigates to the caller. |
+| **Indicators** panel (network IOCs + content providers) | `WasmDexKit.extractIocs()` — one engine call returns `{network:[{value,category,classes[]}], providers:[{uri,family,classes[]}]}`, with the public-suffix list + content-URI dataset **bundled in the engine**. Each row navigates to the caller. Runs in the worker, off the load path (§4.3). |
 | **Capabilities** tab (same panel as permissions) | `WasmDexKit.summarizeCapabilities()` — one call returns the behavioural profile over the engine's **bundled** API catalog: `{categories, permissions, apiHits:[{apiSignature, permissions[], categories[], callSiteCount, callers[]}], byCaller, catalogVersion, catalogSize, matchedApis, totalCallSites}`. Covers un-gated behaviour (REFLECTION, DYNAMIC, STORAGE…) that the permissions view structurally cannot show. |
 | **Permissions** panel (all protection levels) | `WasmDexKit.permissionCallers(appOnly)` — the engine does the whole permission→API→callers join over its **bundled** perm→API table + protection levels, returning `[{perm, protectionLevel, rows:[{api, descriptors[], callers[]}]}]`. The panel groups/filters by dangerous / signature / normal / internal. |
 | **Components** tab + sidebar class badges | `WasmDexKit.findClassesBySuperclass()`, BFS'd to the transitive closure of ten Android component bases (activity / service / receiver / provider / application, plus device-admin, accessibility, notification-listener, VPN, job). Reported as **candidates**: the engine only sees dex bytes, so `AndroidManifest.xml` cannot confirm a class is actually declared — and a class registered at runtime or never declared still shows up, which is usually the interesting case. |
@@ -267,8 +295,8 @@ The user-facing features and the dexllm calls behind each:
 Emscripten throws C++ exceptions as `{ excPtr: number }` objects. Naively
 stringifying one leaks a raw pointer to the user (e.g.
 `decompile failed: {"excPtr":35302424}`). Both threads share a `describeError`
-helper ([`index.html:1337`](../index.html#L1337),
-[`worker.js:65`](../worker.js#L65)) that routes such objects through
+helper ([`index.html:1479`](../index.html#L1479),
+[`worker.js:66`](../worker.js#L66)) that routes such objects through
 `Module.getExceptionMessage(ptr)` and always returns a plain human-readable
 string — the inner call is itself guarded because it can throw "memory access
 out of bounds" if the exception was already freed.

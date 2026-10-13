@@ -18,6 +18,6 @@ your device, no upload.
 
 The engine uses a Web Worker plus a streaming-compiled wasm module, both of
 which require a real HTTP origin — browsers refuse them under `file://`. The
-launcher is a ~7 MB Go binary that binds 127.0.0.1 on a random port, opens
+launcher is an ~11 MB Go binary that binds 127.0.0.1 on a random port, opens
 the default browser, and serves the embedded bundle. No installer, no
 dependencies, no system-wide changes.

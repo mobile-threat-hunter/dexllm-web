@@ -10,6 +10,7 @@
 //   main → worker: { id, type: "load",     bytes: Uint8Array, label: string }
 //                  { id, type: "addDump",  bytes: Uint8Array, label: string, vfs: string }
 //                  { id, type: "decompile", cls: string, sourceIdx: number /*-1 = aggregated dk*/ }
+//                  { id, type: "extractIocs", sourceIdx: number, isolatedKey }
 //                  { id, type: "reset" }
 //   worker → main: { id, ok: true,  result?: any }
 //                  { id, ok: false, error: string }
@@ -167,18 +168,42 @@ async function handleAddDump({ bytes, label, vfs }) {
   return { dexCount: dk.dexCount() };
 }
 
-function handleDecompile({ cls, sourceIdx, isolatedKey }) {
-  // Isolated mode: route to the isolated single-dex WasmDexKit so the user
-  // sees THAT dex's body of the class (no first-wins from siblings in the
-  // same source, no aggregation across sources).
+// Isolated mode routes to the isolated single-dex WasmDexKit so the caller
+// sees THAT dex's view (no first-wins from siblings in the same source, no
+// aggregation across sources). Otherwise sourceIdx -1 means the aggregate.
+function pickDk(sourceIdx, isolatedKey) {
   if (isolatedKey != null) {
     const isoDk = isolatedMap.get(isolatedKey);
     if (!isoDk) throw new Error("isolated dex not loaded (key=" + isolatedKey + ")");
-    return isoDk.decompileClassJava(cls);
+    return isoDk;
   }
   const useDk = sourceIdx === -1 ? dk : (sources[sourceIdx] && sources[sourceIdx].dk) || dk;
   if (!useDk) throw new Error("no source loaded");
-  return useDk.decompileClassJava(cls);
+  return useDk;
+}
+
+function handleDecompile({ cls, sourceIdx, isolatedKey }) {
+  return pickDk(sourceIdx, isolatedKey).decompileClassJava(cls);
+}
+
+// The whole-corpus indicator scan — the one load-time pass that walks every
+// string in every dex. It cost ~8s on a 40k-class APK and froze the page
+// before the class tree had painted, which is why it moved here; it also
+// overflowed the worker's JS stack on that corpus, which a Chrome worker gets
+// half as much of as the main thread. The vendored engine's switch to a single
+// Aho-Corasick pass (vendor/ioc.cpp XrefMethods) took it to ~230ms and the
+// overflow with it. It stays off the main thread because the remaining cost
+// scales with the corpus, not the indicator count. The result is small (tens
+// of KB) and already plain arrays/objects, so it structured-clones as-is.
+//
+// Note this shares the worker's single message queue with decompile, so a
+// class clicked mid-scan waits for the scan to finish. That is deliberate: a
+// second worker instance would mean a third parsed copy of the corpus (+82 MB
+// on a 48 MB APK), and the main thread cannot help because the engine call is
+// synchronous.
+function handleExtractIocs({ sourceIdx, isolatedKey }) {
+  const r = pickDk(sourceIdx, isolatedKey).extractIocs();
+  return { network: r.network, providers: r.providers };
 }
 
 // Receive ONE extracted dex's bytes from main, create an isolated DexKit, and
@@ -222,6 +247,7 @@ self.onmessage = (e) => {
       if (type === "load")             result = await handleLoad(msg);
       else if (type === "addDump")     result = await handleAddDump(msg);
       else if (type === "decompile")   result = handleDecompile(msg);
+      else if (type === "extractIocs") result = handleExtractIocs(msg);
       else if (type === "addIsolated") result = await handleAddIsolated(msg);
       else if (type === "resetIsolated") { resetIsolated(msg); result = {}; }
       else if (type === "reset")       { resetState(); result = {}; }

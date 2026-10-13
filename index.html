@@ -859,9 +859,9 @@
 <body>
 <header>
   <h1>dex<span>llm</span></h1>
-  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/3ca7d90"
+  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/db51c67"
      target="_blank" rel="noopener" title="dexllm commit this WASM was built from">
-    v0.6.0 · <code>3ca7d90</code>
+    v0.25.0 · <code>db51c67</code>
   </a>
   <!-- mode toggle: Runtime = packer-unpack workflow (multi-source, dump
        priority, [all] aggregate). Isolated = each dex as its own tab, no
@@ -965,14 +965,19 @@
      every dexllm bump, since wasm_module.cpp can change on its own. The base is
      the dexllm commit (matching the version pill above) and `-N` counts rebuilds
      against that same commit; -2 is the lenient single-path load. -->
-<script>window.__DEXLLM_BUILD = "3ca7d90-2";</script>
-<script src="dexllm.js?v=3ca7d90-2"></script>
+<script>window.__DEXLLM_BUILD = "db51c67-1";</script>
+<script src="dexllm.js?v=db51c67-1"></script>
 <script>
 let Module = null, dk = null, allClasses = [], selectedEl = null;
 // classDescriptor -> { urls:Set, ips:Set, domains:Set, emails:Set, onion:Set }
 let classIoc = new Map();
 let iocTotals = null;            // { urls, ips, domains, emails, onion, total }
 let iocIndex = [];               // [{ value, cat, classes:[descriptor,…] }] — for the global panel
+let iocPending = false;          // true while the deferred whole-corpus scan runs
+// Bumped by every load/rebuild. The scan is async, so a result that arrives
+// after the user has dropped another file must be dropped rather than painted
+// over the new corpus.
+let iocGen = 0;
 let permIndex = [];              // [{ perm, level, api, callers:[methodDescriptor,…] }] — permission callers
 let permTotals = null;           // { perms, apis, callers }
 let permPending = false;         // true while the deferred caller analysis runs
@@ -1188,17 +1193,19 @@ function validDomain(host) {
 }
 
 
-// Run the whole pipeline against the loaded dk; populates classIoc + iocTotals.
-function computeIocs(dkInst) {
-  // Engine-side (dex-analyzer-for-llm#13): dk.extractIocs() runs the network-IoC
-  // scan (URLs/IPs/domains/emails/onion, over the engine's bundled public-suffix
-  // list) AND the content:// provider-URI match (bundled provider dataset), and
-  // resolves each indicator's referencing classes — one call, plain-JS result.
-  // Replaces the old JS scan + shipped datasets (classifyStrings / detectProviders
-  // / xrefStringsToClasses / content_uris.json). Shape:
-  //   { network:[{value,category,classes[]}], providers:[{uri,family,classes[]}] }.
-  classIoc = new Map();
-  iocIndex = [];
+// Fold one engine result into the panel model. Kept free of globals so the
+// async runtime scan can land its result into a snapshot instead of the live
+// view when the user has switched away mid-flight.
+//
+// Engine-side (dex-analyzer-for-llm#13): dk.extractIocs() runs the network-IoC
+// scan (URLs/IPs/domains/emails/onion, over the engine's bundled public-suffix
+// list) AND the content:// provider-URI match (bundled provider dataset), and
+// resolves each indicator's referencing classes — one call, plain-JS result.
+// Replaces the old JS scan + shipped datasets (classifyStrings / detectProviders
+// / xrefStringsToClasses / content_uris.json). Shape:
+//   { network:[{value,category,classes[]}], providers:[{uri,family,classes[]}] }.
+function buildIocResult(r) {
+  const cIoc = new Map(), idx = [];
   const add = (value, cat, classes) => {
     // Skip indicators with no referencing class — they can't be navigated to
     // (the panel is click-to-caller) and are almost always misclassification
@@ -1206,24 +1213,66 @@ function computeIocs(dkInst) {
     // `libcore.icu.icu` scanned as domains). Dropping them removes the dead
     // "— none" rows.
     if (!classes.length) return;
-    iocIndex.push({ value, cat, classes });
+    idx.push({ value, cat, classes });
     for (const cd of classes) {
-      let e = classIoc.get(cd);
-      if (!e) { e = newIocEntry(); classIoc.set(cd, e); }
+      let e = cIoc.get(cd);
+      if (!e) { e = newIocEntry(); cIoc.set(cd, e); }
       e[cat].add(value);
     }
   };
-  const r = dkInst.extractIocs();
   for (const p of r.providers) add(p.uri, "providers", p.classes);   // providers first (panel order)
   for (const n of r.network) add(n.value, n.category, n.classes);
-  iocTotals = { total: iocIndex.length };
-  for (const cat of IOC_CATS) iocTotals[cat] = 0;
-  for (const it of iocIndex) iocTotals[it.cat] = (iocTotals[it.cat] || 0) + 1;
+  const totals = { total: idx.length };
+  for (const cat of IOC_CATS) totals[cat] = 0;
+  for (const it of idx) totals[it.cat] = (totals[it.cat] || 0) + 1;
+  return { classIoc: cIoc, iocIndex: idx, iocTotals: totals };
+}
+
+// Synchronous scan against one dk — used by the Isolated per-dex tabs, where
+// the dk is a single dex and the user has already chosen to open that tab.
+// The runtime aggregate goes through scanIocsAsync instead.
+function computeIocs(dkInst) {
+  const res = buildIocResult(dkInst.extractIocs());
+  classIoc = res.classIoc; iocIndex = res.iocIndex; iocTotals = res.iocTotals;
+  // Entering an isolated tab mid-scan inherits the runtime view's pending flag,
+  // which would leave this (already finished) tab claiming to be scanning.
+  iocPending = false;
 }
 const iocCountFor = cd => {
   const e = classIoc.get(cd); if (!e) return 0;
   let n = 0; for (const cat of IOC_CATS) n += e[cat].size; return n;
 };
+
+// Deferred whole-corpus scan for the runtime aggregate. Runs in the decompile
+// worker: the engine call is synchronous, and on the main thread it froze the
+// page for the entire scan before the class tree had painted — which threw
+// away the benefit of the engine parsing lazily in the first place. The caller
+// does NOT await this; the generation token is what keeps a late result from
+// landing on a corpus it doesn't describe.
+async function scanIocsAsync(gen) {
+  let res;
+  try {
+    const r = await wcall({ type: "extractIocs", sourceIdx: -1, isolatedKey: null });
+    res = buildIocResult(r);
+  } catch (e) {
+    console.error("IOC extraction failed:", e);
+    res = { classIoc: new Map(), iocIndex: [], iocTotals: null };
+  }
+  if (gen !== iocGen) return;              // another load owns the view now
+  // The user can switch to Isolated while this runs, where the live IoC
+  // globals describe a single dex. Land the result in the runtime snapshot
+  // instead so switching back shows it rather than an empty panel.
+  if (viewMode !== "runtime") {
+    if (runtimePanelSnap) Object.assign(runtimePanelSnap, res, { iocPending: false });
+    return;
+  }
+  classIoc = res.classIoc; iocIndex = res.iocIndex; iocTotals = res.iocTotals;
+  iocPending = false;
+  patchIocBadges();
+  renderIocPanel();
+  if (currentClass) renderIocBar(currentClass);
+  refreshRuntimeStatus();
+}
 
 // ---- permission callers ----
 // The permission→API→callers join now lives in the engine
@@ -1886,13 +1935,14 @@ async function processCurrentDk(label, loadMs, opts) {
   const preservedExtras = dexInfo.filter(d => d.isolatedOnly);
   dexInfo = buildDexInfo(rep, perDexCount).concat(preservedExtras);
 
-  // network-IOC pass over the full corpus (dumps + apk) — first-wins applied.
-  statusEl.innerHTML = `<b>${label}</b> · scanning for indicators…`;
-  classIoc = new Map(); iocTotals = null;
-  try {
-    await new Promise(r => setTimeout(r, 0));   // let the "scanning…" status paint
-    computeIocs(dk);
-  } catch (e) { console.error("IOC extraction failed:", e); iocTotals = null; }
+  // The network-IOC pass is the one load-time step whose cost scales with the
+  // whole corpus rather than the clicked class, so it is deferred to the worker
+  // and its result is patched in when it lands. Clearing the state and bumping
+  // the generation here invalidates any scan still in flight from a previous
+  // load.
+  classIoc = new Map(); iocIndex = []; iocTotals = null;
+  iocPending = true;
+  scanIocsAsync(++iocGen);
   try { computeComponents(dk); }
   catch (e) {
     console.error("component detection failed:", e);
@@ -1904,9 +1954,8 @@ async function processCurrentDk(label, loadMs, opts) {
   const dumpPill = dumpedSources.length
     ? ` · <span class="pill bad" title="runtime-dumped dexes loaded with priority over the original APK">${dumpedSources.length} dump${dumpedSources.length === 1 ? "" : "s"}</span>`
     : "";
-  const statusHead = `<b>${label}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}${dumpPill}`;
-  runtimeStatusHead = statusHead + statusPills();
-  statusEl.innerHTML = runtimeStatusHead;
+  runtimeStatusBase = `<b>${label}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}${dumpPill}`;
+  refreshRuntimeStatus();
 
   if (opts && opts.firstLoad) {
     await opts.transition;
@@ -1916,8 +1965,12 @@ async function processCurrentDk(label, loadMs, opts) {
     selectedEl = null; currentClass = null; codeLineCache = [];
     $("#vname").textContent = "— select a class —"; $("#vmeta").textContent = "";
     $("#iocbar").classList.add("empty"); $("#iocbar").innerHTML = "";
+    // The indicator scan is still running at this point, so the hint has to be
+    // written before its count is known — `iocPending` stands in for "there
+    // will probably be badges", and the hint is harmless if there turn out to
+    // be none.
     $("#code").innerHTML = '<div class="placeholder">Pick a class on the left to decompile it.' +
-      (iocTotals && iocTotals.total ? ' Classes that reference a network indicator are marked with a count badge, or click any indicator on the right to jump to it.' : "") + '</div>';
+      (iocPending || (iocTotals && iocTotals.total) ? ' Classes that reference a network indicator are marked with a count badge, or click any indicator on the right to jump to it.' : "") + '</div>';
     $("#iocfilter").value = ""; $("#permfilter").value = "";
     $("#search").value = "";
   }
@@ -1926,7 +1979,7 @@ async function processCurrentDk(label, loadMs, opts) {
   renderPanels();
   renderList($("#search").value || "");
   if (opts && opts.firstLoad) $("#search").focus();
-  setTimeout(() => analyzePerms(statusHead), 30);
+  setTimeout(analyzePerms, 30);
 }
 
 // Map verifyReport + per-dex class counts into the per-dex tab model.
@@ -2145,11 +2198,11 @@ function isolatedStatusHead(did) {
 // Save / restore the runtime-aggregate panel state across mode switches so
 // the heavy initial compute isn't redone every toggle.
 function snapshotPanels() {
-  return { classIoc, iocIndex, iocTotals, permIndex, permTotals, permPending, capReport, activeCapCats,
+  return { classIoc, iocIndex, iocTotals, iocPending, permIndex, permTotals, permPending, capReport, activeCapCats,
            componentIndex, componentGroups, activeCompKinds };
 }
 function restorePanels(s) {
-  classIoc = s.classIoc; iocIndex = s.iocIndex; iocTotals = s.iocTotals;
+  classIoc = s.classIoc; iocIndex = s.iocIndex; iocTotals = s.iocTotals; iocPending = s.iocPending;
   permIndex = s.permIndex; permTotals = s.permTotals; permPending = s.permPending;
   capReport = s.capReport; activeCapCats = s.activeCapCats;
   componentIndex = s.componentIndex; componentGroups = s.componentGroups;
@@ -2186,7 +2239,9 @@ function setMode(newMode) {
     // tab key after the switch.
     selectedDex = "all";
     if (runtimePanelSnap) restorePanels(runtimePanelSnap);
-    statusEl.innerHTML = runtimeStatusHead || statusEl.innerHTML;
+    // Recompose rather than reuse the cached line: a deferred pass may have
+    // finished into the snapshot while the isolated view was on screen.
+    refreshRuntimeStatus();
   }
   currentClass = null; codeLineCache = [];
   renderModeToggle();
@@ -2196,9 +2251,14 @@ function setMode(newMode) {
   if (viewMode === "isolated") statusEl.innerHTML = isolatedStatusHead(Number(selectedDex));
 }
 
-// Tracked at processCurrentDk end so we can restore the runtime status pills
-// when switching back from isolated.
-let runtimeStatusHead = "";
+// The runtime status line without its pills, tracked at processCurrentDk end so
+// it can be recomposed later. The two deferred passes (permissions, indicators)
+// finish in either order, and each must rebuild the pills from the current
+// globals rather than from whatever the other one left on screen.
+let runtimeStatusBase = "";
+function refreshRuntimeStatus() {
+  if (viewMode === "runtime") statusEl.innerHTML = runtimeStatusBase + statusPills();
+}
 
 // Render the per-dex tab bar. In runtime mode the leading [all] tab aggregates
 // every loaded dex via first-wins; in isolated mode each dex is its own tab
@@ -2279,9 +2339,11 @@ function escAttr(s) {
 
 // Network-indicator / permission status pills (composed from current totals).
 function statusPills() {
-  const iocPill = (iocTotals && iocTotals.total)
-    ? ` · <span class="pill bad" title="distinct indicators recovered from dex strings (network + content providers)">${iocTotals.total} IOC${iocTotals.total === 1 ? "" : "s"}</span>`
-    : ` · <span class="pill ok">no IOCs</span>`;
+  const iocPill = iocPending
+    ? ` · <span class="pill" style="background:#8b949e22;color:var(--muted)" title="scanning every string in every dex — the class tree is already usable">scanning indicators…</span>`
+    : (iocTotals && iocTotals.total)
+      ? ` · <span class="pill bad" title="distinct indicators recovered from dex strings (network + content providers)">${iocTotals.total} IOC${iocTotals.total === 1 ? "" : "s"}</span>`
+      : ` · <span class="pill ok">no IOCs</span>`;
   const permPill = permPending
     ? ` · <span class="pill" style="background:#8b949e22;color:var(--muted)">analyzing perms…</span>`
     : (permTotals && permTotals.perms)
@@ -2293,7 +2355,7 @@ function statusPills() {
 
 // Deferred permission caller mapping (the expensive L2 step). Maps EVERY
 // protection level in one pass; the header checkboxes filter the view only.
-async function analyzePerms(statusHead) {
+async function analyzePerms() {
   permIndex = []; permTotals = null; capReport = null; permPending = true;
   renderPermPanel();
   try {
@@ -2304,7 +2366,7 @@ async function analyzePerms(statusHead) {
   catch (e) { console.error("capability mapping failed:", e); capReport = null; }
   permPending = false;
   renderPermPanel();
-  statusEl.innerHTML = statusHead + statusPills();
+  refreshRuntimeStatus();
 }
 
 // ---- class list as a path-compressed, lazy package tree ----
@@ -2326,12 +2388,22 @@ function buildTree(classes) {
     node.classes.push({ desc, label:name });
   }
   (function count(n){
-    let t = n.classes.length, ic = 0;
-    for (const c of n.classes) ic += iocCountFor(c.desc);
-    for (const c of n.children.values()) { count(c); t += c.count; ic += c.iocCount; }
-    n.count = t; n.iocCount = ic; return n;
+    let t = n.classes.length;
+    for (const c of n.children.values()) { count(c); t += c.count; }
+    n.count = t; return n;
   })(root);
   return root;
+}
+
+// Subtree indicator count, read on demand instead of folded into buildTree's
+// count pass: the tree now paints before the indicator scan finishes, so a
+// count baked in at build time would always be zero. Walked rather than cached
+// so there is no state to invalidate when the scan lands or a dex tab changes.
+function subtreeIocCount(node) {
+  let ic = 0;
+  for (const c of node.classes) ic += iocCountFor(c.desc);
+  for (const c of node.children.values()) ic += subtreeIocCount(c);
+  return ic;
 }
 
 // collapse a single-child package chain (com>google>android) into "com.google.android"
@@ -2363,12 +2435,8 @@ function makePkgRow(label, eff, depth, expand) {
   const pl = document.createElement("span"); pl.className = "pl"; pl.textContent = label;
   const cnt = document.createElement("span"); cnt.className = "cnt"; cnt.textContent = eff.count;
   row.append(tw, pl, cnt);
-  if (eff.iocCount > 0) {
-    const b = document.createElement("span"); b.className = "ioc-badge";
-    b.textContent = eff.iocCount;
-    b.title = eff.iocCount + " network-indicator reference(s) under this package";
-    row.append(b);
-  }
+  row.__pkgNode = eff;
+  applyIocBadge(row, subtreeIocCount(eff));
   const kids = document.createElement("div"); kids.className = "kids"; kids.style.display = "none";
   let built = false;
   const toggle = open => {
@@ -2397,14 +2465,35 @@ function makeClassRow(c, depth) {
     cb.title = `${comp.kind} candidate — extends ${descToJava(comp.base)}`;
     div.append(cb);
   }
-  const n = iocCountFor(c.desc);
-  if (n > 0) {
-    const b = document.createElement("span"); b.className = "ioc-badge";
-    b.textContent = n; b.title = iocTitle(c.desc);
-    div.append(b);
-  }
+  div.__clsDesc = c.desc;
+  applyIocBadge(div, iocCountFor(c.desc));
   div.onclick = () => selectClass(c.desc, div);
   return div;
+}
+
+// Create, update or drop a row's indicator badge in place. Both the initial
+// build and the post-scan patch go through here so a badge added late sits
+// exactly where an eagerly built one would have.
+function applyIocBadge(row, n) {
+  let b = row.querySelector(":scope > .ioc-badge");
+  if (n <= 0) { if (b) b.remove(); return; }
+  if (!b) { b = document.createElement("span"); b.className = "ioc-badge"; row.append(b); }
+  b.textContent = n;
+  b.title = row.__pkgNode
+    ? n + " network-indicator reference(s) under this package"
+    : iocTitle(row.__clsDesc);
+}
+
+// Repaint the badges on every row the tree has already materialized. The scan
+// finishes long after the tree paints, and re-rendering would collapse every
+// package the user opened while waiting, so the rows are patched in place.
+function patchIocBadges() {
+  for (const row of listEl.querySelectorAll(".pkg")) {
+    if (row.__pkgNode) applyIocBadge(row, subtreeIocCount(row.__pkgNode));
+  }
+  for (const row of listEl.querySelectorAll(".cls")) {
+    if (row.__clsDesc) applyIocBadge(row, iocCountFor(row.__clsDesc));
+  }
 }
 
 // Plain-text summary of a class's indicators (for badge tooltips).
@@ -2655,7 +2744,15 @@ function renderPanels() { renderIocPanel(); renderPermPanel(); }
 // network indicators panel (top of the two right panels)
 function renderIocPanel() {
   const panel = $("#iocpanel"), body = $("#iocpanelbody");
-  if (!iocIndex.length) { panel.classList.add("empty"); body.innerHTML = ""; return; }
+  if (!iocIndex.length) {
+    if (iocPending) {                        // scan still running — show progress
+      panel.classList.remove("empty");
+      $("#iocphd").textContent = "indicators";
+      body.innerHTML = '<div class="iocgrp" style="color:var(--muted)">scanning dex strings…</div>';
+      return;
+    }
+    panel.classList.add("empty"); body.innerHTML = ""; return;
+  }
   panel.classList.remove("empty");
   $("#iocphd").innerHTML = `indicators <span class="ipcount" title="distinct indicators">${iocIndex.length}</span>`;
   const filt = ($("#iocfilter").value || "").toLowerCase().trim();
@@ -5242,7 +5339,11 @@ function selectClass(cls, el, hint) {
   currentClass = cls;
   pushNavState(hint);
   $("#vname").textContent = cls;
-  $("#vmeta").innerHTML = '<span class="spin"></span>decompiling…';
+  // The worker runs one job at a time, so a click during the deferred indicator
+  // scan waits for the scan to finish. Say so rather than letting the spinner
+  // imply the decompile itself is this slow.
+  $("#vmeta").innerHTML = '<span class="spin"></span>' +
+    (iocPending ? "queued behind the indicator scan…" : "decompiling…");
   $("#code").textContent = "";
   renderIocBar(cls);
   // Route the decompile call.
