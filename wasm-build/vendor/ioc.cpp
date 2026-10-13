@@ -1,8 +1,11 @@
 // ioc.cpp — see web_analysis.h (IoC section). C++ port of dexllm.ioc.extract_iocs.
 //
-// VENDORED from dexllm native/core_ext/ioc.cpp at commit c3ec1a1, unmodified
-// except the include below (the declarations moved to vendor/web_analysis.h when
-// dexllm 4b085d8 dropped them from its core analysis.h).
+// VENDORED from dexllm native/core_ext/ioc.cpp at commit c3ec1a1 — the last
+// state that file ever had, since dexllm 4b085d8 deleted it. Two edits since:
+// the include below (the declarations moved to vendor/web_analysis.h when
+// 4b085d8 dropped them from its core analysis.h), and XrefMethods, which
+// replaced the per-indicator search loop with one batch pass (dexllm#98; see
+// that function for why the single path can never reach a trie).
 //
 // Issue #13. The Python path's five extraction regexes are hand-BOUNDED (ReDoS-
 // safe) and two use look-behind (IPv4, email) — which neither std::regex
@@ -27,6 +30,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 #include <string_view>
@@ -571,6 +575,61 @@ void CollectBuckets(const std::vector<std::string>& strings, bool denoise,
     }
 }
 
+// The "where in the code" half of both reports: {value → referencing method
+// descriptors}. ONE Aho-Corasick pass for every value, not one full-corpus scan
+// per value — FindMethodsUsingStrings never reaches a trie (its ACDAT prefilter
+// is gated on HasComposite, false for a plain using_strings list), so the batch
+// is the only way in, and the cost stops growing with the indicator count
+// (dexllm#98).
+//
+// Keys are POSITIONS, not the values. A batch key is not MUTF-8-encoded
+// (dexllm#29) while the values are, so a value-keyed map would both mis-handle
+// a lone surrogate and collapse two indicators that stringify alike.
+std::map<std::string, std::vector<std::string>> XrefMethods(
+    DexKitExt& ext, const std::vector<const std::string*>& values) {
+    std::map<std::string, std::vector<std::string>> out;
+    if (values.empty()) return out;
+
+    std::map<std::string, std::vector<std::string>> query;
+    std::vector<const std::string*> keyed;
+    keyed.reserve(values.size());
+    for (const std::string* v : values) {
+        // An empty keyword trips a DEXKIT_CHECK inside the batch path, which
+        // ABORTS rather than throws — no catch below can contain it.
+        if (v->empty()) continue;
+        query.emplace(std::to_string(keyed.size()), std::vector<std::string>{*v});
+        keyed.push_back(v);
+    }
+
+    try {
+        auto res = ext.BatchFindMethodsUsingStrings(query, /*match_type=*/"contains",
+                                                    /*ignore_case=*/false);
+        for (std::size_t i = 0; i < keyed.size(); ++i) {
+            std::vector<std::string>& ms = out[*keyed[i]];
+            auto it = res.find(std::to_string(i));
+            if (it == res.end()) continue;
+            for (const auto& m : it->second) ms.push_back(m.descriptor);
+        }
+        return out;
+    } catch (...) {
+        out.clear();
+    }
+
+    // The per-value loop the batch replaced, kept as the fallback so one bad
+    // query still cannot abort the report (extract_iocs's per-query try/except).
+    for (const std::string* v : values) {
+        std::vector<std::string>& ms = out[*v];
+        try {
+            for (const auto& m : ext.FindMethodsUsingStrings(
+                     {*v}, /*match_type=*/"contains", /*ignore_case=*/false))
+                ms.push_back(m.descriptor);
+        } catch (...) {
+            ms.clear();
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
 IocResult ExtractIocs(DexKitExt& ext, bool with_xref, bool denoise,
@@ -589,28 +648,32 @@ IocResult ExtractIocs(DexKitExt& ext, bool with_xref, bool denoise,
                    onion);
 
     // Cross-reference, highest-signal category first, within one budget. Mirrors
-    // extract_iocs's _XREF_PRIORITY = onion, ips, domains, emails, urls.
-    int budget = xref_limit;
+    // extract_iocs's _XREF_PRIORITY = onion, ips, domains, emails, urls. The
+    // budget is spent by SELECTING values in that order, so which indicators get
+    // an xref is unchanged — they are just all asked in one pass.
+    const std::set<std::string>* const priority[] = {&onion, &ips, &domains,
+                                                     &emails, &urls};
+    std::vector<const std::string*> budgeted;
+    if (with_xref && xref_limit > 0) {
+        budgeted.reserve(static_cast<std::size_t>(xref_limit));
+        for (const std::set<std::string>* bucket : priority) {
+            for (const std::string& value : *bucket) {  // std::set already sorted
+                if (budgeted.size() >= static_cast<std::size_t>(xref_limit)) break;
+                budgeted.push_back(&value);
+            }
+        }
+    }
+    const std::map<std::string, std::vector<std::string>> xref =
+        XrefMethods(ext, budgeted);
+
     auto build = [&](const std::set<std::string>& bucket) {
         std::vector<IocIndicator> rows;
         rows.reserve(bucket.size());
-        for (const std::string& value : bucket) {  // std::set already sorted
+        for (const std::string& value : bucket) {
             IocIndicator ind;
             ind.value = value;
-            if (with_xref && budget > 0) {
-                // Mirror extract_iocs's per-query try/except: a throwing L7 query
-                // yields empty methods but STILL spends the budget and continues
-                // the report (one bad indicator must not abort it).
-                try {
-                    for (const auto& m : ext.FindMethodsUsingStrings(
-                             {value}, /*match_type=*/"contains",
-                             /*ignore_case=*/false))
-                        ind.methods.push_back(m.descriptor);
-                } catch (...) {
-                    ind.methods.clear();
-                }
-                --budget;
-            }
+            auto it = xref.find(value);  // absent → out of budget, no xref
+            if (it != xref.end()) ind.methods = it->second;
             rows.push_back(std::move(ind));
         }
         return rows;
@@ -668,22 +731,26 @@ std::vector<std::pair<std::string, std::string>> DetectProvidersFromStrings(
 
 std::vector<ProviderHit> DetectContentProviders(DexKitExt& ext, bool with_xref,
                                                 int xref_limit) {
-    int budget = xref_limit;
+    const auto hits = DetectProvidersFromStrings(ext.ListValueStrings());
+
+    std::vector<const std::string*> budgeted;
+    if (with_xref && xref_limit > 0) {
+        for (const auto& [uri, family] : hits) {
+            if (budgeted.size() >= static_cast<std::size_t>(xref_limit)) break;
+            budgeted.push_back(&uri);
+        }
+    }
+    const std::map<std::string, std::vector<std::string>> xref =
+        XrefMethods(ext, budgeted);
+
     std::vector<ProviderHit> result;
-    for (auto& [uri, family] : DetectProvidersFromStrings(ext.ListValueStrings())) {
+    result.reserve(hits.size());
+    for (const auto& [uri, family] : hits) {
         ProviderHit ph;
         ph.uri = uri;
         ph.family = family;
-        if (with_xref && budget > 0) {
-            try {
-                for (const auto& m : ext.FindMethodsUsingStrings(
-                         {uri}, /*match_type=*/"contains", /*ignore_case=*/false))
-                    ph.methods.push_back(m.descriptor);
-            } catch (...) {
-                ph.methods.clear();
-            }
-            --budget;
-        }
+        auto it = xref.find(uri);  // absent → out of budget, no xref
+        if (it != xref.end()) ph.methods = it->second;
         result.push_back(std::move(ph));
     }
     return result;

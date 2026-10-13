@@ -19,13 +19,23 @@ commit directs WASM consumers to vendor their own engine — this is that copy.
 | `gen/content_uris_data.h` | `native/core_ext/gen/content_uris_data.h` |
 | `gen/word_ranges.h` | `native/core_ext/gen/word_ranges.h` |
 
-Bodies are byte-faithful to `c3ec1a1`. The only edits:
+`c3ec1a1` is also the last state these files ever had — `4b085d8` deleted them
+unchanged, so there is no newer upstream version to track.
+
+Bodies are byte-faithful to `c3ec1a1`. The edits:
 
 - `ioc.cpp` includes `web_analysis.h` instead of `analysis.h` (the declarations
   moved when dexllm's `analysis.h` lost them; it now declares only
   `PermissionCallers`, which stayed in the core and is still consumed directly).
 - `web_analysis.h` includes dexllm's `analysis.h` rather than redeclaring
   `DexKitExt`.
+- `ioc.cpp` gained `XrefMethods`: `ExtractIocs` and `DetectContentProviders`
+  asked one full-corpus `FindMethodsUsingStrings` per indicator, which on a
+  50 MB APK was 8.0 s of the load. They now issue a single Aho-Corasick batch
+  pass. Upstream made the same change to the Python path (dexllm#98) and moved
+  the first-wins dedupe the batch needs into `DexKitExt` (dexllm#106), so this
+  copy only had to change the call shape. Verified byte-identical against the
+  pre-change build on two APKs (26 and 251 indicators).
 
 Everything stays in `namespace dexkit::ext`, so call sites in `wasm_module.cpp`
 are unchanged.

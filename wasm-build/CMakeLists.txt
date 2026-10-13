@@ -45,18 +45,33 @@ foreach(tgt dexkit_static)
   endif()
 endforeach()
 
+# The shared MUTF-8 codec. Its own leaf target, mirroring DEXLLM_ROOT, because
+# dexllm#80 moved the smali renderer into dexkit_ext and that renderer decodes a
+# pool string before escaping it — so dexkit_ext needs mutf8 too, not just
+# dexkit_dad. One target keeps it out of two archives.
+add_library(dexkit_mutf8 STATIC "${DEXLLM_ROOT}/native/dad_cpp/mutf8.cpp")
+target_include_directories(dexkit_mutf8 PUBLIC "${DEXLLM_ROOT}/native/dad_cpp/include")
+target_compile_options(dexkit_mutf8 PRIVATE -fexceptions)
+
 # dexkit_ext — same source list as DEXLLM_ROOT/CMakeLists.txt
 add_library(dexkit_ext STATIC
     "${DEXLLM_ROOT}/native/core_ext/dexkit_ext.cpp"
     "${DEXLLM_ROOT}/native/core_ext/dexitem_code_source.cpp"
     "${DEXLLM_ROOT}/native/core_ext/dex_verifier.cpp"
+    "${DEXLLM_ROOT}/native/core_ext/invoke_args.cpp"
+    "${DEXLLM_ROOT}/native/core_ext/smali_render.cpp"
     "${DEXLLM_ROOT}/native/core_ext/analysis.cpp"
 )
 target_include_directories(dexkit_ext PUBLIC
     "${DEXLLM_ROOT}/native/core_ext/include"
     "${DEXLLM_ROOT}/native/dad_cpp/include"
 )
-target_link_libraries(dexkit_ext PUBLIC dexkit_static)
+# PRIVATE, deliberately — same reasoning as DEXLLM_ROOT/CMakeLists.txt.
+# invoke_args.cpp and smali_render.cpp reach `utils/opcode_util.h` and
+# `utils/byte_code_util.h`; PUBLIC would propagate the vendored Core's dexkit
+# directory through dexkit_dad to every dad_cpp TU.
+target_include_directories(dexkit_ext PRIVATE "${DEXKIT_CORE_ROOT}/Core/dexkit")
+target_link_libraries(dexkit_ext PUBLIC dexkit_static dexkit_mutf8)
 target_compile_options(dexkit_ext PRIVATE -fexceptions)
 
 # web_engine — the IoC / content-provider / capability ports, vendored from
@@ -78,7 +93,6 @@ target_compile_options(web_engine PRIVATE -fexceptions)
 # dexkit_dad — same source list as DEXLLM_ROOT/CMakeLists.txt
 add_library(dexkit_dad STATIC
     "${DEXLLM_ROOT}/native/dad_cpp/decompiler.cpp"
-    "${DEXLLM_ROOT}/native/dad_cpp/mutf8.cpp"
     "${DEXLLM_ROOT}/native/dad_cpp/util.cpp"
     "${DEXLLM_ROOT}/native/dad_cpp/node.cpp"
     "${DEXLLM_ROOT}/native/dad_cpp/basic_blocks.cpp"
@@ -98,7 +112,7 @@ add_library(dexkit_dad STATIC
 target_include_directories(dexkit_dad PUBLIC
     "${DEXLLM_ROOT}/native/dad_cpp/include"
 )
-target_link_libraries(dexkit_dad PUBLIC dexkit_ext)
+target_link_libraries(dexkit_dad PUBLIC dexkit_ext dexkit_mutf8)
 target_compile_options(dexkit_dad PRIVATE -fexceptions)
 
 # Embind binding (this file).
