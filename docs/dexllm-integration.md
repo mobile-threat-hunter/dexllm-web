@@ -202,6 +202,16 @@ routing stays consistent:
   IoC / permission panels are truly isolated with no first-wins aggregation
   ([`worker.js:212`](../worker.js#L212)).
 
+  **Component detection is the one exception**, and has to be. It walks *down*
+  from each Android base through `findClassesBySuperclass`, so a single dex
+  cannot see a chain that leaves it — and `MyActivity → AppCompatActivity`
+  across a multidex split is the norm, not a corner. Each isolated tab
+  therefore takes the aggregate's verdict for the classes it declares
+  (`mergeCorpusComponents`). Only the superclass walk is borrowed; nothing is
+  resolved from a sibling dex, so the mode keeps its meaning. A dex the
+  aggregate never saw — an Isolated-only `+ dex` extra — still gets only what
+  its own BFS can reach.
+
 ---
 
 ## 5. The dexllm API surface used

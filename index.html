@@ -1038,6 +1038,9 @@ const COMPONENT_BASES = [
 let componentIndex = new Map();  // classDescriptor -> the winning COMPONENT_BASES entry
 let componentGroups = new Map(); // kind -> [classDescriptor, …]
 let activeCompKinds = new Set(); // kinds currently shown (all, once detected)
+// The whole-corpus answer, kept aside so an Isolated tab can attribute it to
+// the dex that declares each class. Never written by a per-dex pass.
+let corpusComponentIndex = new Map();
 
 // ── multi-source state ──────────────────────────────────────────────────────
 // Track every source the current DexKit was built from so we can rebuild when
@@ -1433,6 +1436,41 @@ function computeComponents(dkInst) {
       frontier = next;
     }
     if (found.length) componentGroups.set(entry.kind, found.sort());
+  }
+  activeCompKinds = new Set(componentGroups.keys());
+}
+
+// Fold the whole-corpus verdict for `own` into a single-dex result.
+//
+// The BFS above walks DOWN from each base through findClassesBySuperclass,
+// which only sees the dk it was handed. Given one isolated dex, a chain that
+// leaves that dex breaks and the subclass below the break is never reached —
+// and that is the common case, not a corner: an app's own activities extend
+// AppCompatActivity, which multidex routinely puts in a different dex. It cost
+// Telegram's LaunchActivity, BubbleActivity and BasePermissionsActivity their
+// badges on the very tab that declares them (5 of 107 components, all of them
+// app code rather than library noise).
+//
+// The aggregate dk resolves the chain the way ART does, so its verdict is the
+// honest one. Attributing it to the declaring dex borrows nothing but the
+// superclass walk, so Isolated mode keeps its point — no first-wins, no
+// sibling dex answering for this one. A dex the aggregate never saw (an
+// Isolated-only "+ dex" extra) simply finds nothing here and keeps its own
+// BFS result.
+function mergeCorpusComponents(own) {
+  if (!corpusComponentIndex.size) return;
+  const added = new Map();
+  for (const desc of own) {
+    if (componentIndex.has(desc)) continue;
+    const entry = corpusComponentIndex.get(desc);
+    if (!entry) continue;
+    componentIndex.set(desc, entry);
+    let list = added.get(entry.kind);
+    if (!list) { list = []; added.set(entry.kind, list); }
+    list.push(desc);
+  }
+  for (const [kind, list] of added) {
+    componentGroups.set(kind, (componentGroups.get(kind) || []).concat(list).sort());
   }
   activeCompKinds = new Set(componentGroups.keys());
 }
@@ -1948,6 +1986,8 @@ async function processCurrentDk(label, loadMs, opts) {
     console.error("component detection failed:", e);
     componentIndex = new Map(); componentGroups = new Map(); activeCompKinds = new Set();
   }
+  // Isolated tabs attribute this back per dex; see mergeCorpusComponents.
+  corpusComponentIndex = componentIndex;
 
   permIndex = []; permTotals = null; capReport = null; permPending = true;
 
@@ -2143,6 +2183,10 @@ function activateIsolatedTab(did) {
       console.error("component detection failed:", e);
       componentIndex = new Map(); componentGroups = new Map(); activeCompKinds = new Set();
     }
+    // This dex's own BFS misses any class whose superclass chain leaves the
+    // dex, so the corpus verdict is folded back in for the classes this dex
+    // declares.
+    mergeCorpusComponents(iso.classes);
     iso.comp = { componentIndex, componentGroups, activeCompKinds };
   }
   componentIndex = iso.comp.componentIndex;
