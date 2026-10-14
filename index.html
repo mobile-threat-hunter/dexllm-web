@@ -3212,7 +3212,7 @@ function activeQueryDk() {
 
 // Given an element inside #code, find which line of codeLineCache it sits on.
 // `evt` (optional) carries the original click event — in plain-large render
-// mode the target is the whole .chunk div (400 lines), so its bounding rect
+// mode the target is the whole .chunk div (100 lines), so its bounding rect
 // always points at the chunk's first line. Falling back to `evt.clientY`
 // gives us the actual cursor y, so the click maps to the correct line.
 function getLineForElement(el, evt) {
@@ -5201,6 +5201,10 @@ const IS_KW = (t) => JAVA_KW.has(t) || KW_PRIM.has(t) || KW_LIT.has(t);
 // string / type / constructor xref stay span-based (highlight mode only).
 $("#code").addEventListener("click", (e) => {
   if (!currentClass) return;
+  // A drag-release lands here as a click too; navigating would both be
+  // unwanted and destroy the user's fresh selection.
+  const sel = getSelection();
+  if (sel && !sel.isCollapsed) return;
   // D-3 smali sync runs ALONGSIDE the other dispatches — if the smali pane
   // is open, every click in the code area also drives the smali pane to
   // the matching offset (uses the click target's line, not its token).
@@ -5480,7 +5484,15 @@ function selectClass(cls, el, hint) {
 // Render decompiled Java in a single highlight pass (one innerHTML, no per-line
 // DOM). Raw lines are cached for fast line lookup; the glow uses an overlay.
 let codeLineCache = [];
-const CHUNK_LINES = 400;
+// 100 lines per chunk is a measured optimum for the forced layout that fires
+// when a chunk enters the content-visibility render window. With 400, fling-
+// scrolling a 3.7M-char class under a 20x CPU throttle blocked 90–140ms at
+// EVERY chunk boundary (the wheel-scroll stutter on slower machines); with
+// 100 it's clean at 10x and ≤75ms rarely at 20x. Smaller is not better: at 50
+// the per-chunk fixed cost dominates (182 long tasks vs 35 at 20x). A per-
+// line virtual scroller also measured far worse — div insert/remove costs
+// ~10x more style/layout/paint per line than laying out one big text node.
+const CHUNK_LINES = 100;
 function renderCode(text) {
   const code = $("#code");
   codeLineCache = text.split("\n");
