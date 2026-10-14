@@ -965,7 +965,7 @@
      every dexllm bump, since wasm_module.cpp can change on its own. The base is
      the dexllm commit (matching the version pill above) and `-N` counts rebuilds
      against that same commit; -2 is the lenient single-path load. -->
-<script>window.__DEXLLM_BUILD = "db51c67-1";</script>
+<script>window.__DEXLLM_BUILD = "db51c67-2";</script>
 <script src="dexllm.js?v=db51c67-1"></script>
 <script>
 let Module = null, dk = null, allClasses = [], selectedEl = null;
@@ -1512,26 +1512,37 @@ function mergeCorpusComponents(dkInst, own) {
 // an 11MB APK (vs ~40ms for permissionCallers), hence it rides along in the
 // same deferred pass rather than getting its own.
 function computeCaps(dkInst) {
-  const r = dkInst.summarizeCapabilities();
+  // appOnly=true mirrors upstream's default (dexllm#49): library/framework
+  // callers are dropped, and droppedTouches/droppedApis say what was removed.
+  const r = dkInst.summarizeCapabilities(true);
   // Normalise to plain JS up front: the embind val crosses into snapshotPanels
   // and the isolated-tab cache, both of which outlive the call, and apiHits
   // entries are re-sorted below.
   capReport = {
     categories: { ...r.categories },
     permissions: { ...r.permissions },
+    flags: { ...r.flags },
     catalogVersion: r.catalogVersion,
     catalogSize: r.catalogSize,
     matchedApis: r.matchedApis,
     totalCallSites: r.totalCallSites,
+    totalFieldAccesses: r.totalFieldAccesses,
+    droppedTouches: r.droppedTouches,
+    droppedApis: r.droppedApis,
+    shadowedTouches: r.shadowedTouches,
     apiHits: Array.from(r.apiHits, h => ({
       apiSignature: h.apiSignature,
       permissions: Array.from(h.permissions),
       categories: Array.from(h.categories),
+      flags: Array.from(h.flags),
       callSiteCount: h.callSiteCount,
+      fieldAccessCount: h.fieldAccessCount,
       callers: Array.from(h.callers),
     })),
   };
-  activeCapCats = new Set(Object.keys(capReport.categories));
+  // Flags are the orthogonal axis (IDENTIFIER); folding them into the category
+  // chips keeps them filterable without a second chip row.
+  activeCapCats = new Set([...Object.keys(capReport.categories), ...Object.keys(capReport.flags)]);
 }
 
 createDexllm({ locateFile: (f) => f + "?v=" + window.__DEXLLM_BUILD }).then(m => {
@@ -2699,14 +2710,17 @@ function permClipboardText() {
 // rather than the current view).
 function capClipboardText() {
   if (!capReport || !capReport.apiHits.length) return "";
+  const fieldBit = capReport.totalFieldAccesses ? `, ${capReport.totalFieldAccesses} field read${capReport.totalFieldAccesses === 1 ? "" : "s"}` : "";
   const lines = [
-    `# capabilities — catalog ${capReport.catalogVersion}, ${capReport.matchedApis}/${capReport.catalogSize} APIs matched, ${capReport.totalCallSites} call sites`,
+    `# capabilities — catalog ${capReport.catalogVersion}, ${capReport.matchedApis}/${capReport.catalogSize} APIs matched, ${capReport.totalCallSites} call sites${fieldBit} (app code only; ${capReport.droppedTouches} library touches dropped)`,
   ];
-  for (const [cat, n] of Object.entries(capReport.categories).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))) {
-    lines.push(`# ${cat}\t${n} invocations`);
+  for (const [cat, n] of [...Object.entries(capReport.categories), ...Object.entries(capReport.flags || {})]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))) {
+    lines.push(`# ${cat}\t${n} touches`);
   }
   for (const h of capReport.apiHits) {
-    lines.push([h.categories.join(","), h.apiSignature, h.callSiteCount,
+    lines.push([[...h.categories, ...(h.flags || [])].join(","), h.apiSignature,
+                h.callSiteCount + (h.fieldAccessCount || 0),
                 h.permissions.join(","), h.callers.join("; ")].join("\t"));
   }
   return lines.join("\n");
@@ -2850,7 +2864,18 @@ function renderIocPanel() {
       .sort((a, b) => a.value.localeCompare(b.value));
     if (!items.length) continue;
     const h = document.createElement("div"); h.className = "iocgrp cat-" + cat;
-    h.textContent = `${CAT_LABEL[cat] || cat} (${items.length})`; body.appendChild(h);
+    h.textContent = `${CAT_LABEL[cat] || cat} (${items.length})`;
+    if (cat === "providers") {
+      // Issue #33: this bucket matches LITERAL content:// strings in the dex. An
+      // app reaching SMS/contacts/… through a framework CONTENT_URI constant
+      // (a field read; the string lives in framework.jar) shows up under
+      // capabilities instead — an empty/short list here proves nothing.
+      h.textContent += " — literal content:// URIs only";
+      h.title = "Matches content:// strings present in the dex. Framework constants " +
+        "(e.g. Telephony.Sms.Inbox.CONTENT_URI) carry no literal URI in the APK — " +
+        "those are reported in the capabilities panel as field reads.";
+    }
+    body.appendChild(h);
     for (const it of items) {
       body.appendChild(makeNavRow(it.value, it.cat,
         it.classes.map(c => ({ display: c, cls: c, hint: { needle: it.value } })),
@@ -2891,12 +2916,14 @@ function renderPermLevels() {
 function renderCapCats() {
   const bar = $("#permlevels");
   bar.innerHTML = "";
-  const cats = Object.entries(capReport.categories)
+  // Both axes: categories (domain) + flags (orthogonal, e.g. IDENTIFIER). The
+  // vocabularies are disjoint, so one merged chip row is unambiguous.
+  const cats = [...Object.entries(capReport.categories), ...Object.entries(capReport.flags || {})]
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   for (const [cat, n] of cats) {
     const chip = document.createElement("span");
     chip.className = "permlvlchip" + (activeCapCats.has(cat) ? " on" : "");
-    chip.title = `${cat} — ${n} invocation${n === 1 ? "" : "s"} · click to toggle`;
+    chip.title = `${cat} — ${n} touch${n === 1 ? "" : "es"} · click to toggle`;
     chip.innerHTML = `<span class="dot" style="background:var(--brand)"></span>${escAttr(capLabel(cat))} <span class="lc">${n}</span>`;
     chip.onclick = () => {
       if (activeCapCats.has(cat)) activeCapCats.delete(cat); else activeCapCats.add(cat);
@@ -2937,7 +2964,7 @@ function renderCapPanel(panel, body) {
     const hay = (h.apiSignature + " " + h.permissions.join(" ")).toLowerCase();
     if (filt && !hay.includes(filt) && !h.callers.some(c => c.toLowerCase().includes(filt))) continue;
     let any = false;
-    for (const cat of h.categories) {
+    for (const cat of [...h.categories, ...(h.flags || [])]) {
       if (!activeCapCats.has(cat)) continue;
       if (!byCat.has(cat)) byCat.set(cat, []);
       byCat.get(cat).push(h);
@@ -2945,29 +2972,39 @@ function renderCapPanel(panel, body) {
     }
     if (any) shown++;
   }
-  $("#permhd2").innerHTML = `capabilities <span class="ipcount" title="catalog APIs shown · ${capReport.matchedApis} of ${capReport.catalogSize} matched (catalog ${capReport.catalogVersion}) · ${capReport.totalCallSites} call sites">${shown}</span>`;
+  const touchesOf = h => h.callSiteCount + (h.fieldAccessCount || 0);
+  const hdBits = [`${capReport.matchedApis} of ${capReport.catalogSize} matched (catalog ${capReport.catalogVersion})`,
+                  `${capReport.totalCallSites} call sites`];
+  if (capReport.totalFieldAccesses) hdBits.push(`${capReport.totalFieldAccesses} field read${capReport.totalFieldAccesses === 1 ? "" : "s"}`);
+  hdBits.push(`app code only — ${capReport.droppedTouches} library touches across ${capReport.droppedApis} APIs dropped`);
+  if (capReport.shadowedTouches) hdBits.push(`${capReport.shadowedTouches} shadowed (never executes under this load order)`);
+  $("#permhd2").innerHTML = `capabilities <span class="ipcount" title="catalog APIs shown · ${escAttr(hdBits.join(" · "))}">${shown}</span>`;
   if (!byCat.size) { const d = document.createElement("div"); d.className = "permsec"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); return; }
+  const tagCount = t => capReport.categories[t] ?? (capReport.flags || {})[t] ?? 0;
   const cats = [...byCat.keys()].sort((a, b) =>
-    (capReport.categories[b] || 0) - (capReport.categories[a] || 0) || a.localeCompare(b));
+    tagCount(b) - tagCount(a) || a.localeCompare(b));
   for (const cat of cats) {
     const hits = byCat.get(cat);
-    const sites = hits.reduce((n, h) => n + h.callSiteCount, 0);
+    const sites = hits.reduce((n, h) => n + touchesOf(h), 0);
     const ch = document.createElement("div"); ch.className = "permlvlhd";
     ch.style.color = "var(--brand)";
     ch.innerHTML = `<span class="dot" style="background:var(--brand)"></span>${escAttr(capLabel(cat))} · ${hits.length} api${hits.length === 1 ? "" : "s"} · ${sites} site${sites === 1 ? "" : "s"}`;
     body.appendChild(ch);
     for (const h of hits) {
-      // apiSignature is a Dalvik descriptor (Lcls;->name(proto)Ret), unlike the
-      // permissions view's dotted "cls#name(Types)" rows.
-      const name = methodNameOf(h.apiSignature);
-      const label = simpleName(descToJava(classOfMethod(h.apiSignature))) + "#" + name;
+      // apiSignature is a Dalvik METHOD descriptor (Lcls;->name(proto)Ret) or,
+      // since catalog 0.8, a FIELD descriptor (Lcls;->NAME:Ltype;) — a
+      // framework constant like Telephony$Sms$Inbox.CONTENT_URI (issue #33).
+      const isField = h.fieldAccessCount > 0;
+      const name = methodNameOf(h.apiSignature).split(":")[0];
+      const label = simpleName(descToJava(classOfMethod(h.apiSignature))) + (isField ? "." : "#") + name;
       const nav = makeNavRow(label, "perm", h.callers.slice().sort().map(c => ({
         display: c, cls: classOfMethod(c),
         hint: { needle: name, scope: methodNameOf(c) },
       })), "callers");
       body.appendChild(nav);
       const row = nav.querySelector(".iocitem");
-      if (row) row.title = `${h.apiSignature}\n${h.callSiteCount} call site${h.callSiteCount === 1 ? "" : "s"}` +
+      const n = touchesOf(h);
+      if (row) row.title = `${h.apiSignature}\n${n} ${isField ? "field read" : "call site"}${n === 1 ? "" : "s"}` +
         (h.permissions.length ? `\nrequires: ${h.permissions.join(", ")}` : "\nno permission required");
     }
   }

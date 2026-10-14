@@ -86,33 +86,58 @@ std::vector<std::pair<std::string, std::string>> DetectProvidersFromStrings(
 // ---------------------------------------------------------------------------
 // Capability summarisation (issue #13, Phase 2) — C++ port of
 // dexllm.capability.summarize_capabilities over the bundled API catalog
-// (gen/android_api_data.h), shared with the pybind + embind bindings.
+// (gen/android_api_data.h). Originally byte-faithful to c3ec1a1; re-synced to
+// the semantics of dexllm v0.25.0's capability.py for dexllm-web#33:
+// field-descriptor keys (dexllm#36), by_caller = API descriptors (dexllm#35),
+// app_only (dexllm#49), shadowed sites excluded from counts (dexllm#107).
 
-// One catalog API found in the APK.
+// One catalog API found in the APK. A catalog key is a METHOD descriptor
+// (`Lcls;->name(proto)ret`) or a FIELD descriptor (`Lcls;->NAME:Ltype;`);
+// a method key counts invoke instructions into call_site_count, a field key
+// counts read instructions into the separate field_access_count (dexllm#36).
+// Both count INSTRUCTIONS — the same unit — so summing them is meaningful;
+// they stay apart so call_site_count's released meaning is untouched.
 struct CapabilityApiHit {
     std::string api_signature;
     std::vector<std::string> permissions;  // catalog order (may be empty)
-    std::vector<std::string> categories;   // catalog order
-    int call_site_count = 0;               // total call sites (not distinct callers)
-    std::vector<std::string> callers;      // distinct caller descriptors, sorted
+    std::vector<std::string> categories;   // catalog order, deduped
+    std::vector<std::string> flags;        // orthogonal axis (e.g. IDENTIFIER)
+    int call_site_count = 0;               // invoke instructions; 0 for a field key
+    int field_access_count = 0;            // read instructions; 0 for a method key
+    std::vector<std::string> callers;      // distinct toucher descriptors, sorted
 };
 
 // Aggregated capability profile. Counts are sorted maps (order-insensitive vs the
 // Python Counter; deterministic for serialisation). api_hits is in catalog order.
+// The three counter maps count TOUCHES: one per invoke instruction for a method
+// entry, one per read instruction for a field entry.
 struct CapabilityReport {
-    std::map<std::string, int> permissions;  // permission -> #invocations
-    std::map<std::string, int> categories;   // category  -> #invocations
-    std::map<std::string, std::vector<std::string>> by_caller;  // caller -> sorted perms
+    std::map<std::string, int> permissions;  // permission -> #touches
+    std::map<std::string, int> categories;   // category   -> #touches
+    std::map<std::string, int> flags;        // flag       -> #touches
+    // caller -> sorted API descriptors it touches (dexllm#35 — descriptors, not
+    // permissions, so permission-less REFLECTION/CRYPTO/... entries register).
+    std::map<std::string, std::vector<std::string>> by_caller;
     std::vector<CapabilityApiHit> api_hits;
-    int total_call_sites = 0;
+    int total_call_sites = 0;      // invoke instructions, method entries only
+    int total_field_accesses = 0;  // read instructions, field entries only
     std::string catalog_version;
     int catalog_size = 0;
     int matched_apis = 0;
+    // What app_only REMOVED — 0 when it is false, so a filtered zero is
+    // distinguishable from "this APK exercises none of the catalog" (dexllm#49).
+    int dropped_touches = 0;  // same unit as total_call_sites + total_field_accesses
+    int dropped_apis = 0;     // catalog entries that left api_hits entirely
+    // Touches in a SHADOWED copy of their method (dexllm#107): the class resolves
+    // to another loaded dex, so the copy never executes. Applied before app_only.
+    int shadowed_touches = 0;
 };
 
-// Walk the bundled catalog, resolve each API's call sites (FindCallSitesToApi),
-// aggregate permissions / categories / by-caller. Mirrors summarize_capabilities
-// (without the only_categories filter). Deterministic (sorted maps + callers).
-CapabilityReport SummarizeCapabilities(DexKitExt& ext);
+// Walk the bundled catalog, resolve each key by shape (method -> call sites,
+// field -> read sites), aggregate permissions / categories / flags / by-caller.
+// Mirrors v0.25.0 summarize_capabilities (without the only_categories filter).
+// app_only (default true, like upstream) drops touches whose caller is bundled
+// framework / official-library code. Deterministic (sorted maps + callers).
+CapabilityReport SummarizeCapabilities(DexKitExt& ext, bool app_only = true);
 
 }  // namespace dexkit::ext

@@ -400,18 +400,22 @@ public:
 
     // Issue #13 (Phase 2): capability profile over the SHARED engine catalog
     // (dexkit::ext::SummarizeCapabilities / gen/android_api_data.h) — mirrors
-    // dexllm.capability.summarize_capabilities. Shape: { permissions:{p:n},
-    // categories:{c:n}, byCaller:{caller:[perms]}, apiHits:[{apiSignature,
-    // permissions[], categories[], callSiteCount, callers[]}], totalCallSites,
-    // catalogVersion, catalogSize, matchedApis }.
-    val summarizeCapabilities() {
+    // dexllm.capability.summarize_capabilities at v0.25.0 (dexllm-web#33).
+    // Shape: { permissions:{p:n}, categories:{c:n}, flags:{f:n},
+    // byCaller:{caller:[apiDescriptors]}, apiHits:[{apiSignature,
+    // permissions[], categories[], flags[], callSiteCount, fieldAccessCount,
+    // callers[]}], totalCallSites, totalFieldAccesses, catalogVersion,
+    // catalogSize, matchedApis, droppedTouches, droppedApis, shadowedTouches }.
+    // `appOnly` mirrors upstream's default-true filter; embind has no default
+    // arguments, so the JS caller must pass it explicitly.
+    val summarizeCapabilities(bool appOnly) {
         auto to_arr = [](const std::vector<std::string>& v) {
             val a = val::array();
             std::size_t k = 0;
             for (const auto& s : v) a.set(k++, s);
             return a;
         };
-        auto r = dexkit::ext::SummarizeCapabilities(ext_);
+        auto r = dexkit::ext::SummarizeCapabilities(ext_, appOnly);
         val out = val::object();
         val perms = val::object();
         for (const auto& [p, n] : r.permissions) perms.set(p, n);
@@ -419,8 +423,11 @@ public:
         val cats = val::object();
         for (const auto& [c, n] : r.categories) cats.set(c, n);
         out.set("categories", cats);
+        val flags = val::object();
+        for (const auto& [f, n] : r.flags) flags.set(f, n);
+        out.set("flags", flags);
         val byCaller = val::object();
-        for (const auto& [caller, ps] : r.by_caller) byCaller.set(caller, to_arr(ps));
+        for (const auto& [caller, apis] : r.by_caller) byCaller.set(caller, to_arr(apis));
         out.set("byCaller", byCaller);
         val hits = val::array();
         std::size_t hi = 0;
@@ -429,15 +436,21 @@ public:
             o.set("apiSignature", h.api_signature);
             o.set("permissions", to_arr(h.permissions));
             o.set("categories", to_arr(h.categories));
+            o.set("flags", to_arr(h.flags));
             o.set("callSiteCount", h.call_site_count);
+            o.set("fieldAccessCount", h.field_access_count);
             o.set("callers", to_arr(h.callers));
             hits.set(hi++, o);
         }
         out.set("apiHits", hits);
         out.set("totalCallSites", r.total_call_sites);
+        out.set("totalFieldAccesses", r.total_field_accesses);
         out.set("catalogVersion", r.catalog_version);
         out.set("catalogSize", r.catalog_size);
         out.set("matchedApis", r.matched_apis);
+        out.set("droppedTouches", r.dropped_touches);
+        out.set("droppedApis", r.dropped_apis);
+        out.set("shadowedTouches", r.shadowed_touches);
         return out;
     }
 

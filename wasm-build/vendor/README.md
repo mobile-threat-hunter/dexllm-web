@@ -36,6 +36,16 @@ Bodies are byte-faithful to `c3ec1a1`. The edits:
   the first-wins dedupe the batch needs into `DexKitExt` (dexllm#106), so this
   copy only had to change the call shape. Verified byte-identical against the
   pre-change build on two APKs (26 and 251 indicators).
+- `web_analysis.cpp` / the capability half of `web_analysis.h` are NO LONGER
+  byte-faithful: dexllm-web#33 re-synced them to the semantics of dexllm
+  v0.25.0's pure-Python `capability.py` (the deleted C++ copy never gained
+  these) — field-descriptor catalog keys resolved through the field-read xref
+  (dexllm#36), `by_caller` = API descriptors (dexllm#35), `app_only`
+  (dexllm#49), shadowed sites excluded from counts (dexllm#107).
+  `gen/android_api_data.h` is regenerated from upstream's
+  `android_api_map.json` 0.8 (281 entries, 13 field keys) by
+  `../gen_android_api_data.py`, replacing the dead `0.1-seed` catalog whose
+  3 field keys could never match.
 
 Everything stays in `namespace dexkit::ext`, so call sites in `wasm_module.cpp`
 are unchanged.
