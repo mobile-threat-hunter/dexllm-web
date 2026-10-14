@@ -202,15 +202,23 @@ routing stays consistent:
   IoC / permission panels are truly isolated with no first-wins aggregation
   ([`worker.js:212`](../worker.js#L212)).
 
-  **Component detection is the one exception**, and has to be. It walks *down*
+  **Component detection needs one extra step**, and has to. It walks *down*
   from each Android base through `findClassesBySuperclass`, so a single dex
   cannot see a chain that leaves it — and `MyActivity → AppCompatActivity`
-  across a multidex split is the norm, not a corner. Each isolated tab
-  therefore takes the aggregate's verdict for the classes it declares
-  (`mergeCorpusComponents`). Only the superclass walk is borrowed; nothing is
-  resolved from a sibling dex, so the mode keeps its meaning. A dex the
-  aggregate never saw — an Isolated-only `+ dex` extra — still gets only what
-  its own BFS can reach.
+  across a multidex split is the norm, not a corner. So each isolated tab runs
+  its own BFS, then `mergeCorpusComponents` uses the aggregate's answer purely
+  as a **candidate list**: for every candidate the tab declares, the verdict is
+  re-derived by walking *up* that class's own `class_def` chain
+  (`getClassSuperAndInterfaces`, one link at a time) and only leaving this dex
+  once the chain does. Candidates rather than a full sweep because each hop
+  costs a linear dex scan.
+
+  Re-deriving rather than copying is what keeps the mode honest. The aggregate
+  resolves a redeclared descriptor first-wins, so taking its verdict by
+  descriptor alone would let a runtime dump's resolved chain vouch for the
+  packed original's stub of the same descriptor — the one comparison Isolated
+  mode exists to make. A dex the aggregate never saw (an Isolated-only `+ dex`
+  extra) gets only what its own class_defs support, for the same reason.
 
 ---
 

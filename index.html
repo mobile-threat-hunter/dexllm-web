@@ -1035,6 +1035,7 @@ const COMPONENT_BASES = [
   { base: "Landroid/app/Service;",                                     kind: "service",        tag: "S",  color: "#3fc6d8" },
   { base: "Landroid/app/Activity;",                                    kind: "activity",       tag: "A",  color: "#6ba1ff" },
 ];
+const COMPONENT_BY_BASE = new Map(COMPONENT_BASES.map(e => [e.base, e]));
 let componentIndex = new Map();  // classDescriptor -> the winning COMPONENT_BASES entry
 let componentGroups = new Map(); // kind -> [classDescriptor, …]
 let activeCompKinds = new Set(); // kinds currently shown (all, once detected)
@@ -1440,29 +1441,60 @@ function computeComponents(dkInst) {
   activeCompKinds = new Set(componentGroups.keys());
 }
 
-// Fold the whole-corpus verdict for `own` into a single-dex result.
+// Walk UP from `desc` to decide which component base it descends from, reading
+// every link from whichever dex actually declares it: `dkInst` while the chain
+// is still inside this dex, the corpus once the chain leaves. Returns the
+// COMPONENT_BASES entry or null.
 //
-// The BFS above walks DOWN from each base through findClassesBySuperclass,
+// Reading the first link from THIS dex is the whole point. The corpus resolves
+// a redeclared class first-wins, so asking it directly would let a runtime
+// dump's chain vouch for the packed original's stub of the same descriptor —
+// the one comparison Isolated mode exists to make.
+function resolveChainEntry(dkInst, own, desc) {
+  let cur = desc;
+  for (let hops = 0; hops < 64; hops++) {     // bounded: a corrupt dex can cycle
+    if (!own.has(cur)) {
+      // Chain has left this dex; the corpus is the only thing that can see the
+      // rest of it, and its closure already answers for every ancestor.
+      return COMPONENT_BY_BASE.get(cur) || corpusComponentIndex.get(cur) || null;
+    }
+    let sup;
+    try { sup = dkInst.getClassSuperAndInterfaces(cur).super; } catch (_) { return null; }
+    if (!sup) return null;
+    const base = COMPONENT_BY_BASE.get(sup);
+    if (base) return base;
+    cur = sup;
+  }
+  return null;
+}
+
+// Extend a single-dex component result with the classes whose superclass chain
+// leaves the dex.
+//
+// computeComponents walks DOWN from each base through findClassesBySuperclass,
 // which only sees the dk it was handed. Given one isolated dex, a chain that
-// leaves that dex breaks and the subclass below the break is never reached —
-// and that is the common case, not a corner: an app's own activities extend
+// leaves that dex breaks and everything below the break is never reached — and
+// that is the common case, not a corner: an app's own activities extend
 // AppCompatActivity, which multidex routinely puts in a different dex. It cost
 // Telegram's LaunchActivity, BubbleActivity and BasePermissionsActivity their
 // badges on the very tab that declares them (5 of 107 components, all of them
 // app code rather than library noise).
 //
-// The aggregate dk resolves the chain the way ART does, so its verdict is the
-// honest one. Attributing it to the declaring dex borrows nothing but the
-// superclass walk, so Isolated mode keeps its point — no first-wins, no
-// sibling dex answering for this one. A dex the aggregate never saw (an
-// Isolated-only "+ dex" extra) simply finds nothing here and keeps its own
-// BFS result.
-function mergeCorpusComponents(own) {
+// The corpus index is used only as the CANDIDATE LIST — every verdict is then
+// re-derived from this dex's own class_defs by resolveChainEntry, so nothing is
+// attributed to a dex whose copy of the class doesn't actually descend from a
+// component. Candidates rather than a full sweep because the walk costs a
+// linear scan of the dex per hop and `own` can hold 12k classes; a component
+// the corpus misses because a stub copy won first-wins is still found by this
+// dex's own BFS, which this only ever adds to.
+function mergeCorpusComponents(dkInst, own) {
   if (!corpusComponentIndex.size) return;
+  const ownSet = own instanceof Set ? own : new Set(own);
   const added = new Map();
-  for (const desc of own) {
+  for (const desc of ownSet) {
     if (componentIndex.has(desc)) continue;
-    const entry = corpusComponentIndex.get(desc);
+    if (!corpusComponentIndex.has(desc)) continue;
+    const entry = resolveChainEntry(dkInst, ownSet, desc);
     if (!entry) continue;
     componentIndex.set(desc, entry);
     let list = added.get(entry.kind);
@@ -1986,8 +2018,10 @@ async function processCurrentDk(label, loadMs, opts) {
     console.error("component detection failed:", e);
     componentIndex = new Map(); componentGroups = new Map(); activeCompKinds = new Set();
   }
-  // Isolated tabs attribute this back per dex; see mergeCorpusComponents.
-  corpusComponentIndex = componentIndex;
+  // Isolated tabs read this per dex; see mergeCorpusComponents. Copied, not
+  // aliased: the merge mutates `componentIndex` in place, and the only thing
+  // keeping that off this map is computeComponents happening to rebind first.
+  corpusComponentIndex = new Map(componentIndex);
 
   permIndex = []; permTotals = null; capReport = null; permPending = true;
 
@@ -2092,7 +2126,14 @@ function renderModeToggle() {
 function disposeIsolated({ keepExtras = false } = {}) {
   for (const [did, iso] of [...isolated]) {
     const isExtra = typeof did === "string";
-    if (keepExtras && isExtra) continue;
+    if (keepExtras && isExtra) {
+      // The tab survives, but its component result was derived against the
+      // aggregate that is about to be replaced — the regular tabs recompute
+      // because they are disposed, and a surviving extra must not be the one
+      // tab still answering from the old corpus. The per-dex pass is ~12ms.
+      iso.comp = null;
+      continue;
+    }
     try { iso.dk.delete(); } catch (_) {}
     if (isExtra) { try { Module.FS.unlink(`/extra-${did}.dex`); } catch (_) {} }
     else         { try { Module.FS.unlink(`/iso-${did}.dex`);   } catch (_) {} }
@@ -2184,9 +2225,11 @@ function activateIsolatedTab(did) {
       componentIndex = new Map(); componentGroups = new Map(); activeCompKinds = new Set();
     }
     // This dex's own BFS misses any class whose superclass chain leaves the
-    // dex, so the corpus verdict is folded back in for the classes this dex
-    // declares.
-    mergeCorpusComponents(iso.classes);
+    // dex; the corpus supplies the candidates and this dex's own class_defs
+    // decide. Runs after the catch above on purpose — it is independent
+    // evidence from a different engine entry point, so a dex that breaks the
+    // findClassesBySuperclass sweep can still get a partial, validated answer.
+    mergeCorpusComponents(iso.dk, iso.classes);
     iso.comp = { componentIndex, componentGroups, activeCompKinds };
   }
   componentIndex = iso.comp.componentIndex;
