@@ -103,6 +103,30 @@ try {
       xr.callSites.every(s => typeof s.offset === "number"), "total=" + xr.total);
   } else check("callers_of_method shape", false, "no method hit");
 
+  // java-form query bridges to smali descriptors
+  const jf = parse(await client.callTool({
+    name: "search_symbols", arguments: { query: "a2dp.Vol.AppChooser.onCreate", kind: "method", limit: 5 },
+  }));
+  check("search_symbols java-form query", Array.isArray(jf.results) && jf.results.some(r =>
+    (typeof r === "string" ? r : r.desc).startsWith("La2dp/Vol/AppChooser;->onCreate")),
+    JSON.stringify(jf.results));
+
+  // bare `->` query still reaches smali descriptors (candidates are normalized)
+  const bq = parse(await client.callTool({
+    name: "search_symbols", arguments: { query: "AppChooser->onCreate", kind: "method", limit: 5 },
+  }));
+  check("search_symbols bare-arrow query", Array.isArray(bq.results) && bq.results.length > 0,
+    "count=" + bq.count);
+
+  // string search stays literal: "://" must hit real URLs, and its normalized
+  // form (":.") must not be what matched
+  const sl = parse(await client.callTool({
+    name: "search_symbols", arguments: { query: "://", kind: "string", limit: 5 },
+  }));
+  check("string search stays literal", Array.isArray(sl.results) &&
+    sl.results.length > 0 && sl.results.every(s => s.includes("://")),
+    "count=" + sl.count);
+
   // accessors_of_field + references_to_type shapes
   const fsr = parse(await client.callTool({
     name: "search_symbols", arguments: { query: "La2dp/", kind: "field", limit: 1 },

@@ -172,6 +172,8 @@ server.registerTool("decompile_class", {
 server.registerTool("search_symbols", {
   description: "Substring search (case-insensitive) over one symbol kind: class " +
     "descriptors, method descriptors, field descriptors, or string literals. " +
+    "For symbol kinds the query may use java form (a.b.C.member) or smali form " +
+    "(La/b/C;->member) interchangeably; string queries match literally. " +
     "When renames are loaded, matches against BOTH original and display names.",
   inputSchema: {
     query: z.string().min(1),
@@ -181,16 +183,24 @@ server.registerTool("search_symbols", {
 }, wrap(async ({ query, kind, limit = 200 }) => {
   requireDk();
   const q = query.toLowerCase();
+  // Java/smali bridge (mirrors index.html's palette scorer): `/`, `$`, and
+  // `;->` (also a bare `->` in the query) all normalize to `.` on both sides
+  // for symbol kinds; strings stay literal ("a/b" must not hit "a.b").
+  const normSep = (s) => s.replace(/;?->/g, ".").replace(/[/$]/g, ".");
+  const qn = normSep(q);
+  const matches = kind === "string"
+    ? (s) => s.toLowerCase().includes(q)
+    : (s) => normSep(s.toLowerCase()).includes(qn);
   const corpus = symbolCorpus(kind);
   const mapped = kind !== "string" && renameCount() > 0;
   const results = [];
   let truncated = false;
   for (const s of corpus) {
-    let hit = s.toLowerCase().includes(q);
+    let hit = matches(s);
     let d = null;
     if (!hit && mapped) {
       d = displayDesc(s);
-      hit = d !== s && d.toLowerCase().includes(q);
+      hit = d !== s && matches(d);
     }
     if (!hit) continue;
     if (results.length >= limit) { truncated = true; break; }
