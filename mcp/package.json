@@ -1,0 +1,11 @@
+{
+  "name": "dexllm-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "stdio MCP server exposing dexllm-web's wasm dex analysis engine",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "zod": "^3.25.0"
+  }
+}
