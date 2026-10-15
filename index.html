@@ -828,6 +828,51 @@ window.__DEXLLM_BUILD = "db51c67-2";
   .callerpop-empty {
     padding:10px 14px; color:var(--fg-3); font:12px var(--f-ui);
   }
+
+  /* Rename UX — header "renames" button, the right-click rename input popup,
+     and the mapping manager popup. Popup chrome mirrors #callerpop. */
+  #renamesBtn {
+    display:none; margin-left:10px; padding:4px 10px; cursor:pointer;
+    font:600 10.5px var(--f-ui); letter-spacing:.05em; text-transform:uppercase;
+    color:var(--fg-2); border:1px solid var(--line-3); border-radius:6px;
+    background:transparent; white-space:nowrap;
+  }
+  #renamesBtn.off { color:var(--fg-3); }
+  #renamesBtn:hover { color:var(--fg); border-color:var(--brand); }
+  #renamepop, #renamespop {
+    position:fixed; display:none; z-index:60; max-width:480px; max-height:360px;
+    overflow:auto;
+    background:linear-gradient(180deg, var(--bg-3) 0%, var(--bg-2) 100%);
+    border-radius:10px;
+    box-shadow:
+      inset 0 0 0 1px var(--line-3),
+      0 12px 40px rgba(0,0,0,0.7),
+      0 0 0 1px rgba(107,161,255,0.10);
+    font:12px/1.5 var(--f-mono);
+  }
+  #renamepop.show, #renamespop.show { display:block; }
+  #renamepop { padding:10px 12px; min-width:280px; }
+  #renamepop .rn-what {
+    color:var(--fg-3); font:10.5px var(--f-ui); text-transform:uppercase;
+    letter-spacing:.05em; margin-bottom:6px; word-break:break-all;
+  }
+  #renamepop input {
+    width:100%; box-sizing:border-box; padding:5px 8px;
+    background:var(--bg-2); color:var(--fg); border:1px solid var(--line-3);
+    border-radius:6px; font:12px var(--f-mono); outline:none;
+  }
+  #renamepop input:focus { border-color:var(--brand); }
+  #renamepop .rn-err { color:var(--warn); font:11px var(--f-ui); margin-top:5px; min-height:14px; }
+  #renamespop { min-width:340px; }
+  .rn-act { margin-left:10px; cursor:pointer; color:var(--fg-3); text-transform:none; letter-spacing:0; }
+  .rn-act:hover { color:var(--fg); }
+  .rn-row { display:flex; gap:8px; align-items:baseline; padding:4px 14px; color:var(--fg-2); }
+  .rn-row:hover { background:rgba(255,255,255,0.04); }
+  .rn-row .rn-kind { color:var(--fg-3); font:10px var(--f-ui); width:14px; flex:none; }
+  .rn-row .rn-map { flex:1; word-break:break-all; cursor:pointer; }
+  .rn-row .rn-map:hover { color:var(--fg); }
+  .rn-row .rn-del { cursor:pointer; color:var(--fg-3); flex:none; }
+  .rn-row .rn-del:hover { color:var(--warn); }
   .placeholder {
     color:var(--fg-3); padding:40px;
     font:13px/1.6 var(--f-ui); letter-spacing:0.01em;
@@ -900,6 +945,8 @@ window.__DEXLLM_BUILD = "db51c67-2";
     </button>
   </div>
   <span class="sub">in-browser DEX / APK decompiler · runs entirely on your device (WASM)</span>
+  <button id="renamesBtn" type="button"
+    title="Rename mappings for this APK — view, export, import, clear. Right-click an identifier in the code view to rename it.">renames</button>
   <div id="status">loading engine…</div>
 </header>
 
@@ -937,6 +984,23 @@ window.__DEXLLM_BUILD = "db51c67-2";
 <div id="callerpop" role="dialog" aria-label="method callers">
   <div class="callerpop-head">callers of <b id="callerpop-method"></b></div>
   <div id="callerpop-body"></div>
+</div>
+
+<!-- Rename input popup (right-click on an identifier) and the rename manager
+     (header "renames" button). Both close on Escape / outside click. -->
+<div id="renamepop" role="dialog" aria-label="rename symbol">
+  <div class="rn-what" id="renameWhat"></div>
+  <input id="renameInput" autocomplete="off" spellcheck="false">
+  <div class="rn-err" id="renameErr"></div>
+</div>
+<div id="renamespop" role="dialog" aria-label="rename manager">
+  <div class="callerpop-head">renames
+    <span class="rn-act" id="rnExport" title="Download the mappings as JSON">export</span>
+    <span class="rn-act" id="rnImport" title="Merge mappings from a JSON file">import</span>
+    <span class="rn-act" id="rnClear" title="Remove ALL renames for this APK">clear</span>
+  </div>
+  <div id="renamespop-body"></div>
+  <input id="rnImportFile" type="file" accept=".json,application/json" style="display:none">
 </div>
 
 <main id="main">
@@ -1309,6 +1373,257 @@ async function scanIocsAsync(gen) {
 // gone. These small descriptor helpers remain (used by the xref / nav code).
 const descToJava = d => (d.startsWith("L") && d.endsWith(";")) ? d.slice(1, -1).replace(/\//g, ".") : d;
 const classOfMethod = md => md.split("->")[0];   // "Lcls;->m()V" -> "Lcls;"
+const escRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// ── user renames (display-level) ─────────────────────────────────────────────
+// Analyst-assigned names for obfuscated classes / methods / fields. This is a
+// DISPLAY mapping only: every engine query keeps using original descriptors.
+// applyRenames() substitutes into the decompiled text BEFORE renderCode so the
+// DOM and codeLineCache stay byte-identical — click resolution does raw
+// column math on codeLineCache, so the two must never diverge. Substitution
+// never inserts newlines (names are validated single identifiers), so line
+// indexes survive a rename round-trip.
+//
+// Store keys:
+//   classes: "La/b/C;"       -> "NewSimple"     (simple name only; pkg kept)
+//   methods: "La/b/C;->name" -> "newName"       (no proto — overloads rename
+//   fields:  "La/b/C;->name" -> "newName"        together, display-level can't
+//                                                 tell overloads apart anyway)
+// Persisted per-APK under localStorage["dexllm-renames:<sha256hex>"].
+let renameStore = { key: null, classes: new Map(), methods: new Map(), fields: new Map() };
+let rawCodeCache = "";                    // current class's pre-substitution decompile text
+let _dottedDisplayToDesc = new Map();     // "a.b.New"  -> "La/b/C;"
+let _simpleDisplayToDesc = new Map();     // "New"      -> ["La/b/C;", ...] (may collide)
+
+// A rename must stay ONE identifier token: WORD_CH-compatible, no '-', no
+// whitespace (preserves the single-line and column-math invariants).
+const RENAME_OK = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const renameCount = () =>
+  renameStore.classes.size + renameStore.methods.size + renameStore.fields.size;
+
+// "La/b/C$I;" -> "La/b/D$J;" — descriptor with every segment's rename applied
+// (outer-class renames propagate into inner-class descriptors).
+function displayClassDesc(desc) {
+  if (!renameStore.classes.size || !desc.startsWith("L") || !desc.endsWith(";")) return desc;
+  const body = desc.slice(1, -1);
+  const slash = body.lastIndexOf("/");
+  const prefix = body.slice(0, slash + 1);
+  let acc = "";
+  const segs = body.slice(slash + 1).split("$").map(s => {
+    acc = acc ? acc + "$" + s : s;
+    return renameStore.classes.get("L" + prefix + acc + ";") || s;
+  });
+  return "L" + prefix + segs.join("$") + ";";
+}
+function displayDotted(desc)      { return descToJava(displayClassDesc(desc)); }
+function displayBare(desc) {       // "C$I" part with renames, no package
+  const b = displayClassDesc(desc).slice(1, -1);
+  return b.slice(b.lastIndexOf("/") + 1);
+}
+function displayClassSimple(desc) {    // innermost segment only (tree label)
+  const rn = renameStore.classes.get(desc);
+  if (rn) return rn;
+  return displayBare(desc).split("$").pop();
+}
+function displayMember(cls, kind, name) {
+  const m = kind === "f" ? renameStore.fields : renameStore.methods;
+  return m.get(cls + "->" + name) || name;
+}
+// Reverse: displayed member name -> original (null if not a rename). Linear
+// scan — rename maps hold tens of entries, and this only runs per click.
+function origMember(cls, kind, displayName) {
+  const m = kind === "f" ? renameStore.fields : renameStore.methods;
+  const pre = cls + "->";
+  for (const [k, v] of m) {
+    if (v === displayName && k.startsWith(pre)) return k.slice(pre.length);
+  }
+  return null;
+}
+// Reverse: displayed dotted FQN -> original descriptor. Falls back to a
+// '$'-prefix walk so UNRENAMED inners shown under a renamed outer
+// ("a.b.D$1") still resolve to their original descriptor ("La/b/C$1;").
+function origDottedToDesc(dotted) {
+  const hit = _dottedDisplayToDesc.get(dotted);
+  if (hit) return hit;
+  let i = dotted.length;
+  while ((i = dotted.lastIndexOf("$", i - 1)) > 0) {
+    const pre = _dottedDisplayToDesc.get(dotted.slice(0, i));
+    if (pre) return pre.slice(0, -1) + dotted.slice(i) + ";";
+  }
+  return null;
+}
+function origClassesOfSimple(simple) { return _simpleDisplayToDesc.get(simple) || []; }
+
+// Full method/field descriptor -> display string for popup rows. Keeps the
+// descriptor shape so rows stay copy-recognisable; the original descriptor
+// always rides in the row's title tooltip.
+function displayDesc(desc) {
+  if (!renameCount()) return desc;
+  const a = desc.indexOf("->");
+  if (a < 0) return displayClassDesc(desc);
+  const cls = desc.slice(0, a);
+  let rest = desc.slice(a + 2);
+  const p = rest.indexOf("("), c = rest.indexOf(":");
+  if (p >= 0 && (c < 0 || p < c)) {
+    rest = displayMember(cls, "m", rest.slice(0, p)) + renameDescTypes(rest.slice(p));
+  } else if (c >= 0) {
+    rest = displayMember(cls, "f", rest.slice(0, c)) + renameDescTypes(rest.slice(c));
+  } else {
+    rest = displayMember(cls, "m", rest);
+  }
+  return displayClassDesc(cls) + "->" + rest;
+}
+// Substitute renamed class descriptors inside a proto / field-type tail.
+function renameDescTypes(s) {
+  for (const desc of renameStore.classes.keys()) {
+    if (!s.includes(desc)) continue;
+    s = s.split(desc).join(displayClassDesc(desc));
+  }
+  return s;
+}
+
+function rebuildRenameMaps() {
+  _dottedDisplayToDesc = new Map();
+  _simpleDisplayToDesc = new Map();
+  for (const [desc, nn] of renameStore.classes) {
+    _dottedDisplayToDesc.set(displayDotted(desc), desc);
+    const arr = _simpleDisplayToDesc.get(nn) || [];
+    arr.push(desc);
+    _simpleDisplayToDesc.set(nn, arr);
+  }
+}
+
+function updateRenameBtn() {
+  const b = $("#renamesBtn");
+  if (!b) return;
+  const n = renameCount();
+  b.textContent = "renames" + (n ? ` (${n})` : "");
+  b.classList.toggle("off", !n);
+  // Only meaningful once a file is loaded (key is set after the SHA lands).
+  b.style.display = renameStore.key ? "inline-block" : "none";
+}
+
+function saveRenames() {
+  rebuildRenameMaps();
+  updateRenameBtn();
+  if (!renameStore.key) return;
+  try {
+    if (!renameCount()) { localStorage.removeItem(renameStore.key); return; }
+    localStorage.setItem(renameStore.key, JSON.stringify({
+      classes: Object.fromEntries(renameStore.classes),
+      methods: Object.fromEntries(renameStore.methods),
+      fields:  Object.fromEntries(renameStore.fields),
+    }));
+  } catch (_) {}   // quota/private-mode failures lose persistence, not the session
+}
+function loadRenames(key) {
+  renameStore = { key, classes: new Map(), methods: new Map(), fields: new Map() };
+  if (key) {
+    try {
+      const o = JSON.parse(localStorage.getItem(key) || "null");
+      if (o) {
+        for (const [k, v] of Object.entries(o.classes || {})) renameStore.classes.set(k, v);
+        for (const [k, v] of Object.entries(o.methods || {})) renameStore.methods.set(k, v);
+        for (const [k, v] of Object.entries(o.fields  || {})) renameStore.fields.set(k, v);
+      }
+    } catch (_) {}
+  }
+  rebuildRenameMaps();
+  updateRenameBtn();
+}
+
+// ── applyRenames: substitute display names into decompiled text ──────────────
+// Tiers (member tiers run FIRST — they match against the original own-class
+// FQN, which the class tiers are about to rewrite):
+//   M1  method decl / unqualified `name(`      (own class view only)
+//   M2  `this.name(` / `OwnFQN.name(`          (own class view only)
+//   F1  field decl `name;` / `name =`          (own class view only)
+//   F2  `this.name` / `OwnFQN.name`            (own class view only)
+//   C1  exact dotted FQN of every renamed class (corpus-wide; longest first)
+//   C2  renamed-outer prefix before '$' (inner-class propagation)
+//   C3  bare own simple name (class header / constructor lines)
+// String literals are NEVER substituted — string-xref and the IoC pipeline
+// depend on literal integrity — so tiers run per non-string segment.
+const _STR_SEG_RE = /"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'/g;
+function applyRenames(text, cls) {
+  if (!renameCount()) return text;
+  const subs = [];
+  const push = (re, map) => subs.push([re, (m, g) => map.get(g)]);
+
+  // member tiers (own class only)
+  const ownDotted = descToJava(cls);
+  const mMap = new Map(), fMap = new Map();
+  for (const [k, v] of renameStore.methods) {
+    if (k.startsWith(cls + "->")) mMap.set(k.slice(cls.length + 2), v);
+  }
+  for (const [k, v] of renameStore.fields) {
+    if (k.startsWith(cls + "->")) fMap.set(k.slice(cls.length + 2), v);
+  }
+  if (mMap.size) {
+    const alt = "(" + [...mMap.keys()].map(escRe).join("|") + ")";
+    // Unqualified `name(` is only ever a declaration in DAD output (calls are
+    // always receiver-qualified); '@' excluded so annotations survive.
+    push(new RegExp("(?<![\\w$.@])" + alt + "(?=\\s*\\()", "g"), mMap);
+    push(new RegExp("(?<=(?:this|" + escRe(ownDotted) + ")\\.)" + alt + "(?=\\s*\\()", "g"), mMap);
+  }
+  if (fMap.size) {
+    const alt = "(" + [...fMap.keys()].map(escRe).join("|") + ")";
+    // Unqualified bare name = declaration. Excluding a following '.' keeps
+    // single-letter package segments ("a.b.C") out of a field tier's reach.
+    push(new RegExp("(?<![\\w$.@])" + alt + "(?![\\w$.]|\\s*\\()", "g"), fMap);
+    push(new RegExp("(?<=(?:this|" + escRe(ownDotted) + ")\\.)" + alt + "(?![\\w$(])", "g"), fMap);
+  }
+
+  // class tiers (corpus-wide)
+  const cMap = new Map();
+  for (const desc of renameStore.classes.keys()) {
+    const from = descToJava(desc), to = displayDotted(desc);
+    if (from !== to) cMap.set(from, to);
+  }
+  if (cMap.size) {
+    const alt = "(" + [...cMap.keys()].sort((a, b) => b.length - a.length).map(escRe).join("|") + ")";
+    push(new RegExp("(?<![\\w$.])" + alt + "(?![\\w$])", "g"), cMap);   // C1 exact
+    push(new RegExp("(?<![\\w$.])" + alt + "(?=\\$)", "g"), cMap);      // C2 inner propagation
+  }
+  // C3: bare own simple name (header "class C", ctor "C(") — only in own view.
+  {
+    const bare = cls.slice(1, -1).slice(cls.slice(1, -1).lastIndexOf("/") + 1);
+    const bareTo = displayBare(cls);
+    if (bare !== bareTo) {
+      const map = new Map([[bare, bareTo]]);
+      push(new RegExp("(?<![\\w$.])(" + escRe(bare) + ")(?![\\w$.])", "g"), map);
+    }
+  }
+  if (!subs.length) return text;
+
+  // Run all tiers on every non-string segment.
+  const run = (seg) => {
+    for (const [re, fn] of subs) seg = seg.replace(re, fn);
+    return seg;
+  };
+  const out = [];
+  let last = 0, m;
+  _STR_SEG_RE.lastIndex = 0;
+  while ((m = _STR_SEG_RE.exec(text))) {
+    out.push(run(text.slice(last, m.index)), m[0]);
+    last = _STR_SEG_RE.lastIndex;
+  }
+  out.push(run(text.slice(last)));
+  return out.join("");
+}
+
+// Re-render the open class from its cached raw text (rename commit / import).
+function rerenderCurrentClass() {
+  if (!currentClass || !rawCodeCache) return;
+  // The viewer header shows the display FQN — a rename of the OPEN class (or
+  // of a member/outer feeding its descriptor) must refresh it too.
+  $("#vname").textContent = displayClassDesc(currentClass);
+  $("#vname").title = currentClass;
+  const code = $("#code");
+  const st = code.scrollTop;
+  renderCode(applyRenames(rawCodeCache, currentClass));
+  code.scrollTop = st;
+}
 
 
 // ── signature normalisation (mirror of dangerous_api.py) ────────────────────
@@ -1784,6 +2099,19 @@ async function loadFile(file) {
   if (dk) { try { dk.delete(); } catch (_) {} dk = null; }
   clearSymbolIndex();
   _smaliBumpDk();
+  // Renames are keyed to the loaded file's bytes. Reset immediately (so the
+  // previous APK's names can't bleed into this one), then restore this APK's
+  // saved map once the async hash lands — the tree may already be on screen
+  // by then, so re-render if anything was restored.
+  loadRenames(null);
+  crypto.subtle.digest("SHA-256", buf).then(h => {
+    const hex = [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("");
+    loadRenames("dexllm-renames:" + hex);
+    if (renameCount()) {
+      if (dk) renderList($("#search").value || "");
+      rerenderCurrentClass();
+    }
+  }).catch(() => {});
 
   let t0 = performance.now();
   try {
@@ -1893,6 +2221,7 @@ async function addDumpedDex(file) {
     rebuildDk();
     return;
   }
+  clearSymbolIndex();
   const loadMs = (performance.now() - t0).toFixed(0);
   // Aggregate dk just got rebuilt with the new dump → the regular per-dex
   // Isolated entries we may have built (keyed by global dex_id) are now
@@ -2245,8 +2574,8 @@ function activateIsolatedTab(did) {
   const key = did;
   const iso = isolated.get(key);
   if (!iso) return;
-  // Switching the active iso dk → D-3 cache becomes invalid.
-  if (selectedDex !== key) _smaliBumpDk();
+  // Switching the active iso dk → D-3 cache and symbol index become invalid.
+  if (selectedDex !== key) { _smaliBumpDk(); clearSymbolIndex(); }
 
   // Lazy class list — same set as dexClasses.get(did), but read from the iso
   // dk for symmetry.
@@ -2361,8 +2690,9 @@ function setMode(newMode) {
   if (viewMode === newMode) return;
   // Active dexkit identity is about to change — bump D-3 cache token so a
   // methodDesc cached under the previous dk's render gets evicted before
-  // returning stale smali.
+  // returning stale smali. Same for the symbol-search index.
   _smaliBumpDk();
+  clearSymbolIndex();
   if (viewMode === "runtime") runtimePanelSnap = snapshotPanels();
   viewMode = newMode;
   if (viewMode === "isolated") {
@@ -2524,7 +2854,9 @@ function buildTree(classes) {
       if (!c) { c = { seg, children:new Map(), classes:[], count:0 }; node.children.set(seg, c); }
       node = c;
     }
-    node.classes.push({ desc, label:name });
+    // Tree label shows the display (possibly renamed) simple name; the
+    // original descriptor stays in the row's title via makeClassRow.
+    node.classes.push({ desc, label: renameStore.classes.size ? displayBare(desc) : name });
   }
   (function count(n){
     let t = n.classes.length;
@@ -2661,7 +2993,10 @@ function renderList(filter) {
       if (Number.isFinite(did)) pool = dexClasses.get(did) || [];
     }
   }
-  const items = f ? pool.filter(c => c.toLowerCase().includes(f)) : pool;
+  // Filter matches the original descriptor AND the display (renamed) form.
+  const hasRn = renameStore.classes.size > 0;
+  const items = f ? pool.filter(c => c.toLowerCase().includes(f) ||
+    (hasRn && displayClassDesc(c).toLowerCase().includes(f))) : pool;
   const scopeLabel = selectedDex === "all"
     ? `${allClasses.length} classes`
     : (() => {
@@ -3348,7 +3683,9 @@ function receiverClassOf(line, name, lineIdx) {
   // Class-qualified call: last segment uppercase OR multi-segment dotted path
   // whose last segment is uppercase.
   const lastSeg = path.split(".").pop();
-  if (/^[A-Z]/.test(lastSeg)) return "L" + path.replace(/\./g, "/") + ";";
+  // The on-screen path may be a RENAMED dotted name — map it back to the
+  // engine's descriptor first; naive dot→slash conversion only as fallback.
+  if (/^[A-Z]/.test(lastSeg)) return origDottedToDesc(path) || "L" + path.replace(/\./g, "/") + ";";
   // Variable receiver (`builder.build()`) — its declared type would need a
   // reverse scan. The smali path (invoke-*) already resolves these exactly
   // whenever the call is in bytecode, so this fallback is only reached for
@@ -3459,12 +3796,13 @@ function resolveTransitiveCallers(useDk, descriptors, opts = {}) {
 // `<init>(` (which never appears in DAD source output).
 function showCallersFor(cls, name, anchor) {
   const isCtor = name === "<init>";
-  const simpleCls = isCtor
-    ? (cls.match(/\/([A-Za-z_$][\w$]*);$/) || ["", ""])[1]
-    : null;
+  // The ctor needle is the class's DISPLAY simple name: after a class rename
+  // the caller's text shows `new a.b.D(`, not the original name.
+  const simpleCls = isCtor ? displayBare(cls) : null;
   const pop = $("#callerpop");
   detachCallTreeToggle(pop);
-  $("#callerpop-method").textContent = isCtor ? (simpleCls + " — new sites") : name;
+  $("#callerpop-method").textContent =
+    isCtor ? (simpleCls + " — new sites") : displayMember(cls, "m", name);
   const body = $("#callerpop-body");
   body.innerHTML = '<div class="callerpop-empty">searching…</div>';
   pop.classList.add("show");
@@ -3524,7 +3862,7 @@ function showCallersFor(cls, name, anchor) {
         const item = document.createElement("div");
         item.className = "callerpop-item";
         const chainNote = c.chain.length
-          ? `<span style="color:var(--fg-3);font:11px var(--f-ui);margin-left:6px">via ${c.chain.map(methodOfDescriptor).join(" → ")}</span>`
+          ? `<span style="color:var(--fg-3);font:11px var(--f-ui);margin-left:6px">via ${c.chain.map(d => displayMember(classOfMethod(d), "m", methodOfDescriptor(d))).join(" → ")}</span>`
           : "";
         // Occurrence suffix: only shown when the caller has >1 invocations of
         // the target. Offset is the dex bytecode address (smali "0x12") —
@@ -3534,21 +3872,25 @@ function showCallersFor(cls, name, anchor) {
           : "";
         const callerCls = c.desc.split("->")[0];
         const ext = isExternalClass(useDk, callerCls) ? externalBadgeHtml() : "";
-        item.innerHTML = ext + escAttr(c.desc) + chainNote + occNote;
+        item.innerHTML = ext + escAttr(displayDesc(c.desc)) + chainNote + occNote;
         item.title = (c.chain.length ? `${c.desc}\nreached via accessor chain: ${c.chain.join(" → ")}` : c.desc)
                    + (c.totalOcc > 1 ? `\noccurrence ${c.occurrence} of ${c.totalOcc} (bytecode offset 0x${c.offset.toString(16)})` : "");
         const callerMethod = methodOfDescriptor(c.desc);
         item.onclick = () => {
           pop.classList.remove("show");
+          // The call site shows the target's DISPLAY name only when the
+          // caller IS the owning class (this.name / unqualified); foreign
+          // call sites keep the original text.
           const needle = c.chain.length
             ? methodOfDescriptor(c.chain[0])
-            : (isCtor ? simpleCls : name);
+            : (isCtor ? simpleCls : (callerCls === cls ? displayMember(cls, "m", name) : name));
           // occurrence: skip the first (occurrence-1) matches so the glow
           // lands on the right `needle(` instance in the caller's body.
           // scopeProto = the caller method's signature so an overloaded caller
           // (get(Context) vs get(ISP,Context)) scopes to the RIGHT overload.
           const callerProto = c.desc.slice(c.desc.indexOf("("), c.desc.lastIndexOf(")") + 1);
-          navigateToClass(callerCls, { needle, scope: callerMethod, scopeProto: callerProto, occurrence: c.occurrence });
+          // Scope = the caller's own header text, which shows ITS display name.
+          navigateToClass(callerCls, { needle, scope: displayMember(callerCls, "m", callerMethod), scopeProto: callerProto, occurrence: c.occurrence });
         };
         body.appendChild(item);
       }
@@ -3597,7 +3939,7 @@ function isFieldDeclLine(line, name) {
 // the field name so locateAndGlow highlights the access site.
 function showFieldXrefFor(cls, fieldName, anchor) {
   const pop = $("#callerpop");
-  $("#callerpop-method").textContent = fieldName + " — field xref";
+  $("#callerpop-method").textContent = displayMember(cls, "f", fieldName) + " — field xref";
   const body = $("#callerpop-body");
   body.innerHTML = '<div class="callerpop-empty">searching…</div>';
   pop.classList.add("show");
@@ -3628,7 +3970,8 @@ function showFieldXrefFor(cls, fieldName, anchor) {
       if (fieldDescs.length > 1) {
         const head = document.createElement("div");
         head.style.cssText = "padding:4px 10px;color:var(--fg-3);font:11px var(--f-ui);border-bottom:1px solid var(--bd-1)";
-        head.textContent = fd;
+        head.textContent = displayDesc(fd);
+        head.title = fd;
         body.appendChild(head);
       }
       const getters = [], setters = [];
@@ -3670,7 +4013,7 @@ function showFieldXrefFor(cls, fieldName, anchor) {
           const occurrence = (occ[desc] = (occ[desc] || 0) + 1);
           const dupTag = list.filter(d => d === desc).length > 1
             ? ` <span style="color:var(--fg-3);font-size:10px">#${occurrence}</span>` : "";
-          item.innerHTML = ext + escAttr(desc) + dupTag;
+          item.innerHTML = ext + escAttr(displayDesc(desc)) + dupTag;
           item.title = desc;
           // Signature-precise scope so an overloaded reader/writer — or one
           // whose name collides with a `.get(`-style call earlier in the class
@@ -3678,10 +4021,18 @@ function showFieldXrefFor(cls, fieldName, anchor) {
           // in Java, so map <init> to the simple class name; scopeProto then
           // disambiguates overloaded ctors.
           const scopeProto = desc.slice(desc.indexOf("("), desc.lastIndexOf(")") + 1);
-          const scope = targetMethod === "<init>" ? clsSimple(targetCls) : targetMethod;
+          // Display simple name: a renamed target class renders its ctor
+          // header with the NEW bare name (C3 tier), so the scope hint must
+          // match the displayed text, not the engine's original simple name.
+          const scope = targetMethod === "<init>"
+            ? displayBare(targetCls) : displayMember(targetCls, "m", targetMethod);
+          // The access site shows the field's DISPLAY name only inside the
+          // owning class's own view (this.x / unqualified); foreign readers
+          // keep the original text.
+          const needleName = targetCls === cls ? displayMember(cls, "f", fieldName) : fieldName;
           item.onclick = () => {
             pop.classList.remove("show");
-            navigateToClass(targetCls, { needle: fieldName, scope, scopeProto, occurrence });
+            navigateToClass(targetCls, { needle: needleName, scope, scopeProto, occurrence });
           };
           body.appendChild(item);
         }
@@ -3743,7 +4094,8 @@ function narrowFieldsByReceiver(accesses, line, fieldName, currentCls) {
   }
   if (recv === "this") return accesses.filter(a => a.descriptor.startsWith(currentCls + "->"));
   if (/^[A-Z]/.test(recv.split(".").pop())) {
-    const cls = "L" + recv.replace(/\./g, "/") + ";";
+    // On-screen receiver may be a renamed dotted class — reverse-map first.
+    const cls = origDottedToDesc(recv) || "L" + recv.replace(/\./g, "/") + ";";
     return accesses.filter(a => a.descriptor.startsWith(cls + "->"));
   }
   return [];
@@ -3790,8 +4142,8 @@ function navigateToFieldDeclFromUsage(currentCls, lineIdx, fieldName, anchor) {
     const targetCls = fd.split("->")[0];
     // Glow the declaration line — scope:null so locateAndGlow searches
     // class-wide for the field name; the decl line is the only match
-    // outside method bodies.
-    navigateToClass(targetCls, { needle: fieldName, scope: null });
+    // outside method bodies. A renamed field's decl shows its display name.
+    navigateToClass(targetCls, { needle: displayMember(targetCls, "f", fieldName), scope: null });
     return;
   }
   // Multiple — picker (same chrome as callee picker).
@@ -3842,13 +4194,14 @@ function renderCallerTree(tree, body, useDk, indent = 0) {
               : node.depthCapped ? ' <span style="color:var(--fg-3);font-size:10px">(depth cap)</span>'
               : node.children.length ? ` <span style="color:var(--fg-3);font-size:10px">↑ ${node.children.length}</span>`
               : '';
-    row.innerHTML = ext + escAttr(node.desc) + tag;
+    row.innerHTML = ext + escAttr(displayDesc(node.desc)) + tag;
     row.title = node.desc;
     row.onclick = (e) => {
       e.stopPropagation();
       $("#callerpop").classList.remove("show");
       const c = node.desc.split("->")[0];
-      const name = (node.desc.split("->")[1] || "").split("(")[0];
+      // Needle/scope target that class's own view — use its display name.
+      const name = displayMember(c, "m", (node.desc.split("->")[1] || "").split("(")[0]);
       navigateToClass(c, { needle: name, scope: name });
     };
     body.appendChild(row);
@@ -3912,33 +4265,39 @@ function resolveTypeDescriptor(line, tokenText, tokenIdx, useDk) {
     scan = p + 1;
   }
   if (parts.length > 1) {
+    // On-screen dotted path may carry RENAMED segments — reverse-map before
+    // the naive dot→slash conversion (which only fits original names).
+    const mapped = origDottedToDesc(parts.join("."));
+    if (mapped && useDk.locateClassDex(mapped) >= 0) return mapped;
     const desc = "L" + parts.join("/") + ";";
     if (useDk.locateClassDex(desc) >= 0) return desc;
   }
+  // A renamed class shows its bare display simple only inside its OWN view
+  // (header/ctor lines) — so an unqualified renamed token means currentClass.
+  if (currentClass && displayBare(currentClass) === tokenText
+      && useDk.locateClassDex(currentClass) >= 0) return currentClass;
   // Single token: try same package as current class, then suffix-search.
   if (currentClass) {
     const pkg = currentClass.replace(/[^\/]+;$/, "");      // "Lpkg/sub/"
     const desc = pkg + tokenText + ";";
     if (useDk.locateClassDex(desc) >= 0) return desc;
   }
+  const arr = [];
   const cands = useDk.findClassesByName("/" + tokenText + ";", "ends_with", false);
-  if (cands.size() === 1) {
-    const d = cands.get(0).descriptor; cands.delete(); return d;
-  }
-  if (cands.size() > 1) {
-    const arr = [];
-    for (let i = 0; i < cands.size(); i++) arr.push(cands.get(i).descriptor);
-    cands.delete();
-    // Surface a picker — caller will get back the choice asynchronously.
-    return { ambiguous: arr };
-  }
+  for (let i = 0; i < cands.size(); i++) arr.push(cands.get(i).descriptor);
   cands.delete();
+  // Classes whose DISPLAY simple name matches (suffix search only sees
+  // engine-original names).
+  for (const d of origClassesOfSimple(tokenText)) if (!arr.includes(d)) arr.push(d);
+  if (arr.length === 1) return arr[0];
+  // Surface a picker — caller will get back the choice asynchronously.
+  if (arr.length > 1) return { ambiguous: arr };
   return null;
 }
 
 // Render the type-hierarchy popup for class `cls`.
 function showTypeHierarchyFor(cls, anchor) {
-  const simpleCls = (cls.match(/\/?([A-Za-z_$][\w$]*);$/) || ["", cls])[1];
+  const simpleCls = displayBare(cls);
   const pop = $("#callerpop");
   $("#callerpop-method").textContent = simpleCls + " — type xref";
   const body = $("#callerpop-body");
@@ -3961,7 +4320,8 @@ function showTypeHierarchyFor(cls, anchor) {
     body.innerHTML = "";
     const head = document.createElement("div");
     head.style.cssText = "padding:6px 10px;color:var(--fg-3);font:11px var(--f-ui);border-bottom:1px solid var(--bd-1);word-break:break-all";
-    head.textContent = cls;
+    head.textContent = displayClassDesc(cls);
+    head.title = cls;
     body.appendChild(head);
     const section = (label, rows, hintBuilder) => {
       const sec = document.createElement("div");
@@ -3980,7 +4340,7 @@ function showTypeHierarchyFor(cls, anchor) {
         // we split. Both cases land on the declaring class for the ext check.
         const declCls = desc.includes("->") ? desc.split("->")[0] : desc;
         const ext = isExternalClass(useDk, declCls) ? externalBadgeHtml() : "";
-        item.innerHTML = ext + escAttr(desc);
+        item.innerHTML = ext + escAttr(displayDesc(desc));
         item.title = desc;
         item.onclick = () => {
           pop.classList.remove("show");
@@ -3994,25 +4354,26 @@ function showTypeHierarchyFor(cls, anchor) {
     const upRows = [];
     if (hier && hier.super) upRows.push(hier.super);
     for (const ifc of (hier?.interfaces || [])) upRows.push(ifc);
+    // Needles/scopes must match the TARGET view's text — use display names.
     section("↑ extends / implements", upRows, desc => ({
-      cls: desc, hint: { needle: (desc.match(/\/?([A-Za-z_$][\w$]*);$/) || [, ""])[1], scope: null }
+      cls: desc, hint: { needle: displayBare(desc), scope: null }
     }));
     section("↓ subtypes", [...subs].sort(), desc => ({
-      cls: desc, hint: { needle: (desc.match(/\/?([A-Za-z_$][\w$]*);$/) || [, ""])[1], scope: null }
+      cls: desc, hint: { needle: displayBare(desc), scope: null }
     }));
     section("Fields of this type", refs.fields || [], desc => {
       const c = desc.split("->")[0];
       const fldName = (desc.split("->")[1] || "").split(":")[0];
-      return { cls: c, hint: { needle: fldName, scope: null } };
+      return { cls: c, hint: { needle: displayMember(c, "f", fldName), scope: null } };
     });
     section("Methods returning this type", refs.methodsReturning || [], desc => {
       const c = desc.split("->")[0];
-      const mName = (desc.split("->")[1] || "").split("(")[0];
+      const mName = displayMember(c, "m", (desc.split("->")[1] || "").split("(")[0]);
       return { cls: c, hint: { needle: mName, scope: mName } };
     });
     section("Methods with this type as param", refs.methodsWithParam || [], desc => {
       const c = desc.split("->")[0];
-      const mName = (desc.split("->")[1] || "").split("(")[0];
+      const mName = displayMember(c, "m", (desc.split("->")[1] || "").split("(")[0]);
       return { cls: c, hint: { needle: mName, scope: mName } };
     });
   }, 30);
@@ -4061,9 +4422,10 @@ function showStringXrefFor(rawToken, anchor) {
       item.className = "callerpop-item";
       const targetCls = desc.split("->")[0];
       const ext = isExternalClass(useDk, targetCls) ? externalBadgeHtml() : "";
-      item.innerHTML = ext + escAttr(desc);
+      item.innerHTML = ext + escAttr(displayDesc(desc));
       item.title = desc;
-      const mName = (desc.split("->")[1] || "").split("(")[0];
+      // Scope = the target method's header text, which shows its display name.
+      const mName = displayMember(targetCls, "m", (desc.split("->")[1] || "").split("(")[0]);
       item.onclick = () => {
         pop.classList.remove("show");
         // Glow the string literal inside the method.
@@ -4075,11 +4437,16 @@ function showStringXrefFor(rawToken, anchor) {
 }
 
 // ── Global symbol search ───────────────────────────────────────────────────
-// Ctrl+P / `/` opens a modal with a text input. Searches classes + methods +
-// fields by name (substring, case-insensitive). Results stream in via a
+// Ctrl+P / Ctrl+Shift+F opens a modal with a text input. Searches classes +
+// methods + fields (+ strings, lazily) by name (substring, case-insensitive),
+// filtered by the category chips under the input. Results stream in via a
 // debounced redraw. The full corpus comes from listAllMethodDescriptors +
 // listAllFieldDescriptors + listClasses — one WASM call each, cached.
+// `strings` stays null until the first query runs with the string chip on:
+// listValueStrings can return hundreds of thousands of entries on a big APK,
+// so it must not tax palette opens that never ask for strings.
 let _symbolIndex = null;
+const _symCats = { class: true, method: true, field: true, string: true };
 function ensureSymbolIndex() {
   if (_symbolIndex) return _symbolIndex;
   const useDk = activeQueryDk();
@@ -4096,8 +4463,16 @@ function ensureSymbolIndex() {
     const v = useDk.listAllFieldDescriptors();
     for (let i = 0; i < v.size(); i++) fields.push(v.get(i)); v.delete();
   } catch (_) {}
-  _symbolIndex = { classes, methods, fields };
+  _symbolIndex = { classes, methods, fields, strings: null };
   return _symbolIndex;
+}
+function ensureStringIndex(idx) {
+  if (idx.strings) return;
+  idx.strings = [];
+  try {
+    const v = activeQueryDk().listValueStrings();
+    for (let i = 0; i < v.size(); i++) idx.strings.push(v.get(i)); v.delete();
+  } catch (_) {}
 }
 function clearSymbolIndex() { _symbolIndex = null; }
 
@@ -4108,7 +4483,8 @@ function openSymbolSearch() {
     modal.id = "symsearch";
     modal.style.cssText = "position:fixed;top:80px;left:50%;transform:translateX(-50%);width:640px;max-height:60vh;background:var(--bg-1);border:1px solid var(--bd-1);border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.4);z-index:60;display:flex;flex-direction:column;font:13px var(--f-ui)";
     modal.innerHTML = `
-      <input id="symsearch-input" placeholder="search class / method / field…" style="background:transparent;border:0;border-bottom:1px solid var(--bd-1);color:var(--fg);padding:10px 12px;font:14px var(--f-mono);outline:none">
+      <input id="symsearch-input" placeholder="search class / method / field / string…" style="background:transparent;border:0;border-bottom:1px solid var(--bd-1);color:var(--fg);padding:10px 12px;font:14px var(--f-mono);outline:none">
+      <div id="symsearch-cats" style="display:flex;gap:6px;padding:6px 12px;border-bottom:1px solid var(--bd-1)"></div>
       <div id="symsearch-list" style="overflow-y:auto;padding:4px 0;flex:1"></div>
       <div style="border-top:1px solid var(--bd-1);padding:4px 10px;color:var(--fg-3);font-size:11px">↑↓ navigate · ↵ open · esc close</div>
     `;
@@ -4120,6 +4496,7 @@ function openSymbolSearch() {
       const q = input.value.trim().toLowerCase();
       if (!q) { list.innerHTML = '<div style="padding:8px 12px;color:var(--fg-3)">start typing…</div>'; lastResults = []; return; }
       const idx = ensureSymbolIndex();
+      if (_symCats.string) ensureStringIndex(idx);
       // Score: exact match > prefix > contains; cap at 200 results.
       const score = (s) => {
         const lo = s.toLowerCase();
@@ -4127,19 +4504,28 @@ function openSymbolSearch() {
         const i = lo.indexOf(q);
         return i < 0 ? Infinity : (i === 0 ? 1 : 2 + i);
       };
+      // Renamed symbols match on BOTH the original descriptor and the display
+      // form (whichever scores better wins); `disp` rides along so the row can
+      // render "orig → new".
       const collect = (arr, kind) => {
         const out = [];
+        const mapped = kind !== "string" && renameCount() > 0;
         for (const desc of arr) {
-          const sc = score(desc);
-          if (sc < Infinity) out.push({ desc, kind, sc });
+          let sc = score(desc), disp = null;
+          if (mapped) {
+            const d = displayDesc(desc);
+            if (d !== desc) { disp = d; sc = Math.min(sc, score(d)); }
+          }
+          if (sc < Infinity) out.push({ desc, kind, sc, disp });
           if (out.length > 600) break;
         }
         return out;
       };
       const all = [
-        ...collect(idx.classes, "class"),
-        ...collect(idx.methods, "method"),
-        ...collect(idx.fields,  "field")
+        ...(_symCats.class  ? collect(idx.classes, "class")  : []),
+        ...(_symCats.method ? collect(idx.methods, "method") : []),
+        ...(_symCats.field  ? collect(idx.fields,  "field")  : []),
+        ...(_symCats.string ? collect(idx.strings, "string") : [])
       ].sort((a, b) => a.sc - b.sc || a.desc.length - b.desc.length).slice(0, 200);
       lastResults = all;
       selected = 0;
@@ -4150,12 +4536,28 @@ function openSymbolSearch() {
         row.dataset.idx = i;
         row.style.cssText = "padding:4px 12px;cursor:pointer;font:12px var(--f-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
         if (i === 0) row.style.background = "rgba(255,255,255,0.06)";
-        row.innerHTML = `<span style="color:var(--fg-3);display:inline-block;width:48px">${r.kind}</span>${escAttr(r.desc)}`;
+        const label = r.kind === "string" ? JSON.stringify(r.desc)
+                    : r.disp ? `${escAttr(r.desc)} <span style="color:var(--fg-3)">→</span> ${escAttr(r.disp)}`
+                    : escAttr(r.desc);
+        row.innerHTML = `<span style="color:var(--fg-3);display:inline-block;width:52px">${r.kind}</span>${r.kind === "string" ? escAttr(label) : label}`;
+        row.title = r.desc;
         row.onmouseenter = () => { selectRow(i); };
         row.onclick = () => openSymbol(r);
         list.appendChild(row);
       });
     };
+    const cats = modal.querySelector("#symsearch-cats");
+    for (const k of ["class", "method", "field", "string"]) {
+      const chip = document.createElement("span");
+      chip.textContent = k;
+      const paint = () => {
+        chip.style.cssText = "padding:1px 8px;border-radius:9px;cursor:pointer;font:11px var(--f-ui);border:1px solid var(--bd-1);user-select:none;" +
+          (_symCats[k] ? "color:var(--fg);background:rgba(255,255,255,0.08)" : "color:var(--fg-3)");
+      };
+      paint();
+      chip.onclick = () => { _symCats[k] = !_symCats[k]; paint(); render(); input.focus(); };
+      cats.appendChild(chip);
+    }
     const selectRow = (i) => {
       const rows = list.querySelectorAll("[data-idx]");
       if (rows[selected]) rows[selected].style.background = "";
@@ -4168,12 +4570,35 @@ function openSymbolSearch() {
         navigateToClass(r.desc, null);
       } else if (r.kind === "method") {
         const c = r.desc.split("->")[0];
-        const name = (r.desc.split("->")[1] || "").split("(")[0];
+        // Declaration lines in the owning view show the DISPLAY name.
+        const name = displayMember(c, "m", (r.desc.split("->")[1] || "").split("(")[0]);
         navigateToClass(c, { needle: name, scope: name });
-      } else {
+      } else if (r.kind === "field") {
         const c = r.desc.split("->")[0];
-        const name = (r.desc.split("->")[1] || "").split(":")[0];
+        const name = displayMember(c, "f", (r.desc.split("->")[1] || "").split(":")[0]);
         navigateToClass(c, { needle: name, scope: null });
+      } else {
+        // String: one referencing method → jump straight to it (needle = the
+        // raw value; values with escapes miss the literal and fall back to the
+        // method-header scope line). Several → reuse the string-xref popup,
+        // anchored where the modal sat.
+        const value = r.desc;
+        const useDk = activeQueryDk();
+        let arr = [];
+        try {
+          const v = useDk.findMethodsUsingString(value);
+          for (let i = 0; i < v.size(); i++) arr.push(v.get(i)); v.delete();
+        } catch (_) {}
+        if (!arr.length) { flashToast("no methods reference this string"); return; }
+        if (arr.length === 1) {
+          const c = arr[0].split("->")[0];
+          const mName = displayMember(c, "m", (arr[0].split("->")[1] || "").split("(")[0]);
+          navigateToClass(c, { needle: value, scope: mName });
+          return;
+        }
+        const x = window.innerWidth / 2 - 260, y = 86;
+        showStringXrefFor(value, { getBoundingClientRect: () =>
+          ({ left: x, top: y, right: x, bottom: y, width: 0, height: 0 }) });
       }
     };
     let renderTimer = 0;
@@ -4192,10 +4617,11 @@ function openSymbolSearch() {
   modal.querySelector("#symsearch-list").innerHTML = '<div style="padding:8px 12px;color:var(--fg-3)">start typing…</div>';
 }
 document.addEventListener("keydown", (e) => {
-  // Ctrl+P / Cmd+P opens; ignore inside text inputs.
+  // Ctrl+P / Cmd+P or Ctrl+Shift+F / Cmd+Shift+F opens; ignore inside inputs.
   const tag = (e.target?.tagName || "").toLowerCase();
   if (tag === "input" || tag === "textarea") return;
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "p") {
+  const k = e.key.toLowerCase();
+  if ((e.ctrlKey || e.metaKey) && (k === "p" || (e.shiftKey && k === "f"))) {
     e.preventDefault();
     if (!dk) return;
     openSymbolSearch();
@@ -4585,7 +5011,10 @@ function _methodLocalLineFor(methodDesc, codeLineIdx) {
   // `static ClassName()` — both translate to the class simple name. The
   // walkback then matches `<modifier-prefix> classSimple(`. For <clinit>,
   // the modifier is "static" so the regular walk catches it correctly.
-  const viewName = (dexName === "<init>" || dexName === "<clinit>") ? classSimple : dexName;
+  // The on-screen text carries RENAMED names (headers included), so walk
+  // with the display form of both the class simple and the method name.
+  const viewName = (dexName === "<init>" || dexName === "<clinit>")
+    ? displayBare(cls) : displayMember(cls, "m", dexName);
   const headerLine = _methodHeaderLine(codeLineIdx, viewName);
   if (headerLine < 0) return { localLine: -1, headerLine: -1, dexName, classSimple };
   // DAD's DecompileMethod source begins with a leading "\n" — its Writer
@@ -4738,15 +5167,20 @@ function _findMethodDescForSync(cls, codeLineIdx, useDk) {
   const mname = findEnclosingMethodName(codeLineIdx);
   if (!mname) return null;
   const classSimple = (cls.match(/\/?([A-Za-z_$][\w$]*);$/) || ["", ""])[1];
-  // Candidate dex names — match DAD's class-view emission rules.
+  // Candidate dex names — match DAD's class-view emission rules. The header
+  // text the walkback captured may be a RENAMED display name; the dex-side
+  // descriptors only know the original, so reverse-map it in as a candidate.
   const candidates = [mname];
+  const origName = origMember(cls, "m", mname);
+  if (origName && origName !== mname) candidates.push(origName);
   // DAD writes constructors as `ClassName(...)` and static initializers as
   // `static ClassName()` — the captured identifier in both is the class
   // simple name, so a single check covers both. A literal `mname === "static"`
   // branch existed earlier but was unreachable: findEnclosingMethodName picks
   // the LAST identifier before `(`, which for `static ClassName()` is
-  // `ClassName`, never `static`.
-  if (mname === classSimple) candidates.push("<init>", "<clinit>");
+  // `ClassName`, never `static`. A renamed class's ctor header shows the
+  // DISPLAY simple name, so compare against that too.
+  if (mname === classSimple || mname === displayBare(cls)) candidates.push("<init>", "<clinit>");
   // Share the header walkback with the rest of the block.
   const headerLineIdx = _methodHeaderLine(codeLineIdx, mname);
   const javaParams = headerLineIdx >= 0 ? _countJavaHeaderParams(codeLineCache[headerLineIdx]) : -1;
@@ -4881,7 +5315,11 @@ function findEnclosingMethodDescriptor(cls, lineIdx, useDk) {
   // Build a list of candidate dex-side names to match the visible source name.
   const simpleCls = (cls.match(/\/?([A-Za-z_$][\w$]*);$/) || ["", ""])[1];
   const candidates = [mname];
-  if (mname === simpleCls) candidates.push("<init>");
+  // The visible header may carry a RENAMED name; dex descriptors only know
+  // the original — reverse-map it in. Same for a renamed class's ctor header.
+  const origName = origMember(cls, "m", mname);
+  if (origName && origName !== mname) candidates.push(origName);
+  if (mname === simpleCls || mname === displayBare(cls)) candidates.push("<init>");
   if (mname === "static")  candidates.push("<clinit>");
   const ms = useDk.listClassMethods(cls);
   let desc = null;
@@ -4963,7 +5401,7 @@ function narrowInvokesByReceiver(matches, line, name, currentCls) {
 // That misattribution is why ordering matters: `sb.append(fmt(x)).append(32)`
 // has two same-named callees on one source line and the join can surface just
 // the wrong one. Returns [] when inconclusive so the caller falls through.
-function narrowInvokesByClickedLine(useDk, callerDesc, matches, name, lineIdx) {
+function narrowInvokesByClickedLine(useDk, callerDesc, matches, names, lineIdx) {
   if (typeof useDk.findCallSitesFromMethod !== "function") return [];
   const { localLine } = _methodLocalLineFor(callerDesc, lineIdx);
   if (localLine < 0) return [];
@@ -4978,7 +5416,7 @@ function narrowInvokesByClickedLine(useDk, callerDesc, matches, name, lineIdx) {
     if (after < 0) continue;
     const rest = cs.callee.slice(after + 2);
     const open = rest.indexOf("(");
-    if (open <= 0 || rest.slice(0, open) !== name) continue;
+    if (open <= 0 || !names.has(rest.slice(0, open))) continue;
     let best = null;
     for (const e of cache.pcMap) {
       if (e.offset <= cs.offset && (!best || e.offset > best.offset)) best = e;
@@ -4995,6 +5433,13 @@ function navigateToCalleeMethod(currentCls, name, line, lineIdx, anchor) {
   //    method, render its smali, look for invoke-* lines whose method name
   //    matches the clicked token. Each invoke carries Lcls;->name(proto)Ret.
   const callerDesc = findEnclosingMethodDescriptor(currentCls, lineIdx, useDk);
+  // `name` is the CLICKED token — in a renamed view it may be the display
+  // name of one of currentCls's own methods, while the smali descriptors
+  // only know originals. Accept either; the receiver pass (which reads the
+  // same display text the click did) then pins the right invoke.
+  const dexNames = new Set([name]);
+  const origNm = origMember(currentCls, "m", name);
+  if (origNm) dexNames.add(origNm);
   if (callerDesc) {
     const invokes = smaliInvokesFrom(useDk, callerDesc);
     let matches = invokes.filter(iv => {
@@ -5002,7 +5447,7 @@ function navigateToCalleeMethod(currentCls, name, line, lineIdx, anchor) {
       if (after < 0) return false;
       const rest = iv.descriptor.slice(after + 2);
       const open = rest.indexOf("(");
-      return open > 0 && rest.slice(0, open) === name;
+      return open > 0 && dexNames.has(rest.slice(0, open));
     });
     // A name can be invoked more than once in a method with DIFFERENT receivers —
     // loadBitmap holds both `AndroidUtilities.getPath(uri)` (invoke-static) and
@@ -5018,14 +5463,16 @@ function navigateToCalleeMethod(currentCls, name, line, lineIdx, anchor) {
     // have overridden 3 of 228 receiver-resolved sites with a WRONG answer,
     // while offset-last resolves 87 sites the receiver pass could not.
     if (matches.length > 1) {
-      const byLine = narrowInvokesByClickedLine(useDk, callerDesc, matches, name, lineIdx);
+      const byLine = narrowInvokesByClickedLine(useDk, callerDesc, matches, dexNames, lineIdx);
       if (byLine.length) matches = byLine;
     }
     if (matches.length === 1) {
       const d = matches[0].descriptor;                                   // Lcls;->name(proto)Ret
       const targetCls = d.split("->")[0];
       const proto = d.slice(d.indexOf("("), d.lastIndexOf(")") + 1);     // exact overload signature
-      return _navigateAfterClassCheck(targetCls, name, proto);
+      // Needle must match the TARGET view's text — its declaration line
+      // shows the target class's own display name for this method.
+      return _navigateAfterClassCheck(targetCls, displayMember(targetCls, "m", methodOfDescriptor(d)), proto);
     }
     if (matches.length > 1) {
       // Still ambiguous (same receiver, real overloads, or a variable receiver
@@ -5071,13 +5518,22 @@ function showCalleePicker(descriptors, name, anchor) {
   for (const desc of descriptors) {
     const item = document.createElement("div");
     item.className = "callerpop-item";
-    item.textContent = desc;
+    item.textContent = displayDesc(desc);
     item.title = desc;
     const targetCls = desc.split("->")[0];
     const proto = desc.slice(desc.indexOf("("), desc.lastIndexOf(")") + 1);   // exact overload
+    // Needle must match the TARGET view's text: renamed methods/fields show
+    // their display name on the declaration line, ctors the display simple.
+    let needle = name;
+    if (desc.includes("->")) {
+      const mn = methodOfDescriptor(desc);
+      if (mn === "<init>" || mn === "<clinit>") needle = displayBare(targetCls);
+      else if (mn && mn.includes(":")) needle = displayMember(targetCls, "f", mn.split(":")[0]);
+      else if (mn) needle = displayMember(targetCls, "m", mn);
+    }
     item.onclick = () => {
       pop.classList.remove("show");
-      _navigateAfterClassCheck(targetCls, name, proto);
+      _navigateAfterClassCheck(targetCls, needle, proto);
     };
     body.appendChild(item);
   }
@@ -5150,7 +5606,10 @@ function isCtorDeclaration(line, tokenText, tokenIdx, currentCls) {
   if (!currentCls) return false;
   const simple = (currentCls.match(/\/([A-Za-z_$][\w$]*);$/) || ["", ""])[1];
   if (!simple) return false;
-  if (tokenText !== simple && !simple.endsWith("$" + tokenText)) return false;
+  // A renamed class's ctor header shows the DISPLAY simple name — accept it.
+  const disp = displayBare(currentCls);
+  if (tokenText !== simple && !simple.endsWith("$" + tokenText) &&
+      tokenText !== disp && !disp.endsWith("$" + tokenText)) return false;
   const after = line.slice(tokenIdx + tokenText.length);
   if (!/^\s*\(/.test(after)) return false;
   // Constructors can be DEFAULT-access — DAD emits them with no modifier at
@@ -5191,7 +5650,10 @@ function navigateToConstructor(name, lineIdx, anchor) {
     const m = cls.match(/\/?([A-Za-z_$][\w$]*);$/);
     if (!m) return false;
     const simple = m[1];                                    // "Outer$Inner"
-    return simple === name || simple.endsWith("$" + name);
+    if (simple === name || simple.endsWith("$" + name)) return true;
+    // Clicked token may be the target's DISPLAY name (`new a.b.NewName(`).
+    const disp = displayBare(cls);
+    return disp === name || disp.endsWith("$" + name);
   });
   if (matches.length === 1) {
     const targetCls = matches[0].descriptor.split("->")[0];
@@ -5207,6 +5669,8 @@ function navigateToConstructor(name, lineIdx, anchor) {
   const arr = [];
   for (let i = 0; i < cands.size(); i++) arr.push(cands.get(i).descriptor);
   cands.delete();
+  // Suffix search only sees engine-original names — add display-name hits.
+  for (const d of origClassesOfSimple(name)) if (!arr.includes(d)) arr.push(d);
   if (arr.length === 1) return _navigateAfterClassCheck(arr[0], name);
   if (arr.length > 1) {
     showCalleePicker(arr.map(d => d + "-><init>(...)"), name, anchor);
@@ -5307,7 +5771,8 @@ $("#code").addEventListener("click", (e) => {
     e.stopPropagation();
     if (isNewCtorContext(word.line, at, nm.length)) navigateToConstructor(nm, word.idx, eventAnchor(e));
     else if (isCtorDeclaration(word.line, nm, at, currentClass)) showCallersFor(currentClass, "<init>", eventAnchor(e));
-    else if (isMethodDeclaration(word.line, nm)) showCallersFor(currentClass, nm, eventAnchor(e));
+    // Engine queries need the ORIGINAL name — the clicked header may show a rename.
+    else if (isMethodDeclaration(word.line, nm)) showCallersFor(currentClass, origMember(currentClass, "m", nm) || nm, eventAnchor(e));
     else navigateToCalleeMethod(currentClass, nm, word.line, word.idx, eventAnchor(e));
     return;
   }
@@ -5318,14 +5783,16 @@ $("#code").addEventListener("click", (e) => {
   if (word && !IS_KW(word.name) && !/^[vp]\d/.test(word.name) &&
       !/^\s*\(/.test(word.line.slice(word.end)) &&
       !e.target.closest(".tk-typ, .tk-str, .tk-ann")) {
+    // Engine lookups need the ORIGINAL field name; the view shows the rename.
+    const dexFieldNm = origMember(currentClass, "f", word.name) || word.name;
     if (isFieldDeclLine(word.line, word.name)) {
       e.stopPropagation();
-      showFieldXrefFor(currentClass, word.name, eventAnchor(e));
+      showFieldXrefFor(currentClass, dexFieldNm, eventAnchor(e));
       return;
     }
     if (findEnclosingMethodName(word.idx)) {
       e.stopPropagation();
-      navigateToFieldDeclFromUsage(currentClass, word.idx, word.name, eventAnchor(e));
+      navigateToFieldDeclFromUsage(currentClass, word.idx, dexFieldNm, eventAnchor(e));
       return;
     }
   }
@@ -5387,6 +5854,222 @@ document.addEventListener("click", (e) => {
 }, true);
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") $("#callerpop").classList.remove("show");
+});
+
+// ── Rename UX ───────────────────────────────────────────────────────────────
+// Right-click a class / method / field token (or a tree row / #vname) to give
+// it a display name. v1 ownership mirrors applyRenames: member renames only
+// where the substitution rewrites them (decl / this.x / OwnFQN.x in the
+// OWNING class's view); class renames anywhere a resolvable type is shown.
+
+function _memberExistsOn(cls, kind, name) {
+  try {
+    const useDk = activeQueryDk();
+    const v = kind === "m" ? useDk.listClassMethods(cls) : useDk.listClassFieldDescriptors(cls);
+    const marker = "->" + name + (kind === "m" ? "(" : ":");
+    let hit = false;
+    for (let i = 0; i < v.size() && !hit; i++) hit = v.get(i).indexOf(marker) > 0;
+    v.delete();
+    return hit;
+  } catch (_) { return false; }
+}
+
+const _origSimpleOf = (cls) => cls.slice(1, -1).split("/").pop().split("$").pop();
+
+// Identify what a right-click at `e` targets. Returns
+//   { kind:"class",  cls }               — rename the innermost segment
+//   { kind:"method"|"field", cls, orig } — an own-class member (dex-side name)
+// or null when the click isn't on a renameable identifier.
+function renameTargetAt(e) {
+  if (e.target.closest && e.target.closest(".tk-str, .tk-ann")) return null;
+  const word = codeWordAtEvent(e);
+  if (!word || IS_KW(word.name) || /^\d/.test(word.name) || /^[vp]\d/.test(word.name)) return null;
+  const nm = word.name, line = word.line;
+  const before = line.slice(0, word.start);
+  const recv = before.match(/([A-Za-z_$][\w$.]*)\s*\.\s*$/);
+  const ownSite = !recv || recv[1] === "this" || recv[1] === displayDotted(currentClass);
+  if (/^\s*\(/.test(line.slice(word.end))) {
+    if (isNewCtorContext(line, word.start, nm.length)) {
+      const r = resolveTypeDescriptor(line, nm, word.start, activeQueryDk());
+      return typeof r === "string" ? { kind: "class", cls: r } : null;
+    }
+    if (isCtorDeclaration(line, nm, word.start, currentClass))
+      return { kind: "class", cls: currentClass };
+    if (!ownSite) return null;
+    const orig = origMember(currentClass, "m", nm) || nm;
+    return _memberExistsOn(currentClass, "m", orig)
+      ? { kind: "method", cls: currentClass, orig } : null;
+  }
+  if (e.target.closest && e.target.closest(".tk-typ")) {
+    const r = resolveTypeDescriptor(line, nm, word.start, activeQueryDk());
+    return typeof r === "string" ? { kind: "class", cls: r } : null;
+  }
+  if (ownSite) {
+    const orig = origMember(currentClass, "f", nm) || nm;
+    if (_memberExistsOn(currentClass, "f", orig)) return { kind: "field", cls: currentClass, orig };
+  }
+  // Plain-large mode renders no spans — an uppercase token may still be a class.
+  if (/^[A-Z]/.test(nm)) {
+    const r = resolveTypeDescriptor(line, nm, word.start, activeQueryDk());
+    if (typeof r === "string") return { kind: "class", cls: r };
+  }
+  return null;
+}
+
+function openRenamePopup(target, x, y) {
+  const pop = $("#renamepop");
+  pop._target = target;
+  $("#renameWhat").textContent = (target.kind === "class" ? "class" : target.kind) + " · " +
+    (target.kind === "class" ? target.cls : target.cls + "->" + target.orig);
+  const input = $("#renameInput");
+  input.value = target.kind === "class"
+    ? displayClassSimple(target.cls)
+    : displayMember(target.cls, target.kind === "method" ? "m" : "f", target.orig);
+  $("#renameErr").textContent = "";
+  pop.classList.add("show");
+  pop.style.left = Math.max(12, Math.min(window.innerWidth - 320, x)) + "px";
+  pop.style.top = Math.min(window.innerHeight - 130, y + 6) + "px";
+  input.focus(); input.select();
+}
+
+function _commitRename() {
+  const pop = $("#renamepop");
+  const target = pop._target;
+  if (!target) { pop.classList.remove("show"); return; }
+  const v = $("#renameInput").value.trim();
+  const err = $("#renameErr");
+  const isClass = target.kind === "class";
+  const origName = isClass ? _origSimpleOf(target.cls) : target.orig;
+  if (v && v !== origName) {
+    if (!RENAME_OK.test(v)) { err.textContent = "letters, digits, _ and $ only — no leading digit"; return; }
+    // Casing guards protect the tokenizer-driven click dispatch: tk-typ keys
+    // off uppercase initials, and the field/method guards exclude tk-typ.
+    if (isClass && !/^[A-Z]/.test(v)) { err.textContent = "class names must start uppercase"; return; }
+    if (!isClass && /^[A-Z]/.test(v)) { err.textContent = "member names must start lowercase"; return; }
+  }
+  const store = isClass ? renameStore.classes
+              : target.kind === "method" ? renameStore.methods : renameStore.fields;
+  const key = isClass ? target.cls : target.cls + "->" + target.orig;
+  if (!v || v === origName) store.delete(key); else store.set(key, v);
+  saveRenames();
+  pop.classList.remove("show");
+  rerenderCurrentClass();
+  renderList($("#search").value || "");
+  if ($("#renamespop").classList.contains("show")) _renderRenamesList();
+}
+
+$("#renameInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); _commitRename(); }
+  else if (e.key === "Escape") $("#renamepop").classList.remove("show");
+  e.stopPropagation();
+});
+$("#code").addEventListener("contextmenu", (e) => {
+  if (!currentClass) return;
+  const t = renameTargetAt(e);
+  if (!t) return;                       // native menu for everything else
+  e.preventDefault();
+  $("#callerpop").classList.remove("show");
+  openRenamePopup(t, e.clientX, e.clientY);
+});
+listEl.addEventListener("contextmenu", (e) => {
+  const row = e.target.closest(".cls");
+  if (!row || !row.__clsDesc) return;
+  e.preventDefault();
+  openRenamePopup({ kind: "class", cls: row.__clsDesc }, e.clientX, e.clientY);
+});
+$("#vname").addEventListener("contextmenu", (e) => {
+  if (!currentClass) return;
+  e.preventDefault();
+  openRenamePopup({ kind: "class", cls: currentClass }, e.clientX, e.clientY);
+});
+document.addEventListener("click", (e) => {
+  const rp = $("#renamepop");
+  if (rp.classList.contains("show") && !rp.contains(e.target)) rp.classList.remove("show");
+  const mp = $("#renamespop");
+  if (mp.classList.contains("show") && !mp.contains(e.target) && !e.target.closest("#renamesBtn"))
+    mp.classList.remove("show");
+}, true);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { $("#renamepop").classList.remove("show"); $("#renamespop").classList.remove("show"); }
+});
+
+function _renameRefreshAll() {
+  saveRenames();
+  rerenderCurrentClass();
+  renderList($("#search").value || "");
+  _renderRenamesList();
+}
+function _renderRenamesList() {
+  const body = $("#renamespop-body");
+  body.innerHTML = "";
+  const rows = [];
+  for (const [k, v] of renameStore.classes)
+    rows.push({ kind: "C", key: k, store: renameStore.classes, label: descToJava(k) + " → " + v,
+                nav: () => navigateToClass(k) });
+  for (const [k, v] of renameStore.methods)
+    rows.push({ kind: "M", key: k, store: renameStore.methods, label: k + " → " + v,
+                nav: () => navigateToClass(k.split("->")[0], { needle: v }) });
+  for (const [k, v] of renameStore.fields)
+    rows.push({ kind: "F", key: k, store: renameStore.fields, label: k + " → " + v,
+                nav: () => navigateToClass(k.split("->")[0], { needle: v }) });
+  if (!rows.length) {
+    body.innerHTML = '<div class="callerpop-empty">no renames yet — right-click an identifier in the code view</div>';
+    return;
+  }
+  for (const r of rows) {
+    const div = document.createElement("div"); div.className = "rn-row";
+    const kind = document.createElement("span"); kind.className = "rn-kind"; kind.textContent = r.kind;
+    const map = document.createElement("span"); map.className = "rn-map"; map.textContent = r.label; map.title = r.key;
+    map.onclick = () => { $("#renamespop").classList.remove("show"); r.nav(); };
+    const del = document.createElement("span"); del.className = "rn-del"; del.textContent = "✕"; del.title = "remove this rename";
+    del.onclick = () => { r.store.delete(r.key); _renameRefreshAll(); };
+    div.append(kind, map, del);
+    body.appendChild(div);
+  }
+}
+$("#renamesBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const pop = $("#renamespop");
+  if (pop.classList.contains("show")) { pop.classList.remove("show"); return; }
+  _renderRenamesList();
+  pop.classList.add("show");
+  const r = e.target.getBoundingClientRect();
+  pop.style.left = Math.max(12, Math.min(window.innerWidth - 380, r.right - 360)) + "px";
+  pop.style.top = (r.bottom + 6) + "px";
+});
+$("#rnExport").addEventListener("click", () => {
+  const data = JSON.stringify({
+    classes: Object.fromEntries(renameStore.classes),
+    methods: Object.fromEntries(renameStore.methods),
+    fields:  Object.fromEntries(renameStore.fields),
+  }, null, 2);
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([data], { type: "application/json" }));
+  a.download = "dexllm-renames-" + (renameStore.key || "").split(":").pop().slice(0, 12) + ".json";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+});
+$("#rnImport").addEventListener("click", () => $("#rnImportFile").click());
+$("#rnImportFile").addEventListener("change", async (e) => {
+  const f = e.target.files && e.target.files[0];
+  e.target.value = "";
+  if (!f) return;
+  try {
+    const o = JSON.parse(await f.text());
+    const merge = (src, dst) => {
+      for (const [k, v] of Object.entries(src || {}))
+        if (typeof v === "string" && RENAME_OK.test(v)) dst.set(k, v);
+    };
+    merge(o.classes, renameStore.classes);
+    merge(o.methods, renameStore.methods);
+    merge(o.fields,  renameStore.fields);
+    _renameRefreshAll();
+  } catch (_) { flashToast("import failed — not a renames JSON"); }
+});
+$("#rnClear").addEventListener("click", () => {
+  if (!renameCount()) return;
+  renameStore.classes.clear(); renameStore.methods.clear(); renameStore.fields.clear();
+  _renameRefreshAll();
 });
 
 function navigateToClass(desc, hint) {
@@ -5507,7 +6190,8 @@ function selectClass(cls, el, hint) {
   if (cls !== currentClass) clearAllSmaliCaches();
   currentClass = cls;
   pushNavState(hint);
-  $("#vname").textContent = cls;
+  $("#vname").textContent = displayClassDesc(cls);
+  $("#vname").title = cls;
   // The worker runs one job at a time, so a click during the deferred indicator
   // scan waits for the scan to finish. Say so rather than letting the spinner
   // imply the decompile itself is this slow.
@@ -5546,7 +6230,8 @@ function selectClass(cls, el, hint) {
     if (currentClass !== reqClass) return;
     const ms = (performance.now() - reqStart).toFixed(0);
     const text = java || "// (empty — external/abstract class)";
-    renderCode(text);
+    rawCodeCache = text;
+    renderCode(applyRenames(text, reqClass));
     $("#vmeta").textContent = `${text.length} chars · ${ms}ms${dexNote}` +
       (renderCode.plainLarge ? " · plain (large)" : "");
     if (hint) locateAndGlow(hint);
@@ -5554,6 +6239,7 @@ function selectClass(cls, el, hint) {
     if (currentClass !== reqClass) return;
     // err.message comes from the worker's describeError — already a string.
     // describeError handles every other case defensively.
+    rawCodeCache = "";
     renderCode("// decompile failed: " + describeError(err));
     $("#vmeta").textContent = "decompile failed" + dexNote;
   });
@@ -5686,41 +6372,67 @@ function locateAndGlow(hint) {
     return arityHit;                                      // arity-only fallback (or -1)
   };
 
-  // Scope = caller/enclosing method to search within. Signature-precise when a
-  // proto is given (disambiguates overloaded scopes: get(Context) vs
-  // get(ISP,Context)); else first same-name header.
-  let scopeLine = -1;
-  if (scope && !scope.startsWith("<")) {                  // skip <init>/<clinit>
-    if (scopeProto) scopeLine = findDecl(scope, scopeProto);
-    if (scopeLine < 0) scopeLine = lines.findIndex(l => l.includes(scope + "("));
-  }
-  let target = -1;
-  // Overload-precise target: land on the declaration of `needle` matching `proto`.
-  if (needle && proto) target = findDecl(needle, proto);
-  // Declaration sought (proto given) but no proto/arity match — e.g. the header
-  // wraps lines, or generics/arrays defeat the simple-type compare. Land on ANY
-  // declaration of `needle` before the plain-text fallback below, which would
-  // otherwise wrongly hit a CALL site in some other method.
-  if (target < 0 && needle && proto) target = lines.findIndex(l => isMethodDeclaration(l, needle));
-  if (target < 0 && needle) {
-    if (scopeLine >= 0) {
-      let skip = occurrence - 1;
-      for (let i = scopeLine + 1; i < lines.length; i++) {
-        if (!lines[i].includes(needle)) continue;
-        if (skip-- > 0) continue;
-        target = i; break;
+  // One search pass over the view text with a given needle/scope pair.
+  const runPass = (ndl, scp) => {
+    // Scope = caller/enclosing method to search within. Signature-precise when
+    // a proto is given (disambiguates overloaded scopes: get(Context) vs
+    // get(ISP,Context)); else first same-name header.
+    let scopeLine = -1;
+    if (scp && !scp.startsWith("<")) {                    // skip <init>/<clinit>
+      if (scopeProto) scopeLine = findDecl(scp, scopeProto);
+      if (scopeLine < 0) scopeLine = lines.findIndex(l => l.includes(scp + "("));
+    }
+    let hit = -1;
+    // Overload-precise target: land on the declaration of `ndl` matching `proto`.
+    if (ndl && proto) hit = findDecl(ndl, proto);
+    // Declaration sought (proto given) but no proto/arity match — e.g. the header
+    // wraps lines, or generics/arrays defeat the simple-type compare. Land on ANY
+    // declaration of `ndl` before the plain-text fallback below, which would
+    // otherwise wrongly hit a CALL site in some other method.
+    if (hit < 0 && ndl && proto) hit = lines.findIndex(l => isMethodDeclaration(l, ndl));
+    if (hit < 0 && ndl) {
+      if (scopeLine >= 0) {
+        let skip = occurrence - 1;
+        for (let i = scopeLine + 1; i < lines.length; i++) {
+          if (!lines[i].includes(ndl)) continue;
+          if (skip-- > 0) continue;
+          hit = i; break;
+        }
+      }
+      if (hit < 0) {
+        let skip = occurrence - 1;
+        for (let i = 0; i < lines.length; i++) {
+          if (!lines[i].includes(ndl)) continue;
+          if (skip-- > 0) continue;
+          hit = i; break;
+        }
       }
     }
-    if (target < 0) {
-      let skip = occurrence - 1;
-      for (let i = 0; i < lines.length; i++) {
-        if (!lines[i].includes(needle)) continue;
-        if (skip-- > 0) continue;
-        target = i; break;
-      }
+    return hit < 0 ? scopeLine : hit;
+  };
+  // Hint names are generated from engine-side (original) descriptors, but the
+  // on-screen text may carry renames — retry with the display forms when the
+  // original-name pass finds nothing.
+  const mapToDisplay = (s) => {
+    if (!s) return s;
+    if (currentClass) {
+      const dm = displayMember(currentClass, "m", s); if (dm !== s) return dm;
+      const df = displayMember(currentClass, "f", s); if (df !== s) return df;
     }
+    for (const desc of renameStore.classes.keys()) {
+      const body = desc.slice(1, -1);
+      const bare = body.slice(body.lastIndexOf("/") + 1);
+      if (s === bare) return displayBare(desc);
+      if (s === bare.split("$").pop()) return displayClassSimple(desc);
+      if (s === body.replace(/\//g, ".")) return displayDotted(desc);
+    }
+    return s;
+  };
+  let target = runPass(needle, scope);
+  if (target < 0 && renameCount()) {
+    const n2 = mapToDisplay(needle), s2 = mapToDisplay(scope);
+    if (n2 !== needle || s2 !== scope) target = runPass(n2, s2);
   }
-  if (target < 0) target = scopeLine;
   if (target < 0) return;
   const code = $("#code"), g = $("#glowline");
   if (!g) return;
