@@ -4,6 +4,29 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>dexllm — in-browser DEX/APK decompiler</title>
+<!-- The build pin cache-busts dexllm.js and dexllm.wasm AS A PAIR: a returning
+     visitor whose browser kept the old dexllm.js but pulls a new dexllm.wasm
+     gets an ABI mismatch and "engine load failed". Bump on EVERY wasm rebuild —
+     not the same as every dexllm bump, since wasm_module.cpp and the vendored
+     engine change on their own. The base is the dexllm commit (matching the
+     header version pill) and -N counts rebuilds against that commit.
+     Defined ONCE here; the script src below and both locateFile callbacks
+     derive from it (three hand-synced ?v= sites drifted apart in the past —
+     the -2 bump missed the script src and shipped a mismatched pair). -->
+<script>
+window.__DEXLLM_BUILD = "db51c67-2";
+// Kick off the wasm fetch now, in parallel with the rest of this document and
+// dexllm.js. createDexllm's own fetch uses the same URL with credentials
+// "same-origin", which is exactly what as="fetch" + crossorigin (anonymous)
+// preloads as — so the response is reused, not fetched twice. The gate for
+// that claim is the startup CDP run: one dexllm.wasm request in the log.
+{
+  const l = document.createElement("link");
+  l.rel = "preload"; l.as = "fetch"; l.crossOrigin = "anonymous";
+  l.href = "dexllm.wasm?v=" + window.__DEXLLM_BUILD;
+  document.head.appendChild(l);
+}
+</script>
 <style>
   :root {
     /* Tone: pure black foundation with blue-undertoned chrome — a coherent
@@ -885,9 +908,12 @@
     <video id="loopvid" autoplay muted loop playsinline disablepictureinpicture preload="auto">
       <source src="loop.mp4" type="video/mp4">
     </video>
-    <video id="transvid" muted playsinline disablepictureinpicture preload="auto">
-      <source src="trans.mp4" type="video/mp4">
-    </video>
+    <!-- No <source>/preload: the outro clip competed with dexllm.wasm for
+         bandwidth at startup (~100ms of engine-ready on a 10 Mbps line) even
+         though startTransition re-picks the clip per drop anyway. It is
+         prefetched on the first dragenter/pointerdown instead — seconds of
+         user intent before the drop needs it. -->
+    <video id="transvid" muted playsinline disablepictureinpicture preload="none"></video>
     <div class="big">Drop a <b>.apk</b> / <b>.dex</b> / <b>.jar</b> here</div>
     <div>or click to choose a file — nothing is uploaded, decompilation runs locally</div>
   </div>
@@ -958,15 +984,12 @@
   </div>
 </main>
 
-<!-- Cache-bust both dexllm.js and dexllm.wasm. Keeping the JS+WASM pair
-     consistent matters because a returning visitor whose browser has the old
-     dexllm.js cached but pulls the new dexllm.wasm gets an ABI mismatch and
-     "engine load failed". Bump on EVERY wasm rebuild — which is not the same as
-     every dexllm bump, since wasm_module.cpp can change on its own. The base is
-     the dexllm commit (matching the version pill above) and `-N` counts rebuilds
-     against that same commit; -2 is the lenient single-path load. -->
-<script>window.__DEXLLM_BUILD = "db51c67-2";</script>
-<script src="dexllm.js?v=db51c67-1"></script>
+<!-- document.write keeps parser-blocking semantics (dexllm.js must define
+     createDexllm before the big inline script below runs) while deriving the
+     ?v= from the single build pin in <head>. Chrome's document.write
+     intervention only applies to cross-origin scripts, so this same-origin
+     write is never dropped. -->
+<script>document.write('<script src="dexllm.js?v=' + window.__DEXLLM_BUILD + '"><\/script>');</script>
 <script>
 let Module = null, dk = null, allClasses = [], selectedEl = null;
 // classDescriptor -> { urls:Set, ips:Set, domains:Set, emails:Set, onion:Set }
@@ -1682,13 +1705,31 @@ const TRANS_RATE = 2.0;
 // fetched (src set on demand), so the extra clips don't weigh down page load.
 const TRANS_SRCS = ["trans.mp4", "trans2.mp4"];
 
+// Pick the next clip at the first sign of user intent (dragenter / pointer
+// down on the drop card) and start fetching it, so the outro still starts
+// instantly on drop without the clip loading at page startup. The pick is
+// pinned so startTransition plays the clip we actually prefetched.
+let pendingTransClip = null;
+function prefetchTransClip() {
+  if (pendingTransClip) return;
+  pendingTransClip = TRANS_SRCS[Math.floor(Math.random() * TRANS_SRCS.length)];
+  const trans = $("#transvid");
+  trans.setAttribute("src", pendingTransClip);
+  try { trans.load(); } catch (_) {}
+}
+["dragenter", "pointerdown"].forEach(ev =>
+  drop.addEventListener(ev, prefetchTransClip, { passive: true }));
+
 let transTimer = null;
 function startTransition() {
   const loop = $("#loopvid"), trans = $("#transvid");
   if (loop) loop.style.display = "none";
   trans.style.display = "block";
-  // Swap in a random clip unless it's already the loaded one (then just replay).
-  const chosen = TRANS_SRCS[Math.floor(Math.random() * TRANS_SRCS.length)];
+  // Play the prefetched clip if there is one; otherwise pick now. Re-arm the
+  // prefetch for the NEXT drop so repeat loads stay varied.
+  const chosen = pendingTransClip ||
+    TRANS_SRCS[Math.floor(Math.random() * TRANS_SRCS.length)];
+  pendingTransClip = null;
   const cur = trans.getAttribute("src") || trans.currentSrc || "";
   if (!cur.endsWith(chosen)) {
     trans.setAttribute("src", chosen);

@@ -34,13 +34,26 @@ C++ class, `Module.WasmDexKit`, plus a few helper types (`Module.VectorString`,
 
 ## 2. Loading the engine
 
-The page pins a build tag and cache-busts every engine asset with `?v=<tag>`
-so a redeploy never serves a stale wasm against a fresh glue file
-([`index.html:968`](../index.html#L968)):
+The page pins a build tag in `<head>` and cache-busts every engine asset with
+`?v=<tag>` so a redeploy never serves a stale wasm against a fresh glue file.
+The pin is defined ONCE; the `dexllm.js` script tag is written from it
+(`document.write`, parser-blocking so load order is unchanged) and both
+`locateFile` hooks derive from it — hand-syncing multiple `?v=` literals is
+what shipped a mismatched js/wasm pair once. The same head script appends a
+`<link rel="preload" as="fetch" crossorigin>` for `dexllm.wasm`, which starts
+the biggest fetch in parallel with the rest of the document instead of after
+`dexllm.js` executes (measured: engine-ready −15% on an RTT-bound profile):
 
 ```html
-<script>window.__DEXLLM_BUILD = "db51c67-1";</script>
-<script src="dexllm.js?v=db51c67-1"></script>
+<script>
+window.__DEXLLM_BUILD = "db51c67-2";
+{ const l = document.createElement("link");
+  l.rel = "preload"; l.as = "fetch"; l.crossOrigin = "anonymous";
+  l.href = "dexllm.wasm?v=" + window.__DEXLLM_BUILD;
+  document.head.appendChild(l); }
+</script>
+...
+<script>document.write('<script src="dexllm.js?v=' + window.__DEXLLM_BUILD + '"><\/script>');</script>
 ```
 
 The tag is `<dexllm commit>-<rebuild counter>`. The counter exists because

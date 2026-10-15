@@ -138,9 +138,12 @@ function rebuildDk() {
   originalSource.baseDexId = cursor;
 }
 
+// `bytes` arrives as a transferred Uint8Array; FS.writeFile copies it into the
+// wasm heap itself, so wrapping it in another new Uint8Array(bytes) here only
+// added a second full-size memcpy (50 MB on a big APK) and its GC churn.
 async function handleLoad({ bytes, label }) {
   resetState();
-  const buf = new Uint8Array(bytes);
+  const buf = bytes;
   try { Module.FS.writeFile("/input.bin", buf); } catch (_) {
     try { Module.FS.unlink("/input.bin"); } catch (_) {}
     Module.FS.writeFile("/input.bin", buf);
@@ -154,7 +157,7 @@ async function handleLoad({ bytes, label }) {
 }
 
 async function handleAddDump({ bytes, label, vfs }) {
-  const buf = new Uint8Array(bytes);
+  const buf = bytes;
   try { Module.FS.writeFile(vfs, buf); } catch (_) {
     try { Module.FS.unlink(vfs); } catch (_) {}
     Module.FS.writeFile(vfs, buf);
@@ -210,7 +213,7 @@ function handleExtractIocs({ sourceIdx, isolatedKey }) {
 // store under the global dex_id key. Called once per dex on entry to
 // Isolated mode; idempotent if main re-sends.
 async function handleAddIsolated({ bytes, vfs, key }) {
-  const buf = new Uint8Array(bytes);
+  const buf = bytes;
   try { Module.FS.writeFile(vfs, buf); } catch (_) {
     try { Module.FS.unlink(vfs); } catch (_) {}
     Module.FS.writeFile(vfs, buf);
