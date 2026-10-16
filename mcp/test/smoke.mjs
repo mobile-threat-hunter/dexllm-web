@@ -27,6 +27,20 @@ await client.connect(new StdioClientTransport({
 }));
 
 try {
+  // server instructions reach the client at initialize
+  const instr = client.getInstructions();
+  check("server instructions present", typeof instr === "string" &&
+    instr.includes("load_apk first") && instr.includes("dex bytecode only"));
+
+  // analyze_apk prompt: listed + renders the workflow with the given path
+  const prompts = (await client.listPrompts()).prompts.map(p => p.name);
+  check("analyze_apk prompt listed", prompts.includes("analyze_apk"), prompts.join(","));
+  const pr = await client.getPrompt({ name: "analyze_apk", arguments: { path: "/x/y.apk" } });
+  const ptxt = pr.messages[0].content.text;
+  check("analyze_apk prompt text", ptxt.includes("/x/y.apk") &&
+    ["permissions", "capabilities", "components", "iocs", "decompile_class"]
+      .every(s => ptxt.includes(s)));
+
   // tool inventory
   const tools = (await client.listTools()).tools.map(t => t.name).sort();
   check("tool count = 14", tools.length === 14, tools.join(","));

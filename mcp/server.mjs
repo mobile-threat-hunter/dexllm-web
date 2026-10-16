@@ -79,7 +79,66 @@ function symbolCorpus(kind) {
 }
 
 // ── server + tools ───────────────────────────────────────────────────────────
-const server = new McpServer({ name: "dexllm", version: "0.1.0" });
+// Server-level instructions: sent in the initialize response so MCP clients
+// (Claude Code, VS Code Copilot, Copilot CLI, …) can inject them as standing
+// guidance before any tool call. Keep in sync with tool descriptions.
+const INSTRUCTIONS = `dexllm — static analysis of Android dex bytecode (APK / dex / runtime dumps) via a wasm engine.
+
+Workflow: call load_apk first — every other tool errors until a file is loaded. For malware triage, read the four evidence panels (permissions, capabilities, components, iocs) BEFORE decompiling anything, then shortlist the classes they point at and read those with decompile_class plus the xref tools (callers_of_method, usages_of_string, accessors_of_field, references_to_type). The analyze_apk prompt packages this flow.
+
+Standing caveats:
+- dex bytecode only — no AndroidManifest.xml. permissions / components / capabilities are code-derived candidates, not declared facts; dead and library code appears too.
+- search_symbols accepts java form (com.foo.Bar.baz) and smali form (Lcom/foo/Bar;->baz) interchangeably; kind=string stays literal.
+- Results can be large: narrow with limit / offset / package_prefix; responses hard-cap at 200k chars.
+- After add_dump, call sites flagged shadowed:true never execute under first-wins load order — weigh the live copies.
+- load_renames applies display-level renames (shown alongside originals); load_apk resets the session including renames.
+
+Malware-analysis guidance:
+- Obfuscated (single-letter) names carry no meaning — triage by evidence instead: string literals (usages_of_string), capability API hits, and xref topology. Once a class's role is identified, persist it via load_renames so later tool outputs stay readable.
+- With no manifest there are no intent-filter / exported facts. Recover trigger paths from code: search_symbols kind=string for action constants ("BOOT_COMPLETED", "SMS_RECEIVED", "USER_PRESENT") or C2 endpoints from iocs, then usages_of_string → callers_of_method to walk from registration to behavior.
+- permissions rows carry up to 20 caller methods — decompile a window around those methods directly instead of scanning whole classes.
+- Suspect packing when capabilities show DexClassLoader / reflection against a thin or inert class list: analyze the unpacker stub, obtain a runtime dump externally, then add_dump it — dump classes override the packed originals and shadowed:true marks the dead packed copies.
+- Encrypted strings (crypto/Base64 capability + high-entropy literals): find the shared decrypt helper, then callers_of_method on it enumerates every protected call site — usually the fastest map of hidden behavior.
+- Budget context: decompile_class in windows (start_line / max_lines) around the evidence, not whole classes; permissions / capabilities / components / iocs are whole-file summaries — once per session is enough.
+- Verdict discipline: static analysis cannot prove execution. Distinguish behaviors with a reachable trigger path from present-but-unreferenced code, and say which is which.`;
+
+const server = new McpServer({ name: "dexllm", version: "0.1.0" },
+                              { instructions: INSTRUCTIONS });
+
+// Guided malware-triage flow: evidence panels first, then targeted reading.
+// Exposed as an MCP prompt so clients surface it as a one-shot command
+// (Claude Code: /mcp__dexllm__analyze_apk).
+server.registerPrompt("analyze_apk", {
+  title: "Analyze APK for malicious behavior",
+  description: "Evidence-first malware triage: load the APK, read permissions/" +
+    "capabilities/components/iocs, shortlist suspicious core-behavior classes, " +
+    "then decompile and xref them into a behavior report." + DEX_ONLY,
+  argsSchema: { path: z.string().describe("absolute path to the .apk/.dex file") },
+}, ({ path }) => ({
+  messages: [{
+    role: "user",
+    content: {
+      type: "text",
+      text: `Analyze the Android app at ${path} for malicious behavior using the dexllm tools (static dex bytecode only — no manifest).
+
+Step 1 — Load: call load_apk with the path above.
+
+Step 2 — Evidence sweep (run ALL four before reading any code):
+- permissions: note dangerous/signature rows and the caller methods attached to each
+- capabilities: note the top API hits (SMS, telephony, location, camera/mic, crypto, reflection/DexClassLoader, accessibility, device-admin, …)
+- components: note high-signal kinds (device-admin, accessibility, notif-listener, vpn, job) and receivers/services
+- iocs: note network endpoints, content-provider URIs, shell/su commands, and other suspicious strings
+
+Step 3 — Triage: cross-correlate the four lists into a shortlist of classes most likely implementing core malicious behavior. Classes appearing in multiple lists rank first; set aside well-known library packages unless the evidence points into them.
+
+Step 4 — Deep dive each shortlisted class:
+- decompile_class (window large classes with start_line/max_lines rather than dumping whole files)
+- callers_of_method / usages_of_string / references_to_type to establish trigger paths (e.g. boot receiver → service → exfiltration sink)
+
+Step 5 — Report. For each suspected behavior give: WHAT it does, the TRIGGER path, and the EVIDENCE (class/method descriptors, strings, endpoints). Separate confirmed behaviors (reachable trigger path) from present-but-unreferenced code. Finish with an overall verdict and a consolidated IOC list.`,
+    },
+  }],
+}));
 
 server.registerTool("load_apk", {
   description: "Load an APK/DEX file from a local path into the analysis session. " +
