@@ -2994,9 +2994,18 @@ function renderList(filter) {
     }
   }
   // Filter matches the original descriptor AND the display (renamed) form.
+  // Java/smali bridge (palette rule, narrowed): when the query contains a
+  // `.` — the one separator java form always has and smali never does — `/`
+  // and `$` normalize to `.` on both sides so "com.foo.Bar" finds
+  // "Lcom/foo/Bar;". Gating on `.` (not `/$;`) keeps the "$ lists inner
+  // classes" and "/ lists packaged classes" idioms literal. Literal matching
+  // runs first, so smali-form queries behave exactly as before.
   const hasRn = renameStore.classes.size > 0;
-  const items = f ? pool.filter(c => c.toLowerCase().includes(f) ||
-    (hasRn && displayClassDesc(c).toLowerCase().includes(f))) : pool;
+  const normSep = (s) => s.replace(/[/$]/g, ".");
+  const fn = f.includes(".") ? normSep(f) : null;
+  const match = (s) => s.includes(f) || (fn !== null && normSep(s).includes(fn));
+  const items = f ? pool.filter(c => match(c.toLowerCase()) ||
+    (hasRn && match(displayClassDesc(c).toLowerCase()))) : pool;
   const scopeLabel = selectedDex === "all"
     ? `${allClasses.length} classes`
     : (() => {
