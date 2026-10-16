@@ -216,7 +216,10 @@ server.registerTool("search_symbols", {
 server.registerTool("callers_of_method", {
   description: "Cross-references TO a method: every call site invoking the given " +
     'method descriptor ("La/b/C;->name(...)Ret"), with bytecode offsets. Same ' +
-    "engine path as the web UI's xref popup.",
+    "engine path as the web UI's xref popup. Sites carry shadowed:true when the " +
+    "caller's class resolves to another loaded dex (first-wins), i.e. that copy " +
+    "never executes — typically only in multi-source (add_dump) sessions, though " +
+    "a single APK with duplicate classdefs can also set it.",
   inputSchema: {
     method_desc: z.string().describe("full method descriptor"),
     limit: z.number().int().min(1).max(1000).default(200),
@@ -224,7 +227,8 @@ server.registerTool("callers_of_method", {
 }, wrap(async ({ method_desc, limit = 200 }) => {
   const dk = requireDk();
   const sites = dk.findCallSitesWithOffset(method_desc);
-  const out = sites.slice(0, limit).map(s => ({ caller: disp(s.caller), offset: s.offset }));
+  const out = sites.slice(0, limit).map(s =>
+    ({ caller: disp(s.caller), offset: s.offset, ...(s.shadowed ? { shadowed: true } : {}) }));
   return jsonResult({ total: sites.length, truncated: sites.length > limit, callSites: out });
 }));
 

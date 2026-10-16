@@ -14,7 +14,7 @@
      derive from it (three hand-synced ?v= sites drifted apart in the past —
      the -2 bump missed the script src and shipped a mismatched pair). -->
 <script>
-window.__DEXLLM_BUILD = "db51c67-2";
+window.__DEXLLM_BUILD = "db51c67-3";
 // Kick off the wasm fetch now, in parallel with the rest of this document and
 // dexllm.js. createDexllm's own fetch uses the same URL with credentials
 // "same-origin", which is exactly what as="fetch" + crossorigin (anonymous)
@@ -3759,34 +3759,52 @@ function isSyntheticAccessor(desc) {
 //   - desc      the caller method descriptor
 //   - offset    the bytecode offset of this specific invoke inside the caller
 //               (-1 when upstream didn't fill it in)
+//   - shadowed  dexllm#107 — the caller's class resolves to another loaded
+//               dex (first-wins), so this copy of the site never executes.
+//               Typically only in multi-dex / packer-dump sessions, though a
+//               single packed APK with duplicate classdefs can also set it.
+//               Inherited through accessor hops: a live call site reached
+//               only via a shadowed accessor is itself dead.
 //   - chain     accessor chain hops from desc → original target
 // Multiple invocations from the SAME caller method are KEPT as separate
 // records (one per offset) so the popup can show "× 1 of 2" / "× 2 of 2"
 // rather than silently deduping to one row.
 function resolveTransitiveCallers(useDk, descriptors, opts = {}) {
   const MAX_CHAIN = opts.maxChain ?? 4;
-  const seen = new Set();
+  // desc → was it walked via a shadowed path? A live path may re-walk a desc
+  // first seen shadowed (to surface the live variant of its sites); the
+  // reverse never re-walks, so each desc is visited at most twice.
+  const seen = new Map();
   const result = [];
-  const queue = descriptors.map(d => ({ desc: d, chain: [] }));
+  const queue = descriptors.map(d => ({ desc: d, chain: [], shadowed: false }));
   while (queue.length) {
-    const { desc, chain } = queue.shift();
-    if (seen.has(desc) || chain.length > MAX_CHAIN) continue;
-    seen.add(desc);
+    const { desc, chain, shadowed } = queue.shift();
+    const prev = seen.get(desc);
+    if ((prev !== undefined && (prev === false || shadowed)) || chain.length > MAX_CHAIN) continue;
+    seen.set(desc, shadowed);
     let sites;
     try { sites = useDk.findCallSitesWithOffset(desc); }
     catch (_) { continue; }
     for (let i = 0; i < sites.length; i++) {
       const callerDesc = sites[i].caller;
       const offset = sites[i].offset;
+      const sh = shadowed || !!sites[i].shadowed;
       if (isSyntheticAccessor(callerDesc) && callerDesc !== desc) {
         // Walk through the accessor: enqueue ITS callers with a longer chain.
-        queue.push({ desc: callerDesc, chain: [...chain, callerDesc] });
+        queue.push({ desc: callerDesc, chain: [...chain, callerDesc], shadowed: sh });
         continue;
       }
-      result.push({ desc: callerDesc, offset, chain });
+      result.push({ desc: callerDesc, offset, shadowed: sh, chain });
     }
   }
-  return result;
+  // dexllm#107 collapse: in dump sessions the engine reports BOTH copies of a
+  // duplicated call site — a live one and a shadowed twin at the same
+  // (caller, offset). Keep the live one so occurrence counts/navigation stay
+  // correct; only sites that exist solely in a shadowed copy stay flagged.
+  // No-op in single-source sessions (no shadowed rows).
+  const liveKeys = new Set();
+  for (const r of result) if (!r.shadowed) liveKeys.add(r.desc + "@" + r.offset);
+  return result.filter(r => !r.shadowed || !liveKeys.has(r.desc + "@" + r.offset));
 }
 
 // Popup: list callers of <currentClass>->name(...). In Isolated mode the
@@ -3852,9 +3870,6 @@ function showCallersFor(cls, name, anchor) {
       seenIdx.set(r.desc, next);
       r.occurrence = next;
       r.totalOcc = totals.get(r.desc);
-      // Also collapse to "shortest chain" semantics within the same
-      // (desc, offset) pair — if both a direct and an accessor-routed hit
-      // reach the same site, keep the direct one's metadata.
     }
     const renderFlat = () => {
       body.innerHTML = "";
@@ -3872,9 +3887,14 @@ function showCallersFor(cls, name, anchor) {
           : "";
         const callerCls = c.desc.split("->")[0];
         const ext = isExternalClass(useDk, callerCls) ? externalBadgeHtml() : "";
-        item.innerHTML = ext + escAttr(displayDesc(c.desc)) + chainNote + occNote;
+        // dexllm#107: this copy of the caller lives in a dex shadowed by an
+        // earlier source, so the site never executes under this load order.
+        const shadowBadge = c.shadowed ? shadowBadgeHtml() : "";
+        if (c.shadowed) item.style.opacity = "0.6";
+        item.innerHTML = ext + shadowBadge + escAttr(displayDesc(c.desc)) + chainNote + occNote;
         item.title = (c.chain.length ? `${c.desc}\nreached via accessor chain: ${c.chain.join(" → ")}` : c.desc)
-                   + (c.totalOcc > 1 ? `\noccurrence ${c.occurrence} of ${c.totalOcc} (bytecode offset 0x${c.offset.toString(16)})` : "");
+                   + (c.totalOcc > 1 ? `\noccurrence ${c.occurrence} of ${c.totalOcc} (bytecode offset 0x${c.offset.toString(16)})` : "")
+                   + (c.shadowed ? "\nshadowed copy — its class resolves to another dex, so this site never executes under this load order" : "");
         const callerMethod = methodOfDescriptor(c.desc);
         item.onclick = () => {
           pop.classList.remove("show");
@@ -4161,6 +4181,9 @@ function isExternalClass(useDk, cls) {
 function externalBadgeHtml() {
   return '<span style="color:var(--fg-3);font:10px var(--f-ui);margin-right:6px;padding:0 4px;border:1px solid var(--bd-1);border-radius:3px">ext</span>';
 }
+function shadowBadgeHtml() {
+  return '<span style="color:var(--warn);font:10px var(--f-ui);margin-right:6px;padding:0 4px;border:1px solid var(--bd-1);border-radius:3px">shadowed</span>';
+}
 
 // ── Call-graph expansion ────────────────────────────────────────────────────
 // Recursive caller walk from a starting method descriptor. Depth-capped and
@@ -4169,18 +4192,18 @@ function externalBadgeHtml() {
 // the same resolveTransitiveCallers helper).
 function buildCallerTree(useDk, rootDescs, maxDepth = 3) {
   const seen = new Set();
-  const visit = (desc, depth) => {
-    if (seen.has(desc)) return { desc, children: [], cycle: true };
+  const visit = (desc, depth, shadowed) => {
+    if (seen.has(desc)) return { desc, shadowed, children: [], cycle: true };
     seen.add(desc);
-    if (depth >= maxDepth) return { desc, children: [], depthCapped: true };
+    if (depth >= maxDepth) return { desc, shadowed, children: [], depthCapped: true };
     let records;
     try { records = resolveTransitiveCallers(useDk, [desc]); }
     catch (_) { records = []; }
-    const children = records.map(r => visit(r.desc, depth + 1));
+    const children = records.map(r => visit(r.desc, depth + 1, r.shadowed));
     seen.delete(desc);
-    return { desc, children };
+    return { desc, shadowed, children };
   };
-  return rootDescs.map(d => visit(d, 0));
+  return rootDescs.map(d => visit(d, 0, false));
 }
 
 function renderCallerTree(tree, body, useDk, indent = 0) {
@@ -4190,12 +4213,15 @@ function renderCallerTree(tree, body, useDk, indent = 0) {
     row.style.paddingLeft = (10 + indent * 14) + "px";
     const cls = node.desc.split("->")[0];
     const ext = isExternalClass(useDk, cls) ? externalBadgeHtml() : "";
+    const shadow = node.shadowed ? shadowBadgeHtml() : "";
+    if (node.shadowed) row.style.opacity = "0.6";
     const tag = node.cycle ? ' <span style="color:var(--fg-3);font-size:10px">(cycle)</span>'
               : node.depthCapped ? ' <span style="color:var(--fg-3);font-size:10px">(depth cap)</span>'
               : node.children.length ? ` <span style="color:var(--fg-3);font-size:10px">↑ ${node.children.length}</span>`
               : '';
-    row.innerHTML = ext + escAttr(displayDesc(node.desc)) + tag;
-    row.title = node.desc;
+    row.innerHTML = ext + shadow + escAttr(displayDesc(node.desc)) + tag;
+    row.title = node.desc + (node.shadowed
+      ? "\nshadowed copy — its class resolves to another dex, so this site never executes under this load order" : "");
     row.onclick = (e) => {
       e.stopPropagation();
       $("#callerpop").classList.remove("show");

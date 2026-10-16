@@ -574,6 +574,11 @@ public:
             val o = val::object();
             o.set("caller", cs.caller_descriptor);
             o.set("offset", static_cast<int>(cs.bytecode_offset));
+            // dexllm#107: true when the caller's class resolves to another
+            // loaded dex under first-wins order, so this copy never executes.
+            // Typically only in multi-dex / packer-dump sessions, though a
+            // single APK with duplicate classdefs can also set it.
+            o.set("shadowed", cs.shadowed);
             arr.set(i++, o);
         }
         return arr;

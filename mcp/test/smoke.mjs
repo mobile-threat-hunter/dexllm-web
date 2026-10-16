@@ -201,6 +201,16 @@ try {
     JSON.stringify(ad));
   const lc3 = parse(await client.callTool({ name: "list_classes", arguments: { limit: 1 } }));
   check("post-dump query works", lc3.total > 0);
+  // the dump duplicates every class, so the ORIGINAL's call sites are shadowed
+  // (dump-first resolution) while the dump's copies are live — both must appear
+  const sx = parse(await client.callTool({
+    name: "callers_of_method",
+    arguments: { method_desc: "La2dp/Vol/AppChooser$AppInfoCache;->getAppName()Ljava/lang/String;" },
+  }));
+  check("per-site shadowed flag in dump session",
+    Array.isArray(sx.callSites) && sx.callSites.some(s => s.shadowed === true) &&
+    sx.callSites.some(s => !s.shadowed),
+    "sites=" + sx.total);
 
   // reload resets everything
   const re = parse(await client.callTool({ name: "load_apk", arguments: { path: APK } }));
