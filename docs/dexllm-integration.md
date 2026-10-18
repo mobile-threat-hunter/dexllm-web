@@ -46,7 +46,7 @@ the biggest fetch in parallel with the rest of the document instead of after
 
 ```html
 <script>
-window.__DEXLLM_BUILD = "db51c67-3";
+window.__DEXLLM_BUILD = "b1033c8-1";
 { const l = document.createElement("link");
   l.rel = "preload"; l.as = "fetch"; l.crossOrigin = "anonymous";
   l.href = "dexllm.wasm?v=" + window.__DEXLLM_BUILD;
