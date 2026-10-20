@@ -403,6 +403,29 @@ window.__DEXLLM_BUILD = "b1033c8-1";
     letter-spacing:0.06em; background:rgba(255,255,255,0.04);
     border:1px solid currentColor;
   }
+  /* Dex-section header rows in the runtime grouped view: visually a package
+     row, but tinted + separated so the dex boundary reads at a glance. Dump
+     sections reuse the dashed-red cue the dexbar tabs use. */
+  .pkg.dexsec {
+    background:rgba(255,255,255,0.03);
+    border-top:1px solid var(--line-1);
+    border-bottom:1px solid var(--line-1);
+  }
+  .pkg.dexsec .pl { font-weight:600; letter-spacing:0.02em; }
+  .pkg.dexsec.dump { border-left:3px solid #da3633aa; }
+  .pkg.dexsec.dump .pl { color:#ff9a8c; }
+  /* Declaring-dex filename next to each class (multi-dex "all" view only) —
+     dimmer than the component/IoC badges so it reads as provenance, not alert. */
+  .dex-badge {
+    display:inline-block; margin-left:8px; padding:0 6px; border-radius:4px;
+    font-size:9px; font-weight:500; line-height:15px; vertical-align:middle;
+    letter-spacing:0.03em; color:var(--fg-3);
+    background:rgba(255,255,255,0.03); border:1px solid var(--line-1);
+  }
+  /* Grouped view: this section's copy LOST first-wins — a click shows the
+     winner dex's body, so the row is dimmed and points at the winner. */
+  .dex-badge.loser { color:#ff9a8c; border-color:#da363355; }
+  .cls.shadowed-decl > span:first-child { opacity:0.55; }
   #iocbar {
     padding:0;
     max-height:30vh; overflow:auto;
@@ -1147,6 +1170,14 @@ const vfsBytes = new Set();      // vfs paths held in MEMFS (path tracking only)
 let dexInfo = [];                // per-dex: [{dex_id, name, valid, reason, sourceLabel, dump, count, sourceIdx, localDexId}]
 let selectedDex = "all";         // "all" | <dex_id:number>; class list filter
 let dexClasses = new Map();      // dex_id -> [classDescriptor, …] (from listClassesInDex; no dedup)
+let classDexNames = new Map();   // classDescriptor -> [{id, label}, …] in source-priority order (first = first-wins winner); id = dex_id, label = disambiguated display label
+let showDexBadges = false;       // computed per renderList: "all" scope + ≥2 valid dexes
+// Runtime-mode class-list grouping. "all" = the deduped union tree (classic).
+// A dex_id = group the list into per-dex sections, that dex sorted first.
+// Deliberately SEPARATE from selectedDex: that key routes decompiles, panels,
+// palette pools and history state through the isolated machinery — runtime
+// grouping is a pure list-presentation toggle and must not touch any of it.
+let runtimeGroupDex = "all";
 let viewMode = "runtime";        // "runtime" | "isolated"
 // Runtime = the running-on-ART state. classes*.dex of the APK loaded in their
 //   declared order, then dumped dexes patched on top (dumps win class
@@ -2386,6 +2417,40 @@ async function processCurrentDk(label, loadMs, opts) {
   const preservedExtras = dexInfo.filter(d => d.isolatedOnly);
   dexInfo = buildDexInfo(rep, perDexCount).concat(preservedExtras);
 
+  // Reverse map: class descriptor → declaring dex names. dexInfo is in
+  // source-priority order (dumps first, original last), so a class declared in
+  // several dexes lists its first-wins winner first — the copy the aggregate
+  // decompile actually resolves to.
+  // dex_ids shift whenever a dump is inserted ahead of the original, so a
+  // kept runtimeGroupDex could silently point at a different dex — reset.
+  runtimeGroupDex = "all";
+
+  classDexNames = new Map();
+  {
+    // A dump literally named "classes.dex" (the standard unpacker artifact)
+    // collides with the APK's own classes.dex at the label level — identity
+    // must be dex_id, and the display label disambiguated, or the loser
+    // marker silently vanishes in exactly the packer-triage case.
+    const runtimeDexes = dexInfo.filter(d => d.valid && !d.isolatedOnly);
+    const labelUse = new Map();
+    for (const d of runtimeDexes) {
+      const l = d.tabLabel || d.sourceLabel;
+      labelUse.set(l, (labelUse.get(l) || 0) + 1);
+    }
+    for (const d of runtimeDexes) {
+      const base = d.tabLabel || d.sourceLabel;
+      d.displayLabel = labelUse.get(base) > 1
+        ? `${base} (${d.dump ? "dump" : "original"})` : base;
+      const arr = dexClasses.get(d.dex_id);
+      if (!arr) continue;
+      const entry = { id: d.dex_id, label: d.displayLabel };
+      for (const c of arr) {
+        const e = classDexNames.get(c);
+        if (e) e.push(entry); else classDexNames.set(c, [entry]);
+      }
+    }
+  }
+
   // The network-IOC pass is the one load-time step whose cost scales with the
   // whole corpus rather than the clicked class, so it is deferred to the worker
   // and its result is patched in when it lands. Clearing the state and bumping
@@ -2743,11 +2808,13 @@ function renderDexBar() {
   const makeTab = (label, key, opts) => {
     const b = document.createElement("button");
     b.type = "button";
-    b.className = "dextab" + (key === selectedDex ? " sel" : "") + (opts && opts.dump ? " dump" : "") + (opts && opts.bad ? " bad" : "");
+    const sel = (opts && "sel" in opts) ? opts.sel : key === selectedDex;
+    b.className = "dextab" + (sel ? " sel" : "") + (opts && opts.dump ? " dump" : "") + (opts && opts.bad ? " bad" : "");
     b.dataset.key = String(key);
     b.innerHTML = label + (opts && opts.count != null ? ` <span class="n">${opts.count}</span>` : "");
     if (opts && opts.title) b.title = opts.title;
     b.addEventListener("click", () => {
+      if (opts && opts.onClick) { opts.onClick(); return; }
       if (selectedDex === key) return;
       selectedDex = key;
       currentClass = null; codeLineCache = [];
@@ -2767,19 +2834,42 @@ function renderDexBar() {
     return b;
   };
 
-  // Runtime mode = the ART-running aggregate view. Only one tab — there is no
-  // meaningful per-dex split when classes have already been merged with
-  // first-wins resolution. Per-dex inspection lives in Isolated.
+  // Runtime mode = the ART-running aggregate view. The [all] tab is the merged
+  // first-wins universe; with 2+ dexes, per-dex tabs follow as a GROUPING
+  // control — the list splits into per-dex sections with the clicked dex on
+  // top. Presentation only: decompiles, panels and search still run against
+  // the runtime aggregate (true per-dex inspection lives in Isolated).
   if (viewMode === "runtime") {
     const dumpCount = dumpedSources.length;
     const dumpHint = dumpCount ? ` <span class="n" style="background:#da363344;color:#ff9a8c">+${dumpCount} dump${dumpCount === 1 ? "" : "s"}</span>` : "";
     const baseLabel = originalSource ? escAttr(originalSource.label) : "all";
+    const regroup = (key) => {
+      if (runtimeGroupDex === key) return;
+      runtimeGroupDex = key;
+      renderDexBar();
+      renderList($("#search").value || "");
+    };
     makeTab(`<span class="ico">▦</span>${baseLabel}${dumpHint}`, "all", {
       count: allClasses.length,
+      sel: runtimeGroupDex === "all",
+      onClick: () => regroup("all"),
       title: `Runtime view — the APK's classes*.dex loaded in order` +
              (dumpCount ? `, then ${dumpCount} dumped dex(es) patched on top (their classes win collisions, mirroring ART after a packer unpack)` : "") +
              `. Switch to Isolated to inspect each dex in isolation.`,
     });
+    const validDexes = dexInfo.filter(d => d.valid && !d.isolatedOnly);
+    if (validDexes.length > 1) {
+      for (const d of validDexes) {
+        makeTab(escAttr(d.displayLabel || d.tabLabel || d.sourceLabel), "g-" + d.dex_id, {
+          count: d.count,
+          dump: d.dump,
+          sel: runtimeGroupDex === d.dex_id,
+          onClick: () => regroup(d.dex_id),
+          title: `${d.sourceLabel} — group the class list by dex with this one first. ` +
+                 `View only: clicking a class still decompiles the runtime (first-wins) copy.`,
+        });
+      }
+    }
     return;
   }
   // Isolated: one tab per loaded dex, no aggregate. Tab text uses the parsed
@@ -2887,17 +2977,21 @@ function compress(node) {
   return { label, node:cur };
 }
 
-function appendChildren(node, container, depth, expand) {
+// `secDex` (grouped view only) = the dex_id of the enclosing section,
+// threaded down so class rows can flag first-wins losers (see makeClassRow).
+// Compared by id, never label — dump files named "classes.dex" collide with
+// the APK's own at the label level.
+function appendChildren(node, container, depth, expand, secDex) {
   const pkgs = [...node.children.values()].sort((a,b)=>a.seg.localeCompare(b.seg));
   for (const p of pkgs) {
     const { label, node:eff } = compress(p);
-    container.appendChild(makePkgRow(label, eff, depth, expand));
+    container.appendChild(makePkgRow(label, eff, depth, expand, secDex));
   }
   const cs = node.classes.slice().sort((a,b)=>a.label.localeCompare(b.label));
-  for (const c of cs) container.appendChild(makeClassRow(c, depth));
+  for (const c of cs) container.appendChild(makeClassRow(c, depth, secDex));
 }
 
-function makePkgRow(label, eff, depth, expand) {
+function makePkgRow(label, eff, depth, expand, secDex) {
   const wrap = document.createElement("div");
   const row = document.createElement("div");
   row.className = "pkg";
@@ -2913,7 +3007,7 @@ function makePkgRow(label, eff, depth, expand) {
   const toggle = open => {
     kids.style.display = open ? "block" : "none";
     tw.textContent = open ? "▼" : "▶";
-    if (open && !built) { appendChildren(eff, kids, depth + 1, expand); built = true; }
+    if (open && !built) { appendChildren(eff, kids, depth + 1, expand, secDex); built = true; }
   };
   row.onclick = () => toggle(kids.style.display === "none");
   wrap.append(row, kids);
@@ -2921,12 +3015,41 @@ function makePkgRow(label, eff, depth, expand) {
   return wrap;
 }
 
-function makeClassRow(c, depth) {
+function makeClassRow(c, depth, secDex) {
   const div = document.createElement("div");
   div.className = "cls";
   div.style.paddingLeft = (8 + depth * 14 + 16) + "px";
   const name = document.createElement("span"); name.textContent = c.label;
   div.append(name); div.title = c.desc;
+  if (showDexBadges) {
+    const dn = classDexNames.get(c.desc);
+    if (dn) {
+      const db = document.createElement("span"); db.className = "dex-badge";
+      db.textContent = dn.length > 1 ? `${dn[0].label} +${dn.length - 1}` : dn[0].label;
+      db.title = dn.length > 1
+        ? "declared in: " + dn.map(e => e.label).join(", ") + "\n(first wins — the aggregate view resolves to " + dn[0].label + ")"
+        : "declared in " + dn[0].label;
+      div.append(db);
+      div.title = c.desc + "\n" + db.title;
+    }
+  }
+  // Grouped view: a class under a section that LOST the first-wins resolution
+  // still decompiles to the WINNER's copy on click (runtime semantics). Mark
+  // the row so the analyst isn't silently handed another dex's bytecode —
+  // the trap case is a packer stub under the original APK's section while the
+  // dump's copy is what actually runs (and what the click will show).
+  if (secDex != null) {
+    const dn = classDexNames.get(c.desc);
+    if (dn && dn[0].id !== secDex) {
+      const sb = document.createElement("span"); sb.className = "dex-badge loser";
+      sb.textContent = "→ " + dn[0].label;
+      sb.title = "also declared in " + dn[0].label + ", which wins the runtime first-wins resolution — " +
+                 "clicking decompiles THAT copy. Switch to Isolated mode to read this dex's own body.";
+      div.append(sb);
+      div.classList.add("shadowed-decl");
+      div.title = c.desc + "\n" + sb.title;
+    }
+  }
   const comp = componentIndex.get(c.desc);
   if (comp) {
     const cb = document.createElement("span"); cb.className = "comp-badge";
@@ -2939,6 +3062,18 @@ function makeClassRow(c, depth) {
   div.__clsDesc = c.desc;
   applyIocBadge(div, iocCountFor(c.desc));
   div.onclick = () => selectClass(c.desc, div);
+  // Re-attach the selection highlight when a re-render (regroup, filter,
+  // rename refresh) rebuilt the list and orphaned the previously selected
+  // element. Rows are built inside a DocumentFragment, where isConnected is
+  // still false — so a grouped-view duplicate (one row per dex section) would
+  // ALSO pass the orphan check and leave two highlighted rows. Strip the
+  // previous claimant when re-claiming; the last built row wins, and the
+  // highlight just marks "this class is open", so any of its rows is valid.
+  if (c.desc === currentClass && (!selectedEl || !selectedEl.isConnected)) {
+    if (selectedEl && selectedEl !== div) selectedEl.classList.remove("sel");
+    div.classList.add("sel");
+    selectedEl = div;
+  }
   return div;
 }
 
@@ -2951,7 +3086,9 @@ function applyIocBadge(row, n) {
   if (!b) { b = document.createElement("span"); b.className = "ioc-badge"; row.append(b); }
   b.textContent = n;
   b.title = row.__pkgNode
-    ? n + " network-indicator reference(s) under this package"
+    ? n + (row.classList.contains("dexsec")
+        ? " network-indicator reference(s) in this dex's listed classes"
+        : " network-indicator reference(s) under this package")
     : iocTitle(row.__clsDesc);
 }
 
@@ -2974,13 +3111,40 @@ function iocTitle(cd) {
     .map(cat => `${cat}: ${[...e[cat]].join(", ")}`).join("\n");
 }
 
+// Filter predicate shared by the flat and dex-grouped renders. Matches the
+// original descriptor AND the display (renamed) form. Java/smali bridge
+// (palette rule, narrowed): when the query contains a `.` — the one separator
+// java form always has and smali never does — `/` and `$` normalize to `.` on
+// both sides so "com.foo.Bar" finds "Lcom/foo/Bar;". Gating on `.` (not `/$;`)
+// keeps the "$ lists inner classes" and "/ lists packaged classes" idioms
+// literal. Literal matching runs first, so smali-form queries behave as before.
+function classMatcher(f) {
+  const hasRn = renameStore.classes.size > 0;
+  const normSep = (s) => s.replace(/[/$]/g, ".");
+  const fn = f.includes(".") ? normSep(f) : null;
+  const match = (s) => s.includes(f) || (fn !== null && normSep(s).includes(fn));
+  return (c) => match(c.toLowerCase()) || (hasRn && match(displayClassDesc(c).toLowerCase()));
+}
+
 function renderList(filter) {
   const f = filter.toLowerCase().trim();
+  const validDexCount = dexInfo.filter(d => d.valid && !d.isolatedOnly).length;
+  // Runtime dex-grouped presentation (a per-dex tab clicked on the runtime
+  // bar). Pure list layout — decompile routing and panels stay aggregate.
+  if (viewMode === "runtime" && runtimeGroupDex !== "all" && validDexCount > 1) {
+    showDexBadges = false;        // each section header already names its dex
+    renderGroupedList(f);
+    return;
+  }
   // Scope pool: "all" uses the deduped union (runtime aggregate). A per-dex
   // tab in isolated mode draws from that dex's isolated DexKit class list.
   // Isolated-only extras have string keys ("x1"); regular dexes use number
   // keys; isolated map handles both transparently.
   let pool = allClasses;
+  // Per-class dex badges only make sense where the dex is NOT implied by the
+  // scope: the runtime "all" tab over a multi-dex corpus. A per-dex tab already
+  // names its dex, and a single-dex corpus has nothing to disambiguate.
+  showDexBadges = selectedDex === "all" && validDexCount > 1;
   if (selectedDex !== "all") {
     const iso = isolated.get(selectedDex);
     if (iso && iso.classes) {
@@ -2993,19 +3157,7 @@ function renderList(filter) {
       if (Number.isFinite(did)) pool = dexClasses.get(did) || [];
     }
   }
-  // Filter matches the original descriptor AND the display (renamed) form.
-  // Java/smali bridge (palette rule, narrowed): when the query contains a
-  // `.` — the one separator java form always has and smali never does — `/`
-  // and `$` normalize to `.` on both sides so "com.foo.Bar" finds
-  // "Lcom/foo/Bar;". Gating on `.` (not `/$;`) keeps the "$ lists inner
-  // classes" and "/ lists packaged classes" idioms literal. Literal matching
-  // runs first, so smali-form queries behave exactly as before.
-  const hasRn = renameStore.classes.size > 0;
-  const normSep = (s) => s.replace(/[/$]/g, ".");
-  const fn = f.includes(".") ? normSep(f) : null;
-  const match = (s) => s.includes(f) || (fn !== null && normSep(s).includes(fn));
-  const items = f ? pool.filter(c => match(c.toLowerCase()) ||
-    (hasRn && match(displayClassDesc(c).toLowerCase()))) : pool;
+  const items = f ? pool.filter(classMatcher(f)) : pool;
   const scopeLabel = selectedDex === "all"
     ? `${allClasses.length} classes`
     : (() => {
@@ -3019,6 +3171,73 @@ function renderList(filter) {
   const frag = document.createDocumentFragment();
   appendChildren(root, frag, 0, expand);
   listEl.appendChild(frag);
+}
+
+// Dex-grouped render: one collapsible section per valid dex, the
+// runtimeGroupDex section first and opened. Sections draw from dexClasses
+// (listClassesInDex — no first-wins dedup), so a class declared in several
+// dexes appears under EACH section; surfacing that duplication is the point
+// of the grouped view. Dump sections keep the dashed-red cue.
+function renderGroupedList(f) {
+  const valid = dexInfo.filter(d => d.valid && !d.isolatedOnly);
+  const order = [
+    ...valid.filter(d => d.dex_id === runtimeGroupDex),
+    ...valid.filter(d => d.dex_id !== runtimeGroupDex),
+  ];
+  const pred = f ? classMatcher(f) : null;
+  listEl.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  let shown = 0, declared = 0;
+  const matchedUnique = f ? new Set() : null;
+  for (const d of order) {
+    const pool = dexClasses.get(d.dex_id) || [];
+    declared += pool.length;
+    const items = pred ? pool.filter(pred) : pool;
+    if (f && !items.length) continue;     // hide sections with no matches
+    shown += items.length;
+    if (matchedUnique) for (const c of items) matchedUnique.add(c);
+    const expand = !!f && items.length <= 1500;
+    frag.appendChild(makeDexSection(d, items, expand, d.dex_id === runtimeGroupDex));
+  }
+  // Section counts sum to DECLARATIONS (duplicates listed per dex), which can
+  // exceed the deduped class count — say so instead of contradicting them.
+  countEl.textContent = f
+    ? (matchedUnique.size === shown
+        ? `${shown} matches · grouped by dex`
+        : `${shown} matches (${matchedUnique.size} unique) · grouped by dex`)
+    : (declared === allClasses.length
+        ? `${allClasses.length} classes · ${order.length} dex`
+        : `${declared} declared in ${order.length} dex · ${allClasses.length} unique`);
+  listEl.appendChild(frag);
+}
+
+function makeDexSection(d, items, expand, open) {
+  const root = buildTree(items);
+  const wrap = document.createElement("div");
+  const row = document.createElement("div");
+  row.className = "pkg dexsec" + (d.dump ? " dump" : "");
+  row.style.paddingLeft = "8px";
+  const tw = document.createElement("span"); tw.className = "tw"; tw.textContent = "▶";
+  const pl = document.createElement("span"); pl.className = "pl"; pl.textContent = d.displayLabel || d.tabLabel || d.sourceLabel;
+  const cnt = document.createElement("span"); cnt.className = "cnt"; cnt.textContent = items.length;
+  row.title = d.sourceLabel + (d.dump
+    ? " — runtime-dumped dex (its classes win collisions over the original APK)"
+    : ` — dex_id ${d.dex_id}, ${d.count} declared classes`);
+  row.append(tw, pl, cnt);
+  row.__pkgNode = root;                    // patchIocBadges aggregates the section
+  applyIocBadge(row, subtreeIocCount(root));
+  const kids = document.createElement("div"); kids.className = "kids"; kids.style.display = "none";
+  let built = false;
+  const secDex = d.dex_id;
+  const toggle = o => {
+    kids.style.display = o ? "block" : "none";
+    tw.textContent = o ? "▼" : "▶";
+    if (o && !built) { appendChildren(root, kids, 1, expand, secDex); built = true; }
+  };
+  row.onclick = () => toggle(kids.style.display === "none");
+  wrap.append(row, kids);
+  if (open || expand) toggle(true);
+  return wrap;
 }
 let searchTimer = null;
 $("#search").addEventListener("input", e => {
@@ -6150,7 +6369,12 @@ function navigateToClass(desc, hint) {
     renderList($("#search").value || "");
     renderPanels();
   }
-  const row = [...listEl.querySelectorAll(".cls")].find(e => e.title === desc);
+  // Match on __clsDesc, not title — rows with a dex badge append provenance
+  // text to their title, so an exact title comparison misses every badged row.
+  // Grouped view lists duplicates once per section; prefer the winner row
+  // (the copy the decompile actually shows) over a shadowed loser row.
+  const rows = [...listEl.querySelectorAll(".cls")].filter(e => e.__clsDesc === desc);
+  const row = rows.find(e => !e.classList.contains("shadowed-decl")) || rows[0];
   selectClass(desc, row || null, hint);
   if (row) row.scrollIntoView({ block: "center", behavior: "instant" });
 }
