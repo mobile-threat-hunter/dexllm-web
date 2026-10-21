@@ -403,17 +403,47 @@ window.__DEXLLM_BUILD = "b1033c8-1";
     letter-spacing:0.06em; background:rgba(255,255,255,0.04);
     border:1px solid currentColor;
   }
-  /* Dex-section header rows in the runtime grouped view: visually a package
-     row, but tinted + separated so the dex boundary reads at a glance. Dump
-     sections reuse the dashed-red cue the dexbar tabs use. */
-  .pkg.dexsec {
-    background:rgba(255,255,255,0.03);
-    border-top:1px solid var(--line-1);
-    border-bottom:1px solid var(--line-1);
+  /* Thin divider rows in the runtime dex-sorted view: the single class tree
+     splits into "declared in <dex>" / "other classes" — a label, not a panel. */
+  .dexdivider {
+    display:flex; align-items:center; gap:10px;
+    margin:6px 0 2px; padding:4px 16px;
+    color:var(--fg-3); font:600 10px/1.4 var(--f-ui);
+    letter-spacing:0.05em; text-transform:none; white-space:nowrap;
   }
-  .pkg.dexsec .pl { font-weight:600; letter-spacing:0.02em; }
-  .pkg.dexsec.dump { border-left:3px solid #da3633aa; }
-  .pkg.dexsec.dump .pl { color:#ff9a8c; }
+  .dexdivider::before, .dexdivider::after {
+    content:""; height:1px; background:var(--line-1); flex:1;
+  }
+  .dexdivider::before { flex:0 0 12px; }
+  .dexdivider.dump { color:#ff9a8c; }
+  /* Scrollable dex-file picker dropdown (runtime bar). The dex list can run
+     to 1000+ entries (packer dumps), so it's a filtered scroll list — never
+     one tab per dex. */
+  .dexpop {
+    position:fixed; z-index:60; min-width:260px; max-width:380px;
+    background:var(--bg-3); border:1px solid var(--line-2); border-radius:10px;
+    box-shadow:0 12px 32px rgba(0,0,0,0.55);
+    padding:8px; display:flex; flex-direction:column; gap:6px;
+  }
+  .dexpop input {
+    width:100%; box-sizing:border-box; padding:6px 9px;
+    background:var(--bg-1); color:var(--fg);
+    border:1px solid var(--line-2); border-radius:7px;
+    font:500 12px/1.4 var(--f-ui); outline:none;
+  }
+  .dexpop input:focus { border-color:rgba(107,161,255,0.45); }
+  .dexpop .dexpop-list { max-height:min(46vh, 380px); overflow:auto; }
+  .dexpop .dexpop-row {
+    display:flex; align-items:baseline; gap:10px;
+    padding:5px 9px; border-radius:6px; cursor:pointer;
+    color:var(--fg-2); font:500 12px/1.5 var(--f-ui); white-space:nowrap;
+  }
+  .dexpop .dexpop-row .lbl { overflow:hidden; text-overflow:ellipsis; }
+  .dexpop .dexpop-row:hover { background:var(--bg-4); color:var(--fg); }
+  .dexpop .dexpop-row.sel { background:rgba(107,161,255,0.12); color:var(--fg); }
+  .dexpop .dexpop-row.dump { color:#ff9a8c; }
+  .dexpop .dexpop-row .cnt { margin-left:auto; color:var(--fg-3); font-size:10px; }
+  .dexpop .dexpop-empty { padding:8px 9px; color:var(--fg-3); font:500 11px/1.4 var(--f-ui); }
   /* Declaring-dex filename next to each class (multi-dex "all" view only) —
      dimmer than the component/IoC badges so it reads as provenance, not alert. */
   .dex-badge {
@@ -2803,6 +2833,7 @@ function renderDexBar() {
   bar.classList.add("show");
   // tear down old tab buttons, keep the "+ dex" control at the end
   for (const el of [...bar.querySelectorAll(".dextab")]) el.remove();
+  closeDexPicker();
   const addBtn = $("#adddex");
 
   const makeTab = (label, key, opts) => {
@@ -2835,10 +2866,12 @@ function renderDexBar() {
   };
 
   // Runtime mode = the ART-running aggregate view. The [all] tab is the merged
-  // first-wins universe; with 2+ dexes, per-dex tabs follow as a GROUPING
-  // control — the list splits into per-dex sections with the clicked dex on
-  // top. Presentation only: decompiles, panels and search still run against
-  // the runtime aggregate (true per-dex inspection lives in Isolated).
+  // first-wins universe; with 2+ dexes, a single "dex ▾" picker follows as a
+  // SORTING control — the one class panel re-sorts with the picked dex's
+  // declarations on top (never one tab/section per dex: packer dumps can run
+  // to 1000+ dex files, so the picker is a scrollable filtered list).
+  // Presentation only: decompiles, panels and search still run against the
+  // runtime aggregate (true per-dex inspection lives in Isolated).
   if (viewMode === "runtime") {
     const dumpCount = dumpedSources.length;
     const dumpHint = dumpCount ? ` <span class="n" style="background:#da363344;color:#ff9a8c">+${dumpCount} dump${dumpCount === 1 ? "" : "s"}</span>` : "";
@@ -2859,16 +2892,18 @@ function renderDexBar() {
     });
     const validDexes = dexInfo.filter(d => d.valid && !d.isolatedOnly);
     if (validDexes.length > 1) {
-      for (const d of validDexes) {
-        makeTab(escAttr(d.displayLabel || d.tabLabel || d.sourceLabel), "g-" + d.dex_id, {
-          count: d.count,
-          dump: d.dump,
-          sel: runtimeGroupDex === d.dex_id,
-          onClick: () => regroup(d.dex_id),
-          title: `${d.sourceLabel} — group the class list by dex with this one first. ` +
-                 `View only: clicking a class still decompiles the runtime (first-wins) copy.`,
+      const cur = runtimeGroupDex === "all" ? null
+        : validDexes.find(d => d.dex_id === runtimeGroupDex);
+      const btn = makeTab(
+        `dex: ${cur ? escAttr(cur.displayLabel || cur.tabLabel || cur.sourceLabel) : "all"} <span class="ico" style="margin:0 0 0 4px">▾</span>`,
+        "dexpick", {
+          count: cur ? cur.count : null,
+          dump: !!(cur && cur.dump),
+          sel: !!cur,
+          onClick: () => toggleDexPicker(btn, validDexes, regroup),
+          title: "Sort the class list by declaring dex — pick a dex file to float its classes to the top. " +
+                 "View only: clicking a class still decompiles the runtime (first-wins) copy.",
         });
-      }
     }
     return;
   }
@@ -2894,6 +2929,78 @@ function renderDexBar() {
 }
 function escAttr(s) {
   return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+// Dex-file picker dropdown: a filtered, scrollable list anchored under the
+// "dex ▾" tab. body-mounted and position:fixed because #dexbar scrolls and
+// clips its overflow. One instance at a time; renderDexBar closes it.
+let dexPickerEl = null, dexPickerDismiss = null;
+function closeDexPicker() {
+  if (dexPickerDismiss) { document.removeEventListener("mousedown", dexPickerDismiss, true);
+                          document.removeEventListener("keydown", dexPickerDismiss, true);
+                          window.removeEventListener("resize", dexPickerDismiss);
+                          dexPickerDismiss = null; }
+  if (dexPickerEl) { dexPickerEl.remove(); dexPickerEl = null; }
+}
+function toggleDexPicker(btn, validDexes, regroup) {
+  if (dexPickerEl) { closeDexPicker(); return; }
+  const pop = document.createElement("div");
+  pop.className = "dexpop";
+  const r = btn.getBoundingClientRect();
+  pop.style.top = (r.bottom + 4) + "px";
+  pop.style.left = Math.min(r.left, Math.max(8, window.innerWidth - 390)) + "px";
+
+  const inp = document.createElement("input");
+  inp.type = "text"; inp.placeholder = `filter ${validDexes.length} dex files…`;
+  const list = document.createElement("div"); list.className = "dexpop-list";
+  const empty = document.createElement("div");
+  empty.className = "dexpop-empty"; empty.textContent = "no dex matches";
+  empty.style.display = "none";
+
+  const mkRow = (label, key, count, dump, sel, tip) => {
+    const row = document.createElement("div");
+    row.className = "dexpop-row" + (sel ? " sel" : "") + (dump ? " dump" : "");
+    const lbl = document.createElement("span"); lbl.className = "lbl"; lbl.textContent = label;
+    const cnt = document.createElement("span"); cnt.className = "cnt"; cnt.textContent = count;
+    row.append(lbl, cnt);
+    if (tip) row.title = tip;
+    row.__filterKey = label.toLowerCase();
+    row.onclick = () => { closeDexPicker(); regroup(key); };
+    list.append(row);
+    return row;
+  };
+  mkRow("(all — no dex sorting)", "all", allClasses.length, false, runtimeGroupDex === "all");
+  let selRow = null;
+  for (const d of validDexes) {
+    const row = mkRow(d.displayLabel || d.tabLabel || d.sourceLabel, d.dex_id, d.count,
+                      d.dump, runtimeGroupDex === d.dex_id,
+                      d.sourceLabel + (d.dump ? " — runtime-dumped dex (wins collisions)" : ""));
+    if (runtimeGroupDex === d.dex_id) selRow = row;
+  }
+  inp.addEventListener("input", () => {
+    const q = inp.value.toLowerCase().trim();
+    let any = false;
+    for (const row of list.querySelectorAll(".dexpop-row")) {
+      const hit = !q || row.__filterKey.includes(q);
+      row.style.display = hit ? "" : "none";
+      any = any || hit;
+    }
+    empty.style.display = any ? "none" : "";
+  });
+
+  pop.append(inp, list, empty);
+  document.body.appendChild(pop);
+  dexPickerEl = pop;
+  if (selRow) selRow.scrollIntoView({ block: "center" });
+  inp.focus();
+  dexPickerDismiss = (e) => {
+    if (e.type === "resize") { closeDexPicker(); return; }   // fixed anchor goes stale
+    if (e.type === "keydown") { if (e.key === "Escape") closeDexPicker(); return; }
+    if (!pop.contains(e.target) && !btn.contains(e.target)) closeDexPicker();
+  };
+  document.addEventListener("mousedown", dexPickerDismiss, true);
+  document.addEventListener("keydown", dexPickerDismiss, true);
+  window.addEventListener("resize", dexPickerDismiss);
 }
 
 // Network-indicator / permission status pills (composed from current totals).
@@ -3086,9 +3193,7 @@ function applyIocBadge(row, n) {
   if (!b) { b = document.createElement("span"); b.className = "ioc-badge"; row.append(b); }
   b.textContent = n;
   b.title = row.__pkgNode
-    ? n + (row.classList.contains("dexsec")
-        ? " network-indicator reference(s) in this dex's listed classes"
-        : " network-indicator reference(s) under this package")
+    ? n + " network-indicator reference(s) under this package"
     : iocTitle(row.__clsDesc);
 }
 
@@ -3173,71 +3278,49 @@ function renderList(filter) {
   listEl.appendChild(frag);
 }
 
-// Dex-grouped render: one collapsible section per valid dex, the
-// runtimeGroupDex section first and opened. Sections draw from dexClasses
-// (listClassesInDex — no first-wins dedup), so a class declared in several
-// dexes appears under EACH section; surfacing that duplication is the point
-// of the grouped view. Dump sections keep the dashed-red cue.
+// Dex-sorted render: ONE class panel, split in two by thin divider labels —
+// the picked dex's declarations on top, every other class below. Still the
+// deduped runtime universe: each class appears exactly once (in the top part
+// when the picked dex declares it, even if that copy LOST first-wins — those
+// rows carry the "→ winner" marker via secDex). No per-dex sections/panels:
+// the corpus can hold 1000+ dex files and the list must stay a single scroll.
 function renderGroupedList(f) {
-  const valid = dexInfo.filter(d => d.valid && !d.isolatedOnly);
-  const order = [
-    ...valid.filter(d => d.dex_id === runtimeGroupDex),
-    ...valid.filter(d => d.dex_id !== runtimeGroupDex),
-  ];
+  const d = dexInfo.find(x => x.valid && !x.isolatedOnly && x.dex_id === runtimeGroupDex);
+  if (!d) { runtimeGroupDex = "all"; renderList(f); return; }   // stale pick
+  const label = d.displayLabel || d.tabLabel || d.sourceLabel;
   const pred = f ? classMatcher(f) : null;
+  const declaredSet = new Set(dexClasses.get(d.dex_id) || []);
+  const top = pred ? [...declaredSet].filter(pred) : [...declaredSet];
+  const rest = allClasses.filter(c => !declaredSet.has(c) && (!pred || pred(c)));
+
+  const mkDivider = (text, dump, tip) => {
+    const div = document.createElement("div");
+    div.className = "dexdivider" + (dump ? " dump" : "");
+    div.textContent = text;
+    if (tip) div.title = tip;
+    return div;
+  };
   listEl.innerHTML = "";
   const frag = document.createDocumentFragment();
-  let shown = 0, declared = 0;
-  const matchedUnique = f ? new Set() : null;
-  for (const d of order) {
-    const pool = dexClasses.get(d.dex_id) || [];
-    declared += pool.length;
-    const items = pred ? pool.filter(pred) : pool;
-    if (f && !items.length) continue;     // hide sections with no matches
-    shown += items.length;
-    if (matchedUnique) for (const c of items) matchedUnique.add(c);
-    const expand = !!f && items.length <= 1500;
-    frag.appendChild(makeDexSection(d, items, expand, d.dex_id === runtimeGroupDex));
+  if (top.length) {
+    frag.appendChild(mkDivider(`declared in ${label} (${top.length})`, d.dump,
+      d.sourceLabel + (d.dump
+        ? " — runtime-dumped dex (its classes win collisions over the original APK)"
+        : ` — dex_id ${d.dex_id}`) +
+      ". Dimmed rows lost the first-wins resolution — clicking shows the winner's copy."));
+    appendChildren(buildTree(top), frag, 0, top.length <= 1500, d.dex_id);
   }
-  // Section counts sum to DECLARATIONS (duplicates listed per dex), which can
-  // exceed the deduped class count — say so instead of contradicting them.
+  if (rest.length) {
+    frag.appendChild(mkDivider(`other classes (${rest.length})`, false,
+      "classes not declared in " + label));
+    // Asymmetric on purpose: the picked dex is what the user asked to see, so
+    // its half auto-expands; the rest only opens up under an active filter.
+    appendChildren(buildTree(rest), frag, 0, !!f && rest.length <= 1500);
+  }
   countEl.textContent = f
-    ? (matchedUnique.size === shown
-        ? `${shown} matches · grouped by dex`
-        : `${shown} matches (${matchedUnique.size} unique) · grouped by dex`)
-    : (declared === allClasses.length
-        ? `${allClasses.length} classes · ${order.length} dex`
-        : `${declared} declared in ${order.length} dex · ${allClasses.length} unique`);
+    ? `${top.length + rest.length} / ${allClasses.length} classes · ${top.length} in ${label}`
+    : `${allClasses.length} classes · ${top.length} declared in ${label}`;
   listEl.appendChild(frag);
-}
-
-function makeDexSection(d, items, expand, open) {
-  const root = buildTree(items);
-  const wrap = document.createElement("div");
-  const row = document.createElement("div");
-  row.className = "pkg dexsec" + (d.dump ? " dump" : "");
-  row.style.paddingLeft = "8px";
-  const tw = document.createElement("span"); tw.className = "tw"; tw.textContent = "▶";
-  const pl = document.createElement("span"); pl.className = "pl"; pl.textContent = d.displayLabel || d.tabLabel || d.sourceLabel;
-  const cnt = document.createElement("span"); cnt.className = "cnt"; cnt.textContent = items.length;
-  row.title = d.sourceLabel + (d.dump
-    ? " — runtime-dumped dex (its classes win collisions over the original APK)"
-    : ` — dex_id ${d.dex_id}, ${d.count} declared classes`);
-  row.append(tw, pl, cnt);
-  row.__pkgNode = root;                    // patchIocBadges aggregates the section
-  applyIocBadge(row, subtreeIocCount(root));
-  const kids = document.createElement("div"); kids.className = "kids"; kids.style.display = "none";
-  let built = false;
-  const secDex = d.dex_id;
-  const toggle = o => {
-    kids.style.display = o ? "block" : "none";
-    tw.textContent = o ? "▼" : "▶";
-    if (o && !built) { appendChildren(root, kids, 1, expand, secDex); built = true; }
-  };
-  row.onclick = () => toggle(kids.style.display === "none");
-  wrap.append(row, kids);
-  if (open || expand) toggle(true);
-  return wrap;
 }
 let searchTimer = null;
 $("#search").addEventListener("input", e => {
