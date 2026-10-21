@@ -455,6 +455,11 @@ window.__DEXLLM_BUILD = "b1033c8-1";
   /* Grouped view: this section's copy LOST first-wins — a click shows the
      winner dex's body, so the row is dimmed and points at the winner. */
   .dex-badge.loser { color:#ff9a8c; border-color:#da363355; }
+  /* Leading placements (viewer header, evidence rows): the badge comes BEFORE
+     the value, so a long FQN/string truncates the text — never the provenance. */
+  #vhead .dex-badge, .iocitem > .dex-badge { margin-left:0; }
+  #vhead .dex-badge { flex:none; }
+  .isubitem .dex-badge { margin-left:0; margin-right:8px; }
   .cls.shadowed-decl > span:first-child { opacity:0.55; }
   #iocbar {
     padding:0;
@@ -1063,7 +1068,7 @@ window.__DEXLLM_BUILD = "b1033c8-1";
     <div id="classlist"></div>
   </div>
   <div id="viewer">
-    <div id="vhead"><span class="name" id="vname">— select a class —</span>
+    <div id="vhead"><span class="dex-badge" id="vdex" style="display:none"></span><span class="name" id="vname">— select a class —</span>
       <span id="vmeta"></span>
       <span class="smalibtn" id="smaliBtn" title="Toggle smali sync pane — click a Java line to see the matching bytecode instruction"><span class="smalibtn-icon">↔</span>smali</span>
       <span class="copybtn" id="copyCode" title="Copy the whole decompiled class as text">⧉ copy</span></div>
@@ -2834,6 +2839,9 @@ function refreshRuntimeStatus() {
 // every loaded dex via first-wins; in isolated mode each dex is its own tab
 // with no aggregate. Hidden until the first APK loads.
 function renderDexBar() {
+  // Every mode/tab/dump transition routes through here, so this keeps the
+  // viewer-header dex badge in sync (labels shift when a dump is added).
+  updateViewerDexBadge();
   const bar = $("#dexbar");
   if (!dexInfo.length) { bar.classList.remove("show"); return; }
   bar.classList.add("show");
@@ -3582,6 +3590,23 @@ function panelDexBadge(cls) {
   return b;
 }
 
+// Viewer-header provenance: the declaring dex of the OPEN class, leading
+// #vname so a long FQN can't push it out of view. Same visibility rule as the
+// class-tree badges (runtime "all" scope over a multi-dex corpus) — per-dex /
+// isolated tabs already name their source in #vmeta's dexNote.
+function updateViewerDexBadge() {
+  const b = $("#vdex");
+  const multi = viewMode === "runtime" && selectedDex === "all" &&
+    dexInfo.filter(d => d.valid && !d.isolatedOnly).length > 1;
+  const dn = multi && currentClass ? classDexNames.get(currentClass) : null;
+  if (!dn) { b.style.display = "none"; b.textContent = ""; b.title = ""; return; }
+  b.textContent = dn.length > 1 ? `${dn[0].label} +${dn.length - 1}` : dn[0].label;
+  b.title = dn.length > 1
+    ? "declared in: " + dn.map(e => e.label).join(", ") + "\n(first wins — this view shows " + dn[0].label + "'s copy)"
+    : "declared in " + dn[0].label;
+  b.style.display = "";
+}
+
 // network indicators panel (top of the two right panels)
 function renderIocPanel() {
   computePanelDexCtx();
@@ -3933,12 +3958,11 @@ function makeNavRow(label, cat, targets, noun, lazy) {
   const cnt = document.createElement("span"); cnt.className = "icnt";
   const n = targets.length;
   cnt.textContent = n === 0 ? "— none" : n === 1 ? "→" : "▶ " + n + " " + noun;
-  row.append(val);
   if (n === 1) {
     const db = panelDexBadge(targets[0].cls);
     if (db) row.append(db);
   }
-  row.append(cnt);
+  row.append(val, cnt);
   row.title = label + (n ? `\n${n} ${noun}` : "");
   if (n === 1) {
     row.onclick = () => navigateToClass(targets[0].cls, targets[0].hint);
@@ -3948,7 +3972,7 @@ function makeNavRow(label, cat, targets, noun, lazy) {
     for (const t of targets) {
       const s = document.createElement("div"); s.className = "isubitem"; s.textContent = t.display; s.title = t.display;
       const db = panelDexBadge(t.cls);
-      if (db) s.append(db);
+      if (db) s.prepend(db);
       s.onclick = ev => { ev.stopPropagation(); navigateToClass(t.cls, t.hint); };
       sub.appendChild(s);
     }
@@ -6629,6 +6653,7 @@ function selectClass(cls, el, hint) {
   pushNavState(hint);
   $("#vname").textContent = displayClassDesc(cls);
   $("#vname").title = cls;
+  updateViewerDexBadge();
   // The worker runs one job at a time, so a click during the deferred indicator
   // scan waits for the scan to finish. Say so rather than letting the spinner
   // imply the decompile itself is this slow.
