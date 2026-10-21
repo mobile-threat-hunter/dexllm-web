@@ -449,7 +449,7 @@ window.__DEXLLM_BUILD = "b1033c8-1";
   .dex-badge {
     display:inline-block; margin-left:8px; padding:0 6px; border-radius:4px;
     font-size:9px; font-weight:500; line-height:15px; vertical-align:middle;
-    letter-spacing:0.03em; color:var(--fg-3);
+    letter-spacing:0.03em; color:var(--fg-3); white-space:nowrap;
     background:rgba(255,255,255,0.03); border:1px solid var(--line-1);
   }
   /* Grouped view: this section's copy LOST first-wins — a click shows the
@@ -2887,6 +2887,7 @@ function renderDexBar() {
       runtimeGroupDex = key;
       renderDexBar();
       renderList($("#search").value || "");
+      renderPanels();   // evidence panels follow the picked dex
     };
     makeTab(`<span class="ico">▦</span>${baseLabel}${dumpHint}`, "all", {
       count: allClasses.length,
@@ -2907,7 +2908,8 @@ function renderDexBar() {
           dump: !!(cur && cur.dump),
           sel: !!cur,
           onClick: () => toggleDexPicker(btn, validDexes, regroup),
-          title: "Sort the class list by declaring dex — pick a dex file to float its classes to the top. " +
+          title: "Pick a dex file to float its classes to the top of the tree and filter the " +
+                 "IoC / permission / capability / component panels to evidence from its declared classes. " +
                  "View only: clicking a class still decompiles the runtime (first-wins) copy.",
         });
     }
@@ -3535,8 +3537,54 @@ function renderIocBar(cls) {
 // ---- right panel: every indicator + dangerous-permission caller, click to jump ----
 function renderPanels() { renderIocPanel(); renderPermPanel(); }
 
+// Dex provenance context for the evidence panels. Non-null only in runtime
+// mode with 2+ valid dexes — the same visibility rule as the class-tree
+// badges. Recomputed at the top of each panel render (chip toggles re-enter
+// renderPermPanel directly, bypassing renderPanels) so makeNavRow reads a
+// cache instead of filtering dexInfo per row on 1000+-dex corpora.
+let panelDexCtx = null;
+function computePanelDexCtx() {
+  panelDexCtx = null;
+  if (viewMode !== "runtime") return;
+  const valid = dexInfo.filter(d => d.valid && !d.isolatedOnly);
+  if (valid.length < 2) return;
+  const picked = runtimeGroupDex === "all" ? null
+    : valid.find(d => d.dex_id === runtimeGroupDex) || null;
+  panelDexCtx = {
+    picked,
+    declared: picked ? new Set(dexClasses.get(picked.dex_id) || []) : null,
+    label: picked ? (picked.displayLabel || picked.tabLabel || picked.sourceLabel) : null,
+  };
+}
+// Evidence attribution is by DECLARATION (matches the tree's two-part sort):
+// a class declared in the picked dex passes even when its runtime copy is
+// shadowed — the loser badge then points at the dex whose copy the evidence
+// text actually came from.
+const inPickedDex = cls => !panelDexCtx || !panelDexCtx.declared || panelDexCtx.declared.has(cls);
+
+function panelDexBadge(cls) {
+  if (!panelDexCtx) return null;
+  const dn = classDexNames.get(cls);
+  if (!dn) return null;
+  const b = document.createElement("span");
+  if (panelDexCtx.picked && dn[0].id !== panelDexCtx.picked.dex_id) {
+    b.className = "dex-badge loser";
+    b.textContent = "→ " + dn[0].label;
+    b.title = "declared in " + panelDexCtx.label + " but shadowed — the runtime copy " +
+              "(and this evidence) comes from " + dn[0].label;
+  } else {
+    b.className = "dex-badge";
+    b.textContent = dn.length > 1 ? `${dn[0].label} +${dn.length - 1}` : dn[0].label;
+    b.title = dn.length > 1
+      ? "declared in: " + dn.map(e => e.label).join(", ") + "\n(first wins — evidence resolves to " + dn[0].label + ")"
+      : "declared in " + dn[0].label;
+  }
+  return b;
+}
+
 // network indicators panel (top of the two right panels)
 function renderIocPanel() {
+  computePanelDexCtx();
   const panel = $("#iocpanel"), body = $("#iocpanelbody");
   if (!iocIndex.length) {
     if (iocPending) {                        // scan still running — show progress
@@ -3548,12 +3596,13 @@ function renderIocPanel() {
     panel.classList.add("empty"); body.innerHTML = ""; return;
   }
   panel.classList.remove("empty");
-  $("#iocphd").innerHTML = `indicators <span class="ipcount" title="distinct indicators">${iocIndex.length}</span>`;
+  const picked = !!(panelDexCtx && panelDexCtx.picked);
   const filt = ($("#iocfilter").value || "").toLowerCase().trim();
   body.innerHTML = ""; let shown = 0;
   for (const cat of IOC_CATS) {
     const items = iocIndex
-      .filter(x => x.cat === cat && (!filt || x.value.toLowerCase().includes(filt)))
+      .filter(x => x.cat === cat && (!filt || x.value.toLowerCase().includes(filt)) &&
+                   (!picked || x.classes.some(inPickedDex)))
       .sort((a, b) => a.value.localeCompare(b.value));
     if (!items.length) continue;
     const h = document.createElement("div"); h.className = "iocgrp cat-" + cat;
@@ -3571,21 +3620,24 @@ function renderIocPanel() {
     body.appendChild(h);
     for (const it of items) {
       body.appendChild(makeNavRow(it.value, it.cat,
-        it.classes.map(c => ({ display: c, cls: c, hint: { needle: it.value } })),
+        it.classes.filter(inPickedDex).map(c => ({ display: c, cls: c, hint: { needle: it.value } })),
         "classes"));
       shown++;
     }
   }
+  $("#iocphd").innerHTML = picked
+    ? `indicators <span class="ipcount" title="indicators used by classes declared in ${escAttr(panelDexCtx.label)}, of ${iocIndex.length} total — pick (all) in the dex picker to clear">${shown} / ${iocIndex.length}</span>`
+    : `indicators <span class="ipcount" title="distinct indicators">${iocIndex.length}</span>`;
   if (!shown) { const d = document.createElement("div"); d.className = "iocgrp"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); }
 }
 
 // Header chips: one per protection level actually present, toggling
 // activePermLevels. Counts reflect mapped gated-API usages (pre text-filter).
-function renderPermLevels() {
+function renderPermLevels(list = permIndex) {
   const bar = $("#permlevels");
-  if (!permIndex.length) { bar.innerHTML = ""; return; }
+  if (!list.length) { bar.innerHTML = ""; return; }
   const counts = new Map();
-  for (const p of permIndex) counts.set(p.level, (counts.get(p.level) || 0) + 1);
+  for (const p of list) counts.set(p.level, (counts.get(p.level) || 0) + 1);
   bar.innerHTML = "";
   for (const lv of PERM_LEVELS) {
     const n = counts.get(lv.key) || 0;
@@ -3649,11 +3701,15 @@ function renderCapPanel(panel, body) {
   }
   panel.classList.remove("empty");
   renderCapCats();
+  const picked = !!(panelDexCtx && panelDexCtx.picked);
+  const srcHits = picked
+    ? capReport.apiHits.filter(h => h.callers.some(c => inPickedDex(classOfMethod(c))))
+    : capReport.apiHits;
   const filt = ($("#permfilter").value || "").toLowerCase().trim();
   body.innerHTML = "";
   const byCat = new Map();
   let shown = 0;
-  for (const h of capReport.apiHits) {
+  for (const h of srcHits) {
     const hay = (h.apiSignature + " " + h.permissions.join(" ")).toLowerCase();
     if (filt && !hay.includes(filt) && !h.callers.some(c => c.toLowerCase().includes(filt))) continue;
     let any = false;
@@ -3671,7 +3727,8 @@ function renderCapPanel(panel, body) {
   if (capReport.totalFieldAccesses) hdBits.push(`${capReport.totalFieldAccesses} field read${capReport.totalFieldAccesses === 1 ? "" : "s"}`);
   hdBits.push(`app code only — ${capReport.droppedTouches} library touches across ${capReport.droppedApis} APIs dropped`);
   if (capReport.shadowedTouches) hdBits.push(`${capReport.shadowedTouches} shadowed (never executes under this load order)`);
-  $("#permhd2").innerHTML = `capabilities <span class="ipcount" title="catalog APIs shown · ${escAttr(hdBits.join(" · "))}">${shown}</span>`;
+  if (picked) hdBits.unshift(`showing APIs with a caller declared in ${panelDexCtx.label}, of ${capReport.apiHits.length} total — pick (all) in the dex picker to clear (category chips count the whole corpus)`);
+  $("#permhd2").innerHTML = `capabilities <span class="ipcount" title="catalog APIs shown · ${escAttr(hdBits.join(" · "))}">${picked ? `${shown} / ${capReport.apiHits.length}` : shown}</span>`;
   if (!byCat.size) { const d = document.createElement("div"); d.className = "permsec"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); return; }
   const tagCount = t => capReport.categories[t] ?? (capReport.flags || {})[t] ?? 0;
   const cats = [...byCat.keys()].sort((a, b) =>
@@ -3690,7 +3747,7 @@ function renderCapPanel(panel, body) {
       const isField = h.fieldAccessCount > 0;
       const name = methodNameOf(h.apiSignature).split(":")[0];
       const label = simpleName(descToJava(classOfMethod(h.apiSignature))) + (isField ? "." : "#") + name;
-      const nav = makeNavRow(label, "perm", h.callers.slice().sort().map(c => ({
+      const nav = makeNavRow(label, "perm", h.callers.filter(c => inPickedDex(classOfMethod(c))).sort().map(c => ({
         display: c, cls: classOfMethod(c),
         hint: { needle: name, scope: methodNameOf(c) },
       })), "callers");
@@ -3747,6 +3804,7 @@ function renderCompPanel(panel, body) {
   }
   panel.classList.remove("empty");
   renderCompKinds();
+  const picked = !!(panelDexCtx && panelDexCtx.picked);
   const filt = ($("#permfilter").value || "").toLowerCase().trim();
   body.innerHTML = "";
   let shown = 0;
@@ -3754,7 +3812,7 @@ function renderCompPanel(panel, body) {
     if (!activeCompKinds.has(entry.kind)) continue;
     const all = componentGroups.get(entry.kind);
     if (!all) continue;
-    const list = filt ? all.filter(d => d.toLowerCase().includes(filt)) : all;
+    const list = all.filter(d => (!filt || d.toLowerCase().includes(filt)) && inPickedDex(d));
     if (!list.length) continue;
     shown += list.length;
     const hd = document.createElement("div"); hd.className = "permlvlhd";
@@ -3770,12 +3828,15 @@ function renderCompPanel(panel, body) {
     }
   }
   const total = [...componentGroups.values()].reduce((n, l) => n + l.length, 0);
-  $("#permhd2").innerHTML = `components <span class="ipcount" title="candidate classes shown of ${total} found · declaration in AndroidManifest.xml is NOT verified">${shown}</span>`;
+  $("#permhd2").innerHTML = picked
+    ? `components <span class="ipcount" title="candidates declared in ${escAttr(panelDexCtx.label)}, of ${total} found — pick (all) in the dex picker to clear (kind chips count the whole corpus) · declaration in AndroidManifest.xml is NOT verified">${shown} / ${total}</span>`
+    : `components <span class="ipcount" title="candidate classes shown of ${total} found · declaration in AndroidManifest.xml is NOT verified">${shown}</span>`;
   if (!shown) { const d = document.createElement("div"); d.className = "permsec"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); }
 }
 
 // permission callers — separate panel, grouped by protection level then permission
 function renderPermPanel() {
+  computePanelDexCtx();
   const panel = $("#permpanel"), body = $("#permpanelbody");
   for (const t of document.querySelectorAll("#permtabs .permtab")) {
     t.classList.toggle("on", t.dataset.tab === permTab);
@@ -3804,13 +3865,19 @@ function renderPermPanel() {
     return;
   }
   panel.classList.remove("empty");
-  renderPermLevels();
+  const picked = !!(panelDexCtx && panelDexCtx.picked);
+  const dexRows = picked
+    ? permIndex.filter(p => p.callers.some(c => inPickedDex(classOfMethod(c))))
+    : permIndex;
+  renderPermLevels(dexRows);
   const filt = ($("#permfilter").value || "").toLowerCase().trim();
   body.innerHTML = "";
-  const prows = permIndex.filter(p => activePermLevels.has(p.level) && (!filt ||
+  const prows = dexRows.filter(p => activePermLevels.has(p.level) && (!filt ||
     p.api.toLowerCase().includes(filt) || p.perm.toLowerCase().includes(filt) ||
     p.callers.some(c => c.toLowerCase().includes(filt))));
-  $("#permhd2").innerHTML = `permissions <span class="ipcount" title="gated-API usages shown (app code)">${prows.length}</span>`;
+  $("#permhd2").innerHTML = picked
+    ? `permissions <span class="ipcount" title="gated-API usages with a caller declared in ${escAttr(panelDexCtx.label)}, of ${permIndex.length} total — pick (all) in the dex picker to clear">${prows.length} / ${permIndex.length}</span>`
+    : `permissions <span class="ipcount" title="gated-API usages shown (app code)">${prows.length}</span>`;
   if (!prows.length) { const d = document.createElement("div"); d.className = "permsec"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); return; }
   // Bucket rows by protection level (severity order), then by permission.
   const byLevel = new Map();
@@ -3840,7 +3907,7 @@ function renderPermPanel() {
       // making the glow land on the method header instead of the call site.
       // Strip "(...)" so the needle is just the method NAME.
       const apiName = apiMethod.split("(")[0];
-      const targets = r.callers.slice().sort().map(c => ({
+      const targets = r.callers.filter(c => inPickedDex(classOfMethod(c))).sort().map(c => ({
         display: c, cls: classOfMethod(c),
         hint: { needle: apiName, scope: methodNameOf(c) },
       }));
@@ -3866,7 +3933,12 @@ function makeNavRow(label, cat, targets, noun, lazy) {
   const cnt = document.createElement("span"); cnt.className = "icnt";
   const n = targets.length;
   cnt.textContent = n === 0 ? "— none" : n === 1 ? "→" : "▶ " + n + " " + noun;
-  row.append(val, cnt);
+  row.append(val);
+  if (n === 1) {
+    const db = panelDexBadge(targets[0].cls);
+    if (db) row.append(db);
+  }
+  row.append(cnt);
   row.title = label + (n ? `\n${n} ${noun}` : "");
   if (n === 1) {
     row.onclick = () => navigateToClass(targets[0].cls, targets[0].hint);
@@ -3875,6 +3947,8 @@ function makeNavRow(label, cat, targets, noun, lazy) {
     const hint = document.createElement("div"); hint.className = "isubhint"; hint.textContent = "pick one:"; sub.appendChild(hint);
     for (const t of targets) {
       const s = document.createElement("div"); s.className = "isubitem"; s.textContent = t.display; s.title = t.display;
+      const db = panelDexBadge(t.cls);
+      if (db) s.append(db);
       s.onclick = ev => { ev.stopPropagation(); navigateToClass(t.cls, t.hint); };
       sub.appendChild(s);
     }
