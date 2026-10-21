@@ -2462,15 +2462,21 @@ async function processCurrentDk(label, loadMs, opts) {
     // must be dex_id, and the display label disambiguated, or the loser
     // marker silently vanishes in exactly the packer-triage case.
     const runtimeDexes = dexInfo.filter(d => d.valid && !d.isolatedOnly);
-    const labelUse = new Map();
+    const labelUse = new Map(), dumpLabelUse = new Map();
     for (const d of runtimeDexes) {
       const l = d.tabLabel || d.sourceLabel;
       labelUse.set(l, (labelUse.get(l) || 0) + 1);
+      if (d.dump) dumpLabelUse.set(l, (dumpLabelUse.get(l) || 0) + 1);
     }
     for (const d of runtimeDexes) {
       const base = d.tabLabel || d.sourceLabel;
-      d.displayLabel = labelUse.get(base) > 1
-        ? `${base} (${d.dump ? "dump" : "original"})` : base;
+      // Same-named dumps (e.g. two unpacker artifacts both called
+      // "classes.dex") get their insertion number — it matches the
+      // /dump-N.bin vfs numbering, so status text and labels agree.
+      d.displayLabel = labelUse.get(base) <= 1 ? base
+        : !d.dump ? `${base} (original)`
+        : dumpLabelUse.get(base) > 1 ? `${base} (dump ${d.sourceIdx + 1})`
+        : `${base} (dump)`;
       const arr = dexClasses.get(d.dex_id);
       if (!arr) continue;
       const entry = { id: d.dex_id, label: d.displayLabel };
