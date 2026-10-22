@@ -8,10 +8,13 @@ your device, no upload.
 ## Run it
 
 - **Hosted demo**: <https://mobile-threat-hunter.github.io/dexllm-web>
-- **Windows local**: download
-  [`dist/dexllm-web.exe`](dist/dexllm-web.exe), double-click — a console window
-  prints the local URL and the default browser opens. The entire UI runs from
-  `127.0.0.1` with no further network traffic. Source + build instructions in
+- **Windows local**: download the latest
+  `dexllm-web-vX.Y.Z-windows-amd64.exe` from
+  [Releases](https://github.com/mobile-threat-hunter/dexllm-web/releases/latest),
+  double-click — a console window prints the local URL and the default browser
+  opens. The entire UI runs from `127.0.0.1` with no further network traffic.
+  The exe is only distributed through Releases (the repo doesn't carry a
+  binary — don't use a `Download ZIP` copy). Source + build instructions in
   [`cmd/dexllm-web/`](cmd/dexllm-web/).
 
 ## Why an .exe instead of just opening index.html
