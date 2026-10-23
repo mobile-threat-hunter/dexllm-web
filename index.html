@@ -457,10 +457,11 @@ window.__DEXLLM_BUILD = "b1033c8-1";
   .dex-badge.loser { color:#ff9a8c; border-color:#da363355; }
   /* Leading placements (viewer header, evidence rows): the badge comes BEFORE
      the value, so a long FQN/string truncates the text — never the provenance. */
-  #vhead .dex-badge, .iocitem > .dex-badge { margin-left:0; }
-  #vhead .dex-badge { flex:none; }
-  .isubitem .dex-badge { margin-left:0; margin-right:8px; }
-  .cls.shadowed-decl > span:first-child { opacity:0.55; }
+  #vhead .dex-badge { margin-left:0; flex:none; }
+  .isubitem .dex-badge, .cls .dex-badge { margin-left:0; margin-right:8px; }
+  /* Dim everything but the (now leading) loser badge, which must stay legible
+     since it names the dex whose copy a click will actually show. */
+  .cls.shadowed-decl > span:not(.dex-badge) { opacity:0.55; }
   #iocbar {
     padding:0;
     max-height:30vh; overflow:auto;
@@ -3152,7 +3153,7 @@ function makeClassRow(c, depth, secDex) {
       db.title = dn.length > 1
         ? "declared in: " + dn.map(e => e.label).join(", ") + "\n(first wins — the aggregate view resolves to " + dn[0].label + ")"
         : "declared in " + dn[0].label;
-      div.append(db);
+      div.prepend(db);
       div.title = c.desc + "\n" + db.title;
     }
   }
@@ -3168,7 +3169,7 @@ function makeClassRow(c, depth, secDex) {
       sb.textContent = "→ " + dn[0].label;
       sb.title = "also declared in " + dn[0].label + ", which wins the runtime first-wins resolution — " +
                  "clicking decompiles THAT copy. Switch to Isolated mode to read this dex's own body.";
-      div.append(sb);
+      div.prepend(sb);
       div.classList.add("shadowed-decl");
       div.title = c.desc + "\n" + sb.title;
     }
@@ -3957,16 +3958,13 @@ function makeNavRow(label, cat, targets, noun, lazy) {
   const val = document.createElement("span"); val.className = "ival"; val.textContent = label;
   const cnt = document.createElement("span"); cnt.className = "icnt";
   const n = targets.length;
-  cnt.textContent = n === 0 ? "— none" : n === 1 ? "→" : "▶ " + n + " " + noun;
-  if (n === 1) {
-    const db = panelDexBadge(targets[0].cls);
-    if (db) row.append(db);
-  }
+  cnt.textContent = n === 0 ? "— none" : "▶ " + n + " " + noun;
   row.append(val, cnt);
   row.title = label + (n ? `\n${n} ${noun}` : "");
-  if (n === 1) {
-    row.onclick = () => navigateToClass(targets[0].cls, targets[0].hint);
-  } else if (n > 1) {
+  // A single target used to jump directly with an inline badge; it now gets
+  // the same expand-to-"pick one" treatment as n>1 so every row reads the
+  // same and the dex badge always lives on the sub-entry (user preference).
+  if (n >= 1) {
     const sub = document.createElement("div"); sub.className = "isub"; sub.style.display = "none";
     const hint = document.createElement("div"); hint.className = "isubhint"; hint.textContent = "pick one:"; sub.appendChild(hint);
     for (const t of targets) {
@@ -4000,7 +3998,7 @@ function makeNavRow(label, cat, targets, noun, lazy) {
       // path: replace this row with a fresh one and re-fire it.
       const fresh = makeNavRow(label, cat, found, noun);
       wrap.replaceWith(fresh);
-      // Auto-fire navigation: if 1 target, jump; else expand picker.
+      // Auto-fire: expand the fresh row's "pick one" picker.
       fresh.querySelector(".iocitem")?.click();
     };
   }
@@ -4987,15 +4985,25 @@ function openSymbolSearch() {
       selected = 0;
       list.innerHTML = "";
       if (!all.length) { list.innerHTML = '<div style="padding:8px 12px;color:var(--fg-3)">no matches</div>'; return; }
+      // Declaring-dex badge, LEADING the symbol text (same visibility rule as
+      // the tree: runtime "all" over a multi-dex corpus). Strings have no
+      // declaring class, so they stay bare.
+      const badgeOn = viewMode === "runtime" && selectedDex === "all" &&
+        dexInfo.filter(d => d.valid && !d.isolatedOnly).length > 1;
       all.forEach((r, i) => {
         const row = document.createElement("div");
         row.dataset.idx = i;
         row.style.cssText = "padding:4px 12px;cursor:pointer;font:12px var(--f-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
         if (i === 0) row.style.background = "rgba(255,255,255,0.06)";
+        let badge = "";
+        if (badgeOn && r.kind !== "string") {
+          const dn = classDexNames.get(r.kind === "class" ? r.desc : r.desc.split("->")[0]);
+          if (dn) badge = `<span class="dex-badge" style="margin:0 8px 0 0">${escAttr(dn.length > 1 ? `${dn[0].label} +${dn.length - 1}` : dn[0].label)}</span>`;
+        }
         const label = r.kind === "string" ? JSON.stringify(r.desc)
                     : r.disp ? `${escAttr(r.desc)} <span style="color:var(--fg-3)">→</span> ${escAttr(r.disp)}`
                     : escAttr(r.desc);
-        row.innerHTML = `<span style="color:var(--fg-3);display:inline-block;width:52px">${r.kind}</span>${r.kind === "string" ? escAttr(label) : label}`;
+        row.innerHTML = `<span style="color:var(--fg-3);display:inline-block;width:52px">${r.kind}</span>${badge}${r.kind === "string" ? escAttr(label) : label}`;
         row.title = r.desc;
         row.onmouseenter = () => { selectRow(i); };
         row.onclick = () => openSymbol(r);
