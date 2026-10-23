@@ -3683,13 +3683,15 @@ function renderPermLevels(list = permIndex) {
 
 // Category filter chips for the capabilities view. Unlike protection levels
 // there's no fixed severity list — categories are whatever the catalog tagged,
-// so they're ordered by invocation count (loudest behaviour first).
-function renderCapCats() {
+// so they're ordered by invocation count (loudest behaviour first). Counts come
+// from the dex-filtered hit list, so picking a dex drops tags with no caller
+// declared there instead of leaving them at a corpus-global count.
+function renderCapCats(tagTouches) {
   const bar = $("#permlevels");
   bar.innerHTML = "";
   // Both axes: categories (domain) + flags (orthogonal, e.g. IDENTIFIER). The
   // vocabularies are disjoint, so one merged chip row is unambiguous.
-  const cats = [...Object.entries(capReport.categories), ...Object.entries(capReport.flags || {})]
+  const cats = [...tagTouches.entries()]
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   for (const [cat, n] of cats) {
     const chip = document.createElement("span");
@@ -3726,11 +3728,16 @@ function renderCapPanel(panel, body) {
     return;
   }
   panel.classList.remove("empty");
-  renderCapCats();
   const picked = !!(panelDexCtx && panelDexCtx.picked);
   const srcHits = picked
     ? capReport.apiHits.filter(h => h.callers.some(c => inPickedDex(classOfMethod(c))))
     : capReport.apiHits;
+  const touchesOf = h => h.callSiteCount + (h.fieldAccessCount || 0);
+  const tagTouches = new Map();
+  for (const h of srcHits)
+    for (const cat of [...h.categories, ...(h.flags || [])])
+      tagTouches.set(cat, (tagTouches.get(cat) || 0) + touchesOf(h));
+  renderCapCats(tagTouches);
   const filt = ($("#permfilter").value || "").toLowerCase().trim();
   body.innerHTML = "";
   const byCat = new Map();
@@ -3747,16 +3754,15 @@ function renderCapPanel(panel, body) {
     }
     if (any) shown++;
   }
-  const touchesOf = h => h.callSiteCount + (h.fieldAccessCount || 0);
   const hdBits = [`${capReport.matchedApis} of ${capReport.catalogSize} matched (catalog ${capReport.catalogVersion})`,
                   `${capReport.totalCallSites} call sites`];
   if (capReport.totalFieldAccesses) hdBits.push(`${capReport.totalFieldAccesses} field read${capReport.totalFieldAccesses === 1 ? "" : "s"}`);
   hdBits.push(`app code only — ${capReport.droppedTouches} library touches across ${capReport.droppedApis} APIs dropped`);
   if (capReport.shadowedTouches) hdBits.push(`${capReport.shadowedTouches} shadowed (never executes under this load order)`);
-  if (picked) hdBits.unshift(`showing APIs with a caller declared in ${panelDexCtx.label}, of ${capReport.apiHits.length} total — pick (all) in the dex picker to clear (category chips count the whole corpus)`);
+  if (picked) hdBits.unshift(`showing APIs with a caller declared in ${panelDexCtx.label}, of ${capReport.apiHits.length} total — pick (all) in the dex picker to clear`);
   $("#permhd2").innerHTML = `capabilities <span class="ipcount" title="catalog APIs shown · ${escAttr(hdBits.join(" · "))}">${picked ? `${shown} / ${capReport.apiHits.length}` : shown}</span>`;
   if (!byCat.size) { const d = document.createElement("div"); d.className = "permsec"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); return; }
-  const tagCount = t => capReport.categories[t] ?? (capReport.flags || {})[t] ?? 0;
+  const tagCount = t => tagTouches.get(t) || 0;
   const cats = [...byCat.keys()].sort((a, b) =>
     tagCount(b) - tagCount(a) || a.localeCompare(b));
   for (const cat of cats) {
@@ -3787,13 +3793,14 @@ function renderCapPanel(panel, body) {
 }
 
 // Kind filter chips for the components view, in COMPONENT_BASES order so the
-// most specific (and most interesting) kinds lead.
+// most specific (and most interesting) kinds lead. Counts follow the dex
+// filter — a kind with no candidate declared in the picked dex is hidden.
 function renderCompKinds() {
   const bar = $("#permlevels");
   bar.innerHTML = "";
   for (const entry of COMPONENT_BASES) {
-    const list = componentGroups.get(entry.kind);
-    if (!list || !list.length) continue;
+    const list = (componentGroups.get(entry.kind) || []).filter(inPickedDex);
+    if (!list.length) continue;
     const chip = document.createElement("span");
     chip.className = "permlvlchip" + (activeCompKinds.has(entry.kind) ? " on" : "");
     chip.title = `${entry.kind} — extends ${descToJava(entry.base)} · click to toggle`;
@@ -3855,7 +3862,7 @@ function renderCompPanel(panel, body) {
   }
   const total = [...componentGroups.values()].reduce((n, l) => n + l.length, 0);
   $("#permhd2").innerHTML = picked
-    ? `components <span class="ipcount" title="candidates declared in ${escAttr(panelDexCtx.label)}, of ${total} found — pick (all) in the dex picker to clear (kind chips count the whole corpus) · declaration in AndroidManifest.xml is NOT verified">${shown} / ${total}</span>`
+    ? `components <span class="ipcount" title="candidates declared in ${escAttr(panelDexCtx.label)}, of ${total} found — pick (all) in the dex picker to clear · declaration in AndroidManifest.xml is NOT verified">${shown} / ${total}</span>`
     : `components <span class="ipcount" title="candidate classes shown of ${total} found · declaration in AndroidManifest.xml is NOT verified">${shown}</span>`;
   if (!shown) { const d = document.createElement("div"); d.className = "permsec"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); }
 }
