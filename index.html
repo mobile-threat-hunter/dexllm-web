@@ -6689,14 +6689,21 @@ function revealClassInTree(desc) {
   // keeps its kids in the DOM under display:none — findRow sees them, the
   // expansion loop doesn't. Open every collapsed ancestor so the highlight is
   // actually on screen.
-  if (row) {
-    for (let k = row.parentElement; k && k !== listEl; k = k.parentElement) {
-      if (k.classList.contains("kids") && k.style.display === "none" &&
-          k.previousElementSibling && k.previousElementSibling.onclick)
-        k.previousElementSibling.onclick();
-    }
-  }
+  if (row) _reopenBuiltAncestors(row);
   return row;
+}
+function _reopenBuiltAncestors(row) {
+  for (let k = row.parentElement; k && k !== listEl; k = k.parentElement) {
+    if (k.classList.contains("kids") && k.style.display === "none" &&
+        k.previousElementSibling && k.previousElementSibling.onclick)
+      k.previousElementSibling.onclick();
+  }
+}
+function _inListViewport(row) {
+  const r = row.getBoundingClientRect(), p = listEl.getBoundingClientRect();
+  // ±1px slack: fractional rects under zoom/DPR scaling must not make a row
+  // flush at the list edge look "outside" and trigger a needless scroll.
+  return r.height > 0 && r.top >= p.top - 1 && r.bottom <= p.bottom + 1;
 }
 
 function navigateToClass(desc, hint) {
@@ -6784,12 +6791,13 @@ window.addEventListener("popstate", (e) => {
         renderPanels();
       }
     }
-    // Navigate to the class. If same class as currently shown, just re-glow.
-    if (state.cls === currentClass) {
-      if (state.hint) locateAndGlow(state.hint);
-    } else {
-      navigateToClass(state.cls, state.hint);
-    }
+    // Navigate (or re-glow) through the normal funnel. Routing the same-class
+    // case through navigateToClass → selectClass keeps the tree mark honest on
+    // back/forward too: the selected row's collapsed ancestors reopen and the
+    // row scrolls back when it left the list viewport — the direct
+    // locateAndGlow shortcut bypassed that (review finding). _historySuppress
+    // is set, so no new history entry is pushed either way.
+    navigateToClass(state.cls, state.hint);
   } finally {
     _historySuppress = false;
   }
@@ -6800,15 +6808,18 @@ function selectClass(cls, el, hint) {
   const pop = document.getElementById("callerpop");
   if (pop) pop.classList.remove("show");
   // Navigations that don't come from a tree click (code tokens, panels,
-  // palette, history) pass no row — reveal it so the class list always points
-  // at the class the viewer is showing. EXCEPT within-class hint jumps while
-  // the selected row is still live: re-revealing there would re-expand a
-  // package the user deliberately collapsed and yank the list scroll on every
-  // indicator/caller click (review finding).
+  // palette, history, xrefs) pass no row — reveal it so the class list ALWAYS
+  // points at the class the viewer is showing, even when the user collapsed
+  // its package since (user mandate: the open class must stay marked). On
+  // within-class hint jumps the live row is reused and we only scroll when it
+  // actually left the list viewport, so rapid indicator/caller clicks don't
+  // yank the scroll position (review finding).
   if (!el) {
     if (cls === currentClass && selectedEl && selectedEl.isConnected &&
         selectedEl.__clsDesc === cls) {
       el = selectedEl;
+      _reopenBuiltAncestors(el);
+      if (!_inListViewport(el)) el.scrollIntoView({ block: "center", behavior: "instant" });
     } else {
       el = revealClassInTree(cls);
       if (el) el.scrollIntoView({ block: "center", behavior: "instant" });
@@ -6828,7 +6839,11 @@ function selectClass(cls, el, hint) {
   // glow an arbitrary line in the new class on a subsequent smali click.
   // The umbrella clearAllSmaliCaches also drops the L4 invoke/field
   // caches that are descriptor-keyed and could mismatch across classes.
-  if (cls !== currentClass) clearAllSmaliCaches();
+  // codeLineCache still holds the PREVIOUS class's lines until the decompile
+  // resolves — clear it here, or a same-class hint jump arriving while the
+  // decompile is pending takes the early-return above and glows against the
+  // old class's text (review finding).
+  if (cls !== currentClass) { clearAllSmaliCaches(); codeLineCache = []; }
   currentClass = cls;
   pushNavState(hint);
   $("#vname").textContent = displayClassDesc(cls);
