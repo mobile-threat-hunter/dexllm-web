@@ -3240,6 +3240,23 @@ function iocTitle(cd) {
 // both sides so "com.foo.Bar" finds "Lcom/foo/Bar;". Gating on `.` (not `/$;`)
 // keeps the "$ lists inner classes" and "/ lists packaged classes" idioms
 // literal. Literal matching runs first, so smali-form queries behave as before.
+// Rebuilds (filter debounce, regroup, rename refresh, dump add) wipe the
+// revealed row — the 140ms search debounce can even fire right AFTER a
+// navigation and erase a highlight the user just watched appear (review
+// finding). Re-attach the open class without scrolling: a rebuild resets the
+// scroll anyway, and yanking mid-filter-typing would fight the user. If the
+// rebuild itself re-claimed the highlight (makeClassRow), this is a no-op;
+// if a filter excludes the class, revealClassInTree gives up — filter wins.
+function reattachTreeSelection() {
+  if (!currentClass || (selectedEl && selectedEl.isConnected)) return;
+  const row = revealClassInTree(currentClass);
+  if (row && !row.classList.contains("sel")) {
+    if (selectedEl) selectedEl.classList.remove("sel");
+    row.classList.add("sel");
+    selectedEl = row;
+  }
+}
+
 function classMatcher(f) {
   const hasRn = renameStore.classes.size > 0;
   const normSep = (s) => s.replace(/[/$]/g, ".");
@@ -3293,6 +3310,7 @@ function renderList(filter) {
   const frag = document.createDocumentFragment();
   appendChildren(root, frag, 0, expand);
   listEl.appendChild(frag);
+  reattachTreeSelection();
 }
 
 // Dex-sorted render: ONE class panel, split in two by thin divider labels —
@@ -3338,6 +3356,7 @@ function renderGroupedList(f) {
     ? `${top.length + rest.length} / ${allClasses.length} classes · ${top.length} in ${label}`
     : `${allClasses.length} classes · ${top.length} declared in ${label}`;
   listEl.appendChild(frag);
+  reattachTreeSelection();
 }
 let searchTimer = null;
 $("#search").addEventListener("input", e => {
@@ -6543,6 +6562,64 @@ $("#rnClear").addEventListener("click", () => {
   _renameRefreshAll();
 });
 
+// The tree is lazy — a collapsed package has no DOM below it — so a class
+// opened from code tokens / evidence panels / the palette often has no row to
+// highlight. Expand the collapsed chain that leads to the class and return its
+// row; grouped view prefers the winner row over a shadowed loser (the copy a
+// click actually decompiles), matching navigateToClass's old lookup rule.
+//
+// Containment is tested against the class's own package path — O(depth) per
+// candidate row — not by walking whole subtrees (review: O(depth × corpus)
+// per navigation on 1000+-dex corpora). A pkg row's __pkgNode is the END of a
+// compressed chain, so its seg can sit at any offset of the path; try each
+// matching offset and verify by walking children. The final contains-check
+// makes a coincidental seg match harmless.
+function revealClassInTree(desc) {
+  const inner = desc.replace(/^L/, "").replace(/;$/, "");
+  const slash = inner.lastIndexOf("/");
+  const segs = slash >= 0 ? inner.slice(0, slash).split("/") : [];
+  const leadsTo = (node) => {
+    for (let i = 0; i < segs.length; i++) {
+      if (segs[i] !== node.seg) continue;
+      let cur = node;
+      for (let j = i + 1; j < segs.length && cur; j++) cur = cur.children.get(segs[j]);
+      if (cur && cur.classes.some(c => c.desc === desc)) return true;
+    }
+    return false;
+  };
+  const findRow = () => {
+    const rows = [...listEl.querySelectorAll(".cls")].filter(e => e.__clsDesc === desc);
+    return rows.find(e => !e.classList.contains("shadowed-decl")) || rows[0] || null;
+  };
+  let row = findRow();
+  // Each pass opens the outermost collapsed package on the class's path
+  // (document order guarantees parent before child), materializing the next
+  // level. Every pass consumes at least one path segment, which bounds the
+  // loop — no arbitrary depth cap to silently give up past (review). A tree
+  // filtered so the class doesn't appear finds no such package and gives up —
+  // the filter wins.
+  for (let guard = segs.length + 2; !row && guard > 0; guard--) {
+    const pkg = [...listEl.querySelectorAll(".pkg")].find(r =>
+      r.__pkgNode && r.nextElementSibling &&
+      r.nextElementSibling.style.display === "none" && leadsTo(r.__pkgNode));
+    if (!pkg) break;
+    pkg.onclick();
+    row = findRow();
+  }
+  // A row can exist yet be hidden: once built, a package the user re-collapses
+  // keeps its kids in the DOM under display:none — findRow sees them, the
+  // expansion loop doesn't. Open every collapsed ancestor so the highlight is
+  // actually on screen.
+  if (row) {
+    for (let k = row.parentElement; k && k !== listEl; k = k.parentElement) {
+      if (k.classList.contains("kids") && k.style.display === "none" &&
+          k.previousElementSibling && k.previousElementSibling.onclick)
+        k.previousElementSibling.onclick();
+    }
+  }
+  return row;
+}
+
 function navigateToClass(desc, hint) {
   // Check the currently active tab's class pool.
   let pool;
@@ -6571,14 +6648,8 @@ function navigateToClass(desc, hint) {
     renderList($("#search").value || "");
     renderPanels();
   }
-  // Match on __clsDesc, not title — rows with a dex badge append provenance
-  // text to their title, so an exact title comparison misses every badged row.
-  // Grouped view lists duplicates once per section; prefer the winner row
-  // (the copy the decompile actually shows) over a shadowed loser row.
-  const rows = [...listEl.querySelectorAll(".cls")].filter(e => e.__clsDesc === desc);
-  const row = rows.find(e => !e.classList.contains("shadowed-decl")) || rows[0];
-  selectClass(desc, row || null, hint);
-  if (row) row.scrollIntoView({ block: "center", behavior: "instant" });
+  // selectClass reveals the row in the lazy tree and scrolls to it.
+  selectClass(desc, null, hint);
 }
 
 let currentClass = null;
@@ -6649,6 +6720,21 @@ function selectClass(cls, el, hint) {
   // Dismiss any open callers popup — its anchor token is about to be replaced.
   const pop = document.getElementById("callerpop");
   if (pop) pop.classList.remove("show");
+  // Navigations that don't come from a tree click (code tokens, panels,
+  // palette, history) pass no row — reveal it so the class list always points
+  // at the class the viewer is showing. EXCEPT within-class hint jumps while
+  // the selected row is still live: re-revealing there would re-expand a
+  // package the user deliberately collapsed and yank the list scroll on every
+  // indicator/caller click (review finding).
+  if (!el) {
+    if (cls === currentClass && selectedEl && selectedEl.isConnected &&
+        selectedEl.__clsDesc === cls) {
+      el = selectedEl;
+    } else {
+      el = revealClassInTree(cls);
+      if (el) el.scrollIntoView({ block: "center", behavior: "instant" });
+    }
+  }
   if (selectedEl) selectedEl.classList.remove("sel");
   selectedEl = el || null;
   if (el) el.classList.add("sel");
