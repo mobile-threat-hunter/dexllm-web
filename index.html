@@ -193,11 +193,28 @@ window.__DEXLLM_BUILD = "b1033c8-1";
   main { flex:1; display:none; min-height:0; }
   main.show { display:flex; }
   #sidebar {
-    width:380px; min-width:240px;
+    position:relative;
+    /* flex:none — offsetWidth must track the inline width exactly, or the
+       window-resize re-clamp reads a flex-shrunk value and ratchets it down. */
+    width:380px; min-width:240px; flex:none;
     display:flex; flex-direction:column;
     background:linear-gradient(180deg, var(--bg-2) 0%, var(--bg-1) 100%);
     box-shadow:inset -1px 0 0 var(--line-1);
   }
+  /* Draggable right edge — resize the class list. Mirrors #rightcolResize:
+     6px hot zone straddling the border, brand tint on hover/drag. */
+  #sidebarResize {
+    position:absolute; right:-3px; top:0; bottom:0; width:6px;
+    cursor:col-resize; z-index:6; user-select:none;
+  }
+  #sidebarResize::before {
+    content:""; position:absolute; left:2px; top:0; bottom:0; width:2px;
+    background:transparent; transition:background 0.15s;
+  }
+  #sidebarResize:hover::before,
+  #sidebarResize.dragging::before { background:var(--brand); }
+  body.sidebarResizing,
+  body.sidebarResizing * { cursor:col-resize !important; user-select:none !important; }
   #search {
     margin:11px 12px 8px; padding:9px 12px;
     background:var(--bg-1);
@@ -968,7 +985,7 @@ window.__DEXLLM_BUILD = "b1033c8-1";
        IoC/permission panels are all reachable on mobile. */
     main.show { flex-direction:column; overflow-y:auto; }
     #sidebar {
-      width:auto; min-width:0; flex:none; height:36vh;
+      width:auto !important; min-width:0; flex:none; height:36vh;
       border-right:none; border-bottom:1px solid var(--border);
     }
     #viewer { width:auto; min-height:0; flex:none; height:60vh; }
@@ -979,7 +996,7 @@ window.__DEXLLM_BUILD = "b1033c8-1";
       border-left:none; border-top:1px solid var(--border);
     }
     .sidepanel { flex:none !important; height:38vh !important; }   /* each panel fixed + inner scroll */
-    #rightcolResize, #panelSplit { display:none !important; }   /* no drag-resize on stacked mobile layout */
+    #sidebarResize, #rightcolResize, #panelSplit { display:none !important; }   /* no drag-resize on stacked mobile layout */
   }
 </style>
 </head>
@@ -1064,6 +1081,7 @@ window.__DEXLLM_BUILD = "b1033c8-1";
 
 <main id="main">
   <div id="sidebar">
+    <div id="sidebarResize" title="Drag to resize the class list"></div>
     <input id="search" placeholder="filter classes…" autocomplete="off">
     <div id="count"></div>
     <div id="classlist"></div>
@@ -5261,6 +5279,11 @@ const RIGHTCOL_W_MAX_FLOOR = 300;  // …but always allow at least this
 const PANEL_H_MIN         = 90;    // each panel keeps at least this many px
 const RIGHTCOL_W_KEY = "dexllm-web.rightcolWidth";
 const IOC_FRAC_KEY   = "dexllm-web.iocPanelFrac";
+const SIDEBAR_W_MIN       = 240;   // matches the CSS min-width
+const SIDEBAR_W_DEFAULT   = 380;   // matches the CSS default
+const SIDEBAR_W_MAX_FRAC  = 0.6;   // never exceed window.innerWidth × this
+const SIDEBAR_W_MAX_FLOOR = 300;   // …but always allow at least this
+const SIDEBAR_W_KEY = "dexllm-web.sidebarWidth";
 
 function _lsGetNum(key) {
   try { const n = parseInt(localStorage.getItem(key) || "", 10); return Number.isFinite(n) ? n : NaN; }
@@ -5381,6 +5404,56 @@ function layoutPanels() {
   window.addEventListener("blur", end);
 })();
 
+// ---- class-list (sidebar) width ----
+function _applySidebarWidth(w) {
+  const max = Math.max(SIDEBAR_W_MAX_FLOOR, window.innerWidth * SIDEBAR_W_MAX_FRAC);
+  w = Math.max(SIDEBAR_W_MIN, Math.min(max, w));
+  $("#sidebar").style.width = w + "px";
+  return w;
+}
+function _initSidebarWidth() {
+  const stored = _lsGetNum(SIDEBAR_W_KEY);
+  _applySidebarWidth(Number.isFinite(stored) && stored >= SIDEBAR_W_MIN ? stored : SIDEBAR_W_DEFAULT);
+}
+
+(function _wireSidebarResize() {
+  const handle = $("#sidebarResize");
+  if (!handle) return;
+  let drag = null;
+  const end = () => {
+    if (!drag) return;
+    drag = null;
+    handle.classList.remove("dragging");
+    document.body.classList.remove("sidebarResizing");
+    // Persist the STYLE width, not offsetWidth: a drag that straddles the
+    // mobile breakpoint (width:auto !important) would otherwise store the
+    // full viewport width.
+    const w = parseInt($("#sidebar").style.width, 10);
+    if (w) { try { localStorage.setItem(SIDEBAR_W_KEY, String(w)); } catch (_) {} }
+    // Widening the sidebar shrinks #viewer — re-clamp the smali overlay so it
+    // can't be left wider than the pane it floats in.
+    if (smaliSync.enabled) _applySmaliPaneWidth($("#smalipane").offsetWidth);
+  };
+  const endIfSame = (e) => { if (!drag || e.pointerId === drag.id) end(); };
+  handle.addEventListener("pointerdown", (e) => {
+    if (drag) return;   // a second pointer must not hijack an active drag
+    e.preventDefault();
+    drag = { id: e.pointerId, startX: e.clientX, startW: $("#sidebar").offsetWidth };
+    handle.classList.add("dragging");
+    document.body.classList.add("sidebarResizing");
+    try { handle.setPointerCapture(e.pointerId); } catch (_) {}
+  });
+  handle.addEventListener("pointermove", (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    // Sidebar sits on the left edge → drag right = wider.
+    _applySidebarWidth(drag.startW + (e.clientX - drag.startX));
+  });
+  handle.addEventListener("pointerup", endIfSame);
+  handle.addEventListener("lostpointercapture", endIfSame);
+  handle.addEventListener("pointercancel", endIfSame);
+  window.addEventListener("blur", end);
+})();
+
 // Re-clamp both dimensions when the window resizes (rAF-throttled to avoid a
 // layout-thrash read/write pair per event), and relayout the split when either
 // panel appears/disappears.
@@ -5390,7 +5463,12 @@ function layoutPanels() {
     if (tok) return;
     tok = requestAnimationFrame(() => {
       tok = 0;
-      _applyRightcolWidth($("#rightcol").offsetWidth);
+      // Re-clamp from the STYLE width, never offsetWidth: before a file loads
+      // #main is display:none (offsetWidth 0 → would clobber the stored width
+      // down to the minimum), and on mobile width:auto !important makes
+      // offsetWidth the viewport width. style.width is what we last applied.
+      _applySidebarWidth(parseInt($("#sidebar").style.width, 10) || SIDEBAR_W_DEFAULT);
+      _applyRightcolWidth(parseInt($("#rightcol").style.width, 10) || RIGHTCOL_W_DEFAULT);
       layoutPanels();
     });
   });
@@ -5399,6 +5477,7 @@ function layoutPanels() {
     const el = document.getElementById(id);
     if (el) obs.observe(el, { attributes: true, attributeFilter: ["class"] });
   }
+  _initSidebarWidth();
   _initRightcolWidth();
   layoutPanels();
 })();
