@@ -1,7 +1,7 @@
 // dexllm-web local launcher.
 //
 // Bundles every static asset of the dexllm-web demo (index.html, the wasm
-// engine, worker, MP4 clips, dangerous-perm dataset) into a single executable.
+// engine, worker, drop-screen logo) into a single executable.
 // Double-click the .exe → a tiny in-process HTTP server binds to a random
 // loopback port and the user's default browser opens the page. Closing the
 // console window (or Ctrl+C) stops the server.

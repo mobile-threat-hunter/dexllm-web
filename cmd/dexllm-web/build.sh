@@ -4,7 +4,8 @@
 # main.go for local smoke-test).
 #
 # Run this after any of the deployed artifacts at the repo root change:
-#   index.html / worker.js / dexllm.js / dexllm.wasm (datasets now bundled in the wasm)
+#   index.html / worker.js / dexllm.js / dexllm.wasm / dexllm_logo.png
+#   (datasets now bundled in the wasm)
 # The exe embeds them at build time, so the binary needs a refresh whenever
 # the GitHub Pages bundle does.
 
@@ -15,7 +16,7 @@ root="$(cd "$here/../.." && pwd)"
 
 # Pull the deployed bundle into static/ for go:embed
 mkdir -p "$here/static"
-for f in index.html worker.js dexllm.js dexllm.wasm loop.mp4 trans.mp4 trans2.mp4; do
+for f in index.html worker.js dexllm.js dexllm.wasm dexllm_logo.png; do
   cp "$root/$f" "$here/static/"
 done
 

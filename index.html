@@ -181,14 +181,16 @@ window.__DEXLLM_BUILD = "b1033c8-1";
   }
   #drop.drag #dropcard { border-color:var(--accent); background:var(--hl); color:var(--fg); }
   #dropcard .big { font-size:16px; color:var(--fg); }
-  #dropcard div:last-child { font-size:12px; }
-  #loopvid, #transvid {
+  #dropcard .drophint { font-size:12px; }
+  #droplogo {
     width:300px; max-width:72vw; aspect-ratio:1/1; border-radius:10px;
     border:none; box-shadow:none; display:block;
     object-fit:cover; background:#000; pointer-events:none;
   }
-  #transvid { display:none; }   /* shown only as the drop→browse transition */
-  @media (max-width:720px) { #loopvid, #transvid { width:220px; } }
+  @media (max-width:720px) { #droplogo { width:220px; } }
+  #dropcard #droploading { display:none; font-size:13px; color:var(--fg); }
+  #drop.loading #droploading { display:block; }
+  #drop.loading .big, #drop.loading .drophint { display:none; }
 
   main { flex:1; display:none; min-height:0; }
   main.show { display:flex; }
@@ -1039,17 +1041,10 @@ window.__DEXLLM_BUILD = "b1033c8-1";
 
 <label id="drop" for="file">
   <div id="dropcard">
-    <video id="loopvid" autoplay muted loop playsinline disablepictureinpicture preload="auto">
-      <source src="loop.mp4" type="video/mp4">
-    </video>
-    <!-- No <source>/preload: the outro clip competed with dexllm.wasm for
-         bandwidth at startup (~100ms of engine-ready on a 10 Mbps line) even
-         though startTransition re-picks the clip per drop anyway. It is
-         prefetched on the first dragenter/pointerdown instead — seconds of
-         user intent before the drop needs it. -->
-    <video id="transvid" muted playsinline disablepictureinpicture preload="none"></video>
+    <img id="droplogo" src="dexllm_logo.png" alt="DEXLLM">
     <div class="big">Drop a <b>.apk</b> / <b>.dex</b> / <b>.jar</b> here</div>
-    <div>or click to choose a file — nothing is uploaded, decompilation runs locally</div>
+    <div class="drophint">or click to choose a file — nothing is uploaded, decompilation runs locally</div>
+    <div id="droploading"><span class="spin"></span>loading…</div>
   </div>
   <input id="file" type="file" accept=".apk,.dex,.jar,.zip,application/octet-stream">
 </label>
@@ -2089,153 +2084,90 @@ dexbarEl.addEventListener("drop", async e => {
   } finally { btn.disabled = false; btn.textContent = orig; }
 });
 
-// Outro/transition clip: on drop, swap the looping clip for trans.mp4 (same
-// spot) and play it once. Resolves when it ends (or a safety cap), which is
-// when we reveal the class browser.
-// Playback speeds: loop clip 1.8×, transition clip 2×.
-const VID_RATE = 1.8;
-const TRANS_RATE = 2.0;
-(function () {
-  const lv = $("#loopvid");
-  if (!lv) return;
-  const apply = () => { try { lv.playbackRate = VID_RATE; } catch (_) {} };
-  apply(); lv.addEventListener("loadedmetadata", apply); lv.addEventListener("play", apply);
-  // Recent Chrome ships stricter autoplay (document-user-activation-required)
-  // where even `autoplay muted` is held until a user gesture. Force the play()
-  // call ourselves (muted videos still resolve), and as a last-resort fallback
-  // retry on the first user interaction. iOS/Safari also benefit from the kick.
-  lv.muted = true;                        // make defaultMuted explicit pre-play
-  const kick = () => { const p = lv.play(); if (p && p.catch) p.catch(() => {}); };
-  kick(); lv.addEventListener("loadedmetadata", kick); lv.addEventListener("canplay", kick);
-  const retry = () => { if (lv.paused) kick(); };
-  ["pointerdown","touchstart","keydown","scroll","visibilitychange"].forEach(
-    ev => document.addEventListener(ev, retry, { once: false, passive: true }));
-})();
+// On drop, swap the drop-card hints for a "loading…" spinner so the parse
+// time is visible instead of being masked by a transition clip; the class
+// browser is revealed the moment the engine finishes.
+function showDropLoading() { drop.classList.add("loading"); }
+function hideDropLoading() { drop.classList.remove("loading"); }
 
-// Pool of outro clips — one is picked at random per drop so repeated loads
-// feel varied. All play at the same TRANS_RATE. Only the chosen clip is
-// fetched (src set on demand), so the extra clips don't weigh down page load.
-const TRANS_SRCS = ["trans.mp4", "trans2.mp4"];
-
-// Pick the next clip at the first sign of user intent (dragenter / pointer
-// down on the drop card) and start fetching it, so the outro still starts
-// instantly on drop without the clip loading at page startup. The pick is
-// pinned so startTransition plays the clip we actually prefetched.
-let pendingTransClip = null;
-function prefetchTransClip() {
-  if (pendingTransClip) return;
-  pendingTransClip = TRANS_SRCS[Math.floor(Math.random() * TRANS_SRCS.length)];
-  const trans = $("#transvid");
-  trans.setAttribute("src", pendingTransClip);
-  try { trans.load(); } catch (_) {}
-}
-["dragenter", "pointerdown"].forEach(ev =>
-  drop.addEventListener(ev, prefetchTransClip, { passive: true }));
-
-let transTimer = null;
-function startTransition() {
-  const loop = $("#loopvid"), trans = $("#transvid");
-  if (loop) loop.style.display = "none";
-  trans.style.display = "block";
-  // Play the prefetched clip if there is one; otherwise pick now. Re-arm the
-  // prefetch for the NEXT drop so repeat loads stay varied.
-  const chosen = pendingTransClip ||
-    TRANS_SRCS[Math.floor(Math.random() * TRANS_SRCS.length)];
-  pendingTransClip = null;
-  const cur = trans.getAttribute("src") || trans.currentSrc || "";
-  if (!cur.endsWith(chosen)) {
-    trans.setAttribute("src", chosen);
-    try { trans.load(); } catch (_) {}
-  }
-  const setRate = () => { try { trans.playbackRate = TRANS_RATE; } catch (_) {} };
-  // playbackRate can be reset by load(); reassert it once the new clip's data
-  // is ready as well as immediately.
-  trans.addEventListener("loadeddata", setRate, { once: true });
-  try { trans.currentTime = 0; } catch (_) {}
-  setRate();
-  const p = trans.play(); if (p && p.catch) p.catch(() => {});
-  setRate();
-  return new Promise(resolve => {
-    let done = false;
-    const finish = () => { if (done) return; done = true; clearTimeout(transTimer); resolve(); };
-    trans.onended = finish;
-    trans.onerror = finish;
-    transTimer = setTimeout(finish, 6500);   // never hang the UI
-  });
-}
-function stopTransition() {                    // restore the loop (e.g. on load error)
-  const loop = $("#loopvid"), trans = $("#transvid");
-  clearTimeout(transTimer);
-  try { trans.pause(); } catch (_) {}
-  trans.style.display = "none";
-  if (loop) loop.style.display = "";
-}
+// Invalidates an in-flight loadFile when a newer drop lands: the stale load
+// bails after its awaits instead of wiping the newer load's state.
+let loadGen = 0;
 
 async function loadFile(file) {
   if (!Module) { alert("engine still loading…"); return; }
+  const gen = ++loadGen;
   // History entries from the previous APK reference classes that aren't
   // loaded here. Clear the URL hash via replaceState (the entries stay in
   // browser history but popstate's `dexEntryExists` check filters them out).
   try { history.replaceState(null, "", location.pathname + location.search); }
   catch (_) {}
-  const transition = startTransition();   // play the outro clip while we parse
+  showDropLoading();
   statusEl.innerHTML = `parsing <b>${file.name}</b>…`;
-  const buf = new Uint8Array(await file.arrayBuffer());
-  // Fresh load wipes any previously-added dumps; rewriting /input.bin so the
-  // path stays stable lets the rebuild flow (multi-source ctor) reuse it.
-  for (const v of vfsBytes) { try { Module.FS.unlink(v); } catch (_) {} }
-  vfsBytes.clear();
-  disposeIsolated();
-  runtimePanelSnap = null;
-  dumpedSources = [];
-  try { Module.FS.writeFile("/input.bin", buf); } catch (_) {
-    try { Module.FS.unlink("/input.bin"); } catch (_) {} Module.FS.writeFile("/input.bin", buf);
-  }
-  vfsBytes.add("/input.bin");
-  selectedDex = "all";
-  if (dk) { try { dk.delete(); } catch (_) {} dk = null; }
-  clearSymbolIndex();
-  _smaliBumpDk();
-  // Renames are keyed to the loaded file's bytes. Reset immediately (so the
-  // previous APK's names can't bleed into this one), then restore this APK's
-  // saved map once the async hash lands — the tree may already be on screen
-  // by then, so re-render if anything was restored.
-  loadRenames(null);
-  crypto.subtle.digest("SHA-256", buf).then(h => {
-    const hex = [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("");
-    loadRenames("dexllm-renames:" + hex);
-    if (renameCount()) {
-      if (dk) renderList($("#search").value || "");
-      rerenderCurrentClass();
-    }
-  }).catch(() => {});
-
-  let t0 = performance.now();
+  // Everything below can throw/reject (file vanished between drop and read,
+  // allocation failure on a huge APK, FS quota, engine fault). Without the
+  // catch the rejection is unhandled and the drop card is stranded on the
+  // "loading…" line with the real hints hidden.
   try {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    if (gen !== loadGen) return;   // superseded by a newer drop
+    // Fresh load wipes any previously-added dumps; rewriting /input.bin so the
+    // path stays stable lets the rebuild flow (multi-source ctor) reuse it.
+    for (const v of vfsBytes) { try { Module.FS.unlink(v); } catch (_) {} }
+    vfsBytes.clear();
+    disposeIsolated();
+    runtimePanelSnap = null;
+    dumpedSources = [];
+    try { Module.FS.writeFile("/input.bin", buf); } catch (_) {
+      try { Module.FS.unlink("/input.bin"); } catch (_) {} Module.FS.writeFile("/input.bin", buf);
+    }
+    vfsBytes.add("/input.bin");
+    selectedDex = "all";
+    if (dk) { try { dk.delete(); } catch (_) {} dk = null; }
+    clearSymbolIndex();
+    _smaliBumpDk();
+    // Renames are keyed to the loaded file's bytes. Reset immediately (so the
+    // previous APK's names can't bleed into this one), then restore this APK's
+    // saved map once the async hash lands — the tree may already be on screen
+    // by then, so re-render if anything was restored.
+    loadRenames(null);
+    crypto.subtle.digest("SHA-256", buf).then(h => {
+      const hex = [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("");
+      loadRenames("dexllm-renames:" + hex);
+      if (renameCount()) {
+        if (dk) renderList($("#search").value || "");
+        rerenderCurrentClass();
+      }
+    }).catch(() => {});
+
+    const t0 = performance.now();
     dk = new Module.WasmDexKit("/input.bin");
+    const loadMs = (performance.now() - t0).toFixed(0);
+    // slotCount = attempted dexes (length of verifyReport), NOT dexCount()
+    // (which excludes rejected ones).
+    originalSource = {
+      vfs: "/input.bin",
+      label: file.name,
+      slotCount: dk.verifyReport().length,
+      baseDexId: 0,
+    };
+
+    // Mirror to the decompile worker. We hand it a fresh copy so transferring
+    // (zero-copy postMessage) doesn't detach the main thread's view.
+    const workerBuf = new Uint8Array(buf);
+    wcall({ type: "load", bytes: workerBuf, label: file.name }, [workerBuf.buffer]).catch(e => {
+      console.error("worker load failed:", e); statusEl.innerHTML += " <span class='pill bad'>worker offline</span>";
+    });
+
+    await processCurrentDk(file.name, loadMs, { firstLoad: true });
+    hideDropLoading();   // #drop is hidden now; don't leave the class behind
   } catch (err) {
+    // Bad file, vanished file, allocation / engine fault — surface it and
+    // keep the user on the drop screen (unless a newer drop owns the UI).
+    if (gen !== loadGen) return;
     statusEl.innerHTML = `<span class="pill bad">load failed</span> ${describeError(err)}`;
-    stopTransition();   // bad file — keep the user on the drop screen
-    return;
+    hideDropLoading();
   }
-  const loadMs = (performance.now() - t0).toFixed(0);
-  // slotCount = attempted dexes (length of verifyReport), NOT dexCount() (which
-  // excludes rejected ones).
-  originalSource = {
-    vfs: "/input.bin",
-    label: file.name,
-    slotCount: dk.verifyReport().length,
-    baseDexId: 0,
-  };
-
-  // Mirror to the decompile worker. We hand it a fresh copy so transferring
-  // (zero-copy postMessage) doesn't detach the main thread's view.
-  const workerBuf = new Uint8Array(buf);
-  wcall({ type: "load", bytes: workerBuf, label: file.name }, [workerBuf.buffer]).catch(e => {
-    console.error("worker load failed:", e); statusEl.innerHTML += " <span class='pill bad'>worker offline</span>";
-  });
-
-  await processCurrentDk(file.name, loadMs, { firstLoad: true, transition });
 }
 
 // Build a fresh multi-source DexKit over [dumps..., original]. dumps go FIRST
@@ -2550,7 +2482,6 @@ async function processCurrentDk(label, loadMs, opts) {
   refreshRuntimeStatus();
 
   if (opts && opts.firstLoad) {
-    await opts.transition;
     $("#main").classList.add("show");
     $("#modetoggle").classList.add("show");
     drop.style.display = "none";
