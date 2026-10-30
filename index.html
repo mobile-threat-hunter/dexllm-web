@@ -234,10 +234,24 @@ window.__DEXLLM_BUILD = "b1033c8-1";
       inset 0 0 0 1px rgba(107,161,255,0.55),
       0 0 0 3px rgba(107,161,255,0.12);
   }
-  #count {
-    padding:0 16px 10px; color:var(--fg-3); font:500 11px/1.4 var(--f-ui);
-    letter-spacing:0.04em; text-transform:uppercase;
+  #countbar {
+    display:flex; align-items:center; justify-content:space-between;
+    gap:8px; padding:0 12px 10px 0;
   }
+  #count {
+    padding:0 0 0 16px; color:var(--fg-3); font:500 11px/1.4 var(--f-ui);
+    letter-spacing:0.04em; text-transform:uppercase;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  #evsortBtn {
+    flex:none; border:0; cursor:pointer; border-radius:999px; padding:2px 9px;
+    font:600 10px/1.6 var(--f-ui); letter-spacing:0.04em; text-transform:uppercase;
+    color:var(--fg-3); background:var(--bg-1);
+    box-shadow:inset 0 0 0 1px var(--line-2);
+    transition:color 160ms var(--e-out), box-shadow 160ms var(--e-out);
+  }
+  #evsortBtn:hover { color:var(--fg); }
+  #evsortBtn.on { color:var(--brand); box-shadow:inset 0 0 0 1px rgba(107,161,255,0.45); }
   /* header mode toggle — segmented Runtime / Isolated control, appears once
      an APK is loaded. Runtime is the packer-unpack workflow (aggregate +
      priority); Isolated shows each dex independently. */
@@ -1089,7 +1103,11 @@ window.__DEXLLM_BUILD = "b1033c8-1";
   <div id="sidebar">
     <div id="sidebarResize" title="Drag to resize the class list"></div>
     <input id="search" placeholder="filter classes…" autocomplete="off">
-    <div id="count"></div>
+    <div id="countbar">
+      <div id="count"></div>
+      <button id="evsortBtn" class="on" type="button"
+        title="Sort classes with evidence to the top of each package — indicators, then permissions, then components, then capabilities, A–Z inside each group. Click to toggle plain A–Z.">⚑ evidence first</button>
+    </div>
     <div id="classlist"></div>
   </div>
   <div id="viewer">
@@ -3089,6 +3107,44 @@ function subtreeCounts(node, out = [0, 0, 0]) {
   return out;
 }
 
+// Evidence-first ordering: classes carrying evidence float to the top of
+// their package, grouped by category — indicators, then permissions, then
+// components, then capabilities — A–Z inside each group. A class with
+// several kinds sorts by its strongest (lowest) category; a package by the
+// strongest class in its subtree. Rank 4 = no evidence (plain A–Z tail).
+let evidenceSort = true;
+// One collator for every tree comparison. Build (appendChildren) and in-place
+// resort must break ties identically, or the first scan landing shuffles rows
+// whose evidence never changed.
+const treeCollator = new Intl.Collator();
+function classEvidenceRank(cd) {
+  if (iocCountFor(cd)) return 0;
+  if (permCountFor(cd)) return 1;
+  if (componentIndex.has(cd)) return 2;
+  if (capCountFor(cd)) return 3;
+  return 4;
+}
+// Walked on demand like subtreeCounts — the scans land after the tree
+// paints, so a rank baked in at build time would always be 4. `memo`
+// (node -> rank) lets one resort pass share the walk between a container
+// and its materialized descendant containers.
+function subtreeEvidenceRank(node, memo) {
+  if (memo) { const m = memo.get(node); if (m !== undefined) return m; }
+  let r = 4;
+  for (const c of node.classes) {
+    const cr = classEvidenceRank(c.desc);
+    if (cr < r) r = cr;
+    if (!r) break;
+  }
+  if (r) for (const ch of node.children.values()) {
+    const cr = subtreeEvidenceRank(ch, memo);
+    if (cr < r) r = cr;
+    if (!r) break;
+  }
+  if (memo) memo.set(node, r);
+  return r;
+}
+
 // collapse a single-child package chain (com>google>android) into "com.google.android"
 function compress(node) {
   let label = node.seg, cur = node;
@@ -3104,16 +3160,26 @@ function compress(node) {
 // Compared by id, never label — dump files named "classes.dex" collide with
 // the APK's own at the label level.
 function appendChildren(node, container, depth, expand, secDex) {
-  const pkgs = [...node.children.values()].sort((a,b)=>a.seg.localeCompare(b.seg));
+  const pkgs = [...node.children.values()];
+  if (evidenceSort) {
+    const pr = new Map();
+    for (const p of pkgs) pr.set(p, subtreeEvidenceRank(p));
+    pkgs.sort((a, b) => pr.get(a) - pr.get(b) || treeCollator.compare(a.seg, b.seg));
+  } else {
+    pkgs.sort((a, b) => treeCollator.compare(a.seg, b.seg));
+  }
   for (const p of pkgs) {
     const { label, node:eff } = compress(p);
-    container.appendChild(makePkgRow(label, eff, depth, expand, secDex));
+    container.appendChild(makePkgRow(label, eff, depth, expand, secDex, p.seg));
   }
-  const cs = node.classes.slice().sort((a,b)=>a.label.localeCompare(b.label));
+  const cs = node.classes.slice();
+  cs.sort(evidenceSort
+    ? (a, b) => classEvidenceRank(a.desc) - classEvidenceRank(b.desc) || treeCollator.compare(a.label, b.label)
+    : (a, b) => treeCollator.compare(a.label, b.label));
   for (const c of cs) container.appendChild(makeClassRow(c, depth, secDex));
 }
 
-function makePkgRow(label, eff, depth, expand, secDex) {
+function makePkgRow(label, eff, depth, expand, secDex, seg) {
   const wrap = document.createElement("div");
   const row = document.createElement("div");
   row.className = "pkg";
@@ -3123,6 +3189,9 @@ function makePkgRow(label, eff, depth, expand, secDex) {
   const cnt = document.createElement("span"); cnt.className = "cnt"; cnt.textContent = eff.count;
   row.append(tw, pl, cnt);
   row.__pkgNode = eff;
+  // The sort key appendChildren used — NOT the compressed label, which can
+  // collate differently ("a.z" vs "a-b") and make resorts fight rebuilds.
+  row.__pkgSeg = seg;
   applyRowBadges(row);
   const kids = document.createElement("div"); kids.className = "kids"; kids.style.display = "none";
   let built = false;
@@ -3182,6 +3251,7 @@ function makeClassRow(c, depth, secDex) {
     div.append(cb);
   }
   div.__clsDesc = c.desc;
+  div.__clsLabel = c.label;
   applyRowBadges(div);
   div.onclick = () => selectClass(c.desc, div);
   // Re-attach the selection highlight when a re-render (regroup, filter,
@@ -3281,7 +3351,68 @@ function patchTreeBadges() {
   for (const row of listEl.querySelectorAll(".pkg, .cls")) {
     if (row.__pkgNode || row.__clsDesc) applyRowBadges(row);
   }
+  // Evidence lands after the tree paints, so the order can go stale the same
+  // way the badges do — reorder the rows that are already on screen.
+  if (evidenceSort) resortTree();
 }
+
+// Reorder materialized rows to the current sort mode WITHOUT rebuilding
+// them: expansion state, badges and the selection highlight all ride along
+// with the moved nodes (same discipline as patchTreeBadges — never
+// re-render). Containers are the root list plus every built .kids block;
+// the grouped view's divider rows split the root into independently
+// sorted segments. Packages always precede classes, mirroring
+// appendChildren, and nothing is touched when the order is already right.
+function resortTree() {
+  const memo = new Map();
+  for (const ct of [listEl, ...listEl.querySelectorAll(".kids")]) {
+    let seg = [];
+    const flush = (ref) => {
+      if (!seg.length) return;
+      const pkgs = [], cls = [];
+      for (const el of seg) {
+        if (el.classList.contains("cls")) cls.push(el);
+        else pkgs.push(el);                      // pkg wrap (row + kids)
+      }
+      const rank = new Map();
+      if (evidenceSort) {
+        for (const w of pkgs) rank.set(w, subtreeEvidenceRank(w.firstChild.__pkgNode, memo));
+        for (const c of cls) rank.set(c, classEvidenceRank(c.__clsDesc));
+      }
+      // Same keys as appendChildren (pkg seg / class label), so the in-place
+      // resort converges with a fresh build instead of fighting it.
+      const keyOf = el => el.classList.contains("cls") ? el.__clsLabel : el.firstChild.__pkgSeg;
+      const cmp = evidenceSort
+        ? (x, y) => rank.get(x) - rank.get(y) || treeCollator.compare(keyOf(x), keyOf(y))
+        : (x, y) => treeCollator.compare(keyOf(x), keyOf(y));
+      pkgs.sort(cmp); cls.sort(cmp);
+      const sorted = pkgs.concat(cls);
+      // Move only the suffix that actually changed, as ONE fragment insert —
+      // per-row insertBefore over a flat 100k-class segment freezes the tab.
+      let i0 = 0;
+      while (i0 < sorted.length && sorted[i0] === seg[i0]) i0++;
+      if (i0 < sorted.length) {
+        const frag = document.createDocumentFragment();
+        for (let i = i0; i < sorted.length; i++) frag.appendChild(sorted[i]);
+        ct.insertBefore(frag, ref);
+      }
+      seg = [];
+    };
+    for (const el of [...ct.children]) {
+      const isRow = el.classList.contains("cls") ||
+        (el.firstChild && el.firstChild.classList && el.firstChild.classList.contains("pkg"));
+      if (isRow) seg.push(el);
+      else flush(el);                            // divider / anything unknown
+    }
+    flush(null);
+  }
+}
+
+$("#evsortBtn").onclick = () => {
+  evidenceSort = !evidenceSort;
+  $("#evsortBtn").classList.toggle("on", evidenceSort);
+  resortTree();
+};
 
 // Plain-text summaries for badge tooltips.
 function iocTitle(cd) {
