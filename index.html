@@ -404,14 +404,25 @@ window.__DEXLLM_BUILD = "b1033c8-1";
     letter-spacing:0.02em;
   }
 
-  /* ---- IOC (static C2 / network-indicator) markers ---- */
-  .ioc-badge {
+  /* ---- per-kind evidence badges (IoC / permissions / capabilities) ---- */
+  .ioc-badge, .perm-badge, .cap-badge {
     display:inline-block; margin-left:8px; padding:0 7px; border-radius:999px;
     font-size:10px; font-weight:600; line-height:16px; vertical-align:middle;
-    background:rgba(239,79,74,0.10); color:var(--bad);
-    border:1px solid rgba(239,79,74,0.30); letter-spacing:0.02em;
+    letter-spacing:0.02em;
   }
-  .pkg .ioc-badge { font-weight:500; }
+  .ioc-badge {
+    background:rgba(239,79,74,0.10); color:var(--bad);
+    border:1px solid rgba(239,79,74,0.30);
+  }
+  .perm-badge {
+    background:rgba(245,180,65,0.10); color:var(--warn);
+    border:1px solid rgba(245,180,65,0.30);
+  }
+  .cap-badge {
+    background:rgba(103,197,230,0.10); color:var(--info);
+    border:1px solid rgba(103,197,230,0.30);
+  }
+  .pkg :is(.ioc-badge, .perm-badge, .cap-badge) { font-weight:500; }
   /* Android component candidate tag (A/S/R/P/DA/…) — colour carries the kind,
      so it stays legible next to the red IoC count badge. */
   .comp-badge {
@@ -1145,6 +1156,7 @@ let iocGen = 0;
 let permIndex = [];              // [{ perm, level, api, callers:[methodDescriptor,…] }] — permission callers
 let permTotals = null;           // { perms, apis, callers }
 let permPending = false;         // true while the deferred caller analysis runs
+let permGen = 0;                 // like iocGen: invalidates a scheduled pass on reload
 
 // Protection-level buckets (severity desc) — drive grouping, colour, and the
 // header checkbox filters. `signatureOrSystem` folds into `signature`; the
@@ -1444,7 +1456,7 @@ async function scanIocsAsync(gen) {
   }
   classIoc = res.classIoc; iocIndex = res.iocIndex; iocTotals = res.iocTotals;
   iocPending = false;
-  patchIocBadges();
+  patchTreeBadges();
   renderIocPanel();
   if (currentClass) renderIocBar(currentClass);
   refreshRuntimeStatus();
@@ -2559,7 +2571,8 @@ async function processCurrentDk(label, loadMs, opts) {
   renderPanels();
   renderList($("#search").value || "");
   if (opts && opts.firstLoad) $("#search").focus();
-  setTimeout(analyzePerms, 30);
+  const permRun = ++permGen;
+  setTimeout(() => analyzePerms(permRun), 30);
 }
 
 // Map verifyReport + per-dex class counts into the per-dex tab model.
@@ -2764,10 +2777,16 @@ function activateIsolatedTab(did) {
       iso.perm = { permIndex, permTotals, capReport, activeCapCats };
       iso.permLoaded = true;
       permPending = false;
+      patchTreeBadges();
       renderPermPanel();
       statusEl.innerHTML = isolatedStatusHead(key);
     }, 30);
   }
+  // The dex-bar tab click builds the tree BEFORE this swap (its renderList
+  // runs against the previous tab's globals), and the cached branches above
+  // have no deferred pass to patch later — so re-stamp every materialized
+  // row from this tab's universe now. Covers the IoC badges too.
+  patchTreeBadges();
 }
 
 // Status line text for a isolated tab — replaces the global IoC/perm pills
@@ -3056,16 +3075,40 @@ function statusPills() {
 
 // Deferred permission caller mapping (the expensive L2 step). Maps EVERY
 // protection level in one pass; the header checkboxes filter the view only.
-async function analyzePerms() {
-  permIndex = []; permTotals = null; capReport = null; permPending = true;
-  renderPermPanel();
-  try {
-    await new Promise(r => setTimeout(r, 0));
-    computePerms(dk);
-  } catch (e) { console.error("permission mapping failed:", e); permTotals = null; }
+// Mirrors scanIocsAsync's landing discipline: `gen` keeps a pass scheduled by
+// a previous load from running against a corpus it doesn't describe, and a
+// pass that completes while the Isolated view is on screen lands in the
+// runtime snapshot instead of clobbering the tab's own per-dex result (which
+// also used to strand the runtime view on "analyzing perms…" forever, since
+// the consumed timeout was the only thing that would ever clear it).
+async function analyzePerms(gen) {
+  if (gen !== permGen) return;
+  if (viewMode === "runtime") {
+    permIndex = []; permTotals = null; capReport = null; permPending = true;
+    renderPermPanel();
+  } else if (runtimePanelSnap) {
+    Object.assign(runtimePanelSnap, { permIndex: [], permTotals: null, capReport: null, permPending: true });
+  }
+  await new Promise(r => setTimeout(r, 0));
+  if (gen !== permGen) return;
+  // computePerms/computeCaps write the live globals — that is their contract
+  // with the isolated path. When this runtime pass completes under another
+  // view, let them run, capture the result, and put the tab's own state
+  // back; the whole block is synchronous, so nothing can observe the swap.
+  const saved = { permIndex, permTotals, capReport, activeCapCats };
+  try { computePerms(dk); }
+  catch (e) { console.error("permission mapping failed:", e); permTotals = null; }
   try { computeCaps(dk); }
   catch (e) { console.error("capability mapping failed:", e); capReport = null; }
+  if (viewMode !== "runtime") {
+    const res = { permIndex, permTotals, capReport, activeCapCats, permPending: false };
+    permIndex = saved.permIndex; permTotals = saved.permTotals;
+    capReport = saved.capReport; activeCapCats = saved.activeCapCats;
+    if (runtimePanelSnap) Object.assign(runtimePanelSnap, res);
+    return;
+  }
   permPending = false;
+  patchTreeBadges();
   renderPermPanel();
   refreshRuntimeStatus();
 }
@@ -3098,15 +3141,21 @@ function buildTree(classes) {
   return root;
 }
 
-// Subtree indicator count, read on demand instead of folded into buildTree's
-// count pass: the tree now paints before the indicator scan finishes, so a
+// Subtree badge counts, read on demand instead of folded into buildTree's
+// count pass: the tree paints before the IoC/perm/cap scans finish, so a
 // count baked in at build time would always be zero. Walked rather than cached
-// so there is no state to invalidate when the scan lands or a dex tab changes.
-function subtreeIocCount(node) {
-  let ic = 0;
-  for (const c of node.classes) ic += iocCountFor(c.desc);
-  for (const c of node.children.values()) ic += subtreeIocCount(c);
-  return ic;
+// so there is no state to invalidate when a scan lands or a dex tab changes.
+// One walk accumulates all three kinds (indexed like TREE_BADGES) — the
+// per-class lookups are O(1), so this costs the same as the old IoC-only walk
+// instead of tripling it per package row.
+function subtreeCounts(node, out = [0, 0, 0]) {
+  for (const c of node.classes) {
+    out[0] += iocCountFor(c.desc);
+    out[1] += permCountFor(c.desc);
+    out[2] += capCountFor(c.desc);
+  }
+  for (const c of node.children.values()) subtreeCounts(c, out);
+  return out;
 }
 
 // collapse a single-child package chain (com>google>android) into "com.google.android"
@@ -3143,7 +3192,7 @@ function makePkgRow(label, eff, depth, expand, secDex) {
   const cnt = document.createElement("span"); cnt.className = "cnt"; cnt.textContent = eff.count;
   row.append(tw, pl, cnt);
   row.__pkgNode = eff;
-  applyIocBadge(row, subtreeIocCount(eff));
+  applyRowBadges(row);
   const kids = document.createElement("div"); kids.className = "kids"; kids.style.display = "none";
   let built = false;
   const toggle = open => {
@@ -3202,7 +3251,7 @@ function makeClassRow(c, depth, secDex) {
     div.append(cb);
   }
   div.__clsDesc = c.desc;
-  applyIocBadge(div, iocCountFor(c.desc));
+  applyRowBadges(div);
   div.onclick = () => selectClass(c.desc, div);
   // Re-attach the selection highlight when a re-render (regroup, filter,
   // rename refresh) rebuilt the list and orphaned the previously selected
@@ -3219,36 +3268,103 @@ function makeClassRow(c, depth, secDex) {
   return div;
 }
 
-// Create, update or drop a row's indicator badge in place. Both the initial
-// build and the post-scan patch go through here so a badge added late sits
-// exactly where an eagerly built one would have.
-function applyIocBadge(row, n) {
-  let b = row.querySelector(":scope > .ioc-badge");
+// Per-class permission / capability sets, derived from the deferred pass's
+// permIndex / capReport. Memoized by source identity: every producer path
+// (analyzePerms, the isolated-tab lazy compute + its cache, restorePanels)
+// REASSIGNS those bindings rather than mutating them in place, so an identity
+// check is a complete invalidation rule — no bookkeeping across mode switches.
+let _permMapSrc = null, _permMap = new Map();
+function classPermSet(cd) {
+  if (_permMapSrc !== permIndex) {
+    _permMapSrc = permIndex; _permMap = new Map();
+    for (const e of permIndex) for (const m of e.callers) {
+      const c = classOfMethod(m);
+      let s = _permMap.get(c); if (!s) _permMap.set(c, s = new Set());
+      s.add(e.perm);
+    }
+  }
+  return _permMap.get(cd);
+}
+let _capMapSrc = null, _capMap = new Map();
+function classCapSet(cd) {
+  if (_capMapSrc !== capReport) {
+    _capMapSrc = capReport; _capMap = new Map();
+    if (capReport) for (const h of capReport.apiHits) {
+      const tags = h.categories.concat(h.flags);
+      if (!tags.length) continue;
+      for (const m of h.callers) {
+        const c = classOfMethod(m);
+        let s = _capMap.get(c); if (!s) _capMap.set(c, s = new Set());
+        for (const t of tags) s.add(t);
+      }
+    }
+  }
+  return _capMap.get(cd);
+}
+const permCountFor = cd => { const s = classPermSet(cd); return s ? s.size : 0; };
+const capCountFor = cd => { const s = classCapSet(cd); return s ? s.size : 0; };
+
+// One badge per evidence kind, in a fixed visual order. Each kind lands at a
+// different time (IoC when the string scan finishes, perm/cap when the
+// deferred pass does — in either order), so a late badge is INSERTED at its
+// slot rather than appended; otherwise the order would depend on the race.
+const TREE_BADGES = [
+  { cls: "ioc-badge",  countFor: cd => iocCountFor(cd),  title: cd => iocTitle(cd),
+    pkgTitle: n => n + " network-indicator reference(s) under this package" },
+  { cls: "perm-badge", countFor: cd => permCountFor(cd), title: cd => permTitle(cd),
+    pkgTitle: n => n + " exercised permission(s) under this package (per-class sum)" },
+  { cls: "cap-badge",  countFor: cd => capCountFor(cd),  title: cd => capTitle(cd),
+    pkgTitle: n => n + " capability tag(s) under this package (per-class sum)" },
+];
+
+function _applyBadge(row, idx, n, title) {
+  let b = row.querySelector(":scope > ." + TREE_BADGES[idx].cls);
   if (n <= 0) { if (b) b.remove(); return; }
-  if (!b) { b = document.createElement("span"); b.className = "ioc-badge"; row.append(b); }
+  if (!b) {
+    b = document.createElement("span"); b.className = TREE_BADGES[idx].cls;
+    let before = null;
+    for (let i = idx + 1; i < TREE_BADGES.length && !before; i++)
+      before = row.querySelector(":scope > ." + TREE_BADGES[i].cls);
+    row.insertBefore(b, before);
+  }
   b.textContent = n;
-  b.title = row.__pkgNode
-    ? n + " network-indicator reference(s) under this package"
-    : iocTitle(row.__clsDesc);
+  b.title = title;
 }
 
-// Repaint the badges on every row the tree has already materialized. The scan
-// finishes long after the tree paints, and re-rendering would collapse every
+// Create, update or drop a row's badges in place. Both the initial build and
+// the post-scan patches go through here so a badge added late sits exactly
+// where an eagerly built one would have.
+function applyRowBadges(row) {
+  const counts = row.__pkgNode ? subtreeCounts(row.__pkgNode) : null;
+  for (let i = 0; i < TREE_BADGES.length; i++) {
+    const k = TREE_BADGES[i];
+    const n = counts ? counts[i] : k.countFor(row.__clsDesc);
+    _applyBadge(row, i, n, counts ? k.pkgTitle(n) : k.title(row.__clsDesc));
+  }
+}
+
+// Repaint the badges on every row the tree has already materialized. The scans
+// finish long after the tree paints, and re-rendering would collapse every
 // package the user opened while waiting, so the rows are patched in place.
-function patchIocBadges() {
-  for (const row of listEl.querySelectorAll(".pkg")) {
-    if (row.__pkgNode) applyIocBadge(row, subtreeIocCount(row.__pkgNode));
-  }
-  for (const row of listEl.querySelectorAll(".cls")) {
-    if (row.__clsDesc) applyIocBadge(row, iocCountFor(row.__clsDesc));
+function patchTreeBadges() {
+  for (const row of listEl.querySelectorAll(".pkg, .cls")) {
+    if (row.__pkgNode || row.__clsDesc) applyRowBadges(row);
   }
 }
 
-// Plain-text summary of a class's indicators (for badge tooltips).
+// Plain-text summaries for badge tooltips.
 function iocTitle(cd) {
   const e = classIoc.get(cd); if (!e) return "";
   return IOC_CATS.filter(cat => e[cat].size)
     .map(cat => `${cat}: ${[...e[cat]].join(", ")}`).join("\n");
+}
+function permTitle(cd) {
+  const s = classPermSet(cd); if (!s) return "";
+  return "permissions exercised through gated-API calls:\n" + [...s].sort().join("\n");
+}
+function capTitle(cd) {
+  const s = classCapSet(cd); if (!s) return "";
+  return "capability categories / flags touched:\n" + [...s].sort().join("\n");
 }
 
 // Filter predicate shared by the flat and dex-grouped renders. Matches the
