@@ -439,6 +439,10 @@ window.__DEXLLM_BUILD = "b1033c8-1";
     border:1px solid rgba(103,197,230,0.30);
   }
   .pkg :is(.ioc-badge, .perm-badge, .cap-badge) { font-weight:500; }
+  /* Panel rows (components tab) reuse the tree's per-kind badges. The count
+     keeps the right edge via flex order, so a late-landing badge can be
+     appended in any DOM position and still render name · badges · count. */
+  .iocitem :is(.ioc-badge, .perm-badge, .cap-badge) { flex:none; margin-left:0; }
   /* Android component candidate tag (A/S/R/P/DA/…) — colour carries the kind,
      so it stays legible next to the red IoC count badge. */
   .comp-badge {
@@ -503,6 +507,9 @@ window.__DEXLLM_BUILD = "b1033c8-1";
      the value, so a long FQN/string truncates the text — never the provenance. */
   #vhead .dex-badge { margin-left:0; flex:none; }
   .isubitem .dex-badge, .cls .dex-badge { margin-left:0; margin-right:8px; }
+  /* leading evidence badges on pick-one entries — a trailing badge would
+     vanish behind the ellipsis on long class names (same rule as dex badges) */
+  .isubitem :is(.ioc-badge, .perm-badge, .cap-badge) { margin-left:0; margin-right:8px; }
   /* Dim everything but the (now leading) loser badge, which must stay legible
      since it names the dex whose copy a click will actually show. */
   .cls.shadowed-decl > span:not(.dex-badge) { opacity:0.55; }
@@ -711,6 +718,7 @@ window.__DEXLLM_BUILD = "b1033c8-1";
   .iocitem .icnt {
     color:var(--fg-3); font:500 11px/1.4 var(--f-ui); white-space:nowrap;
     letter-spacing:0.015em;
+    order:2;   /* stays rightmost even when evidence badges are appended */
   }
   .iocitem.urls    .ival{ color:#ff6a63; }
   .iocitem.ips     .ival{ color:#ffb070; }
@@ -1471,6 +1479,7 @@ async function scanIocsAsync(gen) {
   iocPending = false;
   patchTreeBadges();
   renderIocPanel();
+  patchPanelBadges();   // perm-panel rows + pick-one entries aren't rebuilt above
   if (currentClass) renderIocBar(currentClass);
   refreshRuntimeStatus();
 }
@@ -2728,6 +2737,7 @@ function activateIsolatedTab(did) {
       permPending = false;
       patchTreeBadges();
       renderPermPanel();
+      patchPanelBadges();   // IoC-panel pick-one entries carry perm/cap badges
       statusEl.innerHTML = isolatedStatusHead(key);
     }, 30);
   }
@@ -3059,6 +3069,7 @@ async function analyzePerms(gen) {
   permPending = false;
   patchTreeBadges();
   renderPermPanel();
+  patchPanelBadges();   // the IoC panel's pick-one entries carry perm/cap badges
   refreshRuntimeStatus();
 }
 
@@ -3354,6 +3365,42 @@ function patchTreeBadges() {
   // Evidence lands after the tree paints, so the order can go stale the same
   // way the badges do — reorder the rows that are already on screen.
   if (evidenceSort) resortTree();
+}
+
+// "pick one:" sub-entries each navigate to a class — same per-kind badges,
+// LEADING the row (after the dex badge): .isubitem ellipsizes, so a trailing
+// badge would vanish behind a long name. Idempotent: strips and re-inserts
+// in the fixed ioc→perm→cap order so late landings can re-stamp in place.
+function applySubitemBadges(s) {
+  for (const k of TREE_BADGES) { const b = s.querySelector("." + k.cls); if (b) b.remove(); }
+  const db = s.querySelector(".dex-badge");
+  const anchor = db ? db.nextSibling : s.firstChild;
+  for (const k of TREE_BADGES) {
+    const n = k.countFor(s.__clsDesc);
+    if (n <= 0) continue;
+    const b = document.createElement("span"); b.className = k.cls;
+    b.textContent = n;
+    b.title = k.title(s.__clsDesc);
+    s.insertBefore(b, anchor);
+  }
+}
+
+// Evidence rows outside the tree: component-tab class rows and every panel's
+// pick-one sub-entries. Each scan landing rebuilds its OWN panel but not the
+// other's (IoC landing → renderIocPanel only; perm/cap landing →
+// renderPermPanel only), so both landings re-stamp the cross-panel rows here.
+// Precondition: the live ioc/perm/cap globals describe the panels on screen —
+// callers are scan-landing paths (runtime landings are viewMode-guarded; the
+// isolated lazy pass bails on tab switch). Do NOT call between
+// activateIsolatedTab's global swap and its renderPanels, or the old tab's
+// rows get the new tab's counts.
+function patchPanelBadges() {
+  for (const el of document.querySelectorAll(
+      "#iocpanelbody .isubitem, #permpanelbody .iocitem, #permpanelbody .isubitem")) {
+    if (!el.__clsDesc) continue;
+    if (el.classList.contains("isubitem")) applySubitemBadges(el);
+    else applyRowBadges(el);
+  }
 }
 
 // Reorder materialized rows to the current sort mode WITHOUT rebuilding
@@ -4072,7 +4119,13 @@ function renderCompPanel(panel, body) {
       const nav = makeNavRow(descToJava(desc), "perm", [{ display: desc, cls: desc }], "classes");
       body.appendChild(nav);
       const row = nav.querySelector(".iocitem");
-      if (row) row.title = `${desc}\n${entry.kind} candidate — extends ${descToJava(entry.base)}`;
+      if (row) {
+        row.title = `${desc}\n${entry.kind} candidate — extends ${descToJava(entry.base)}`;
+        // Same per-kind evidence badges as the class tree. __clsDesc also
+        // lets the late IoC landing re-stamp these rows in place.
+        row.__clsDesc = desc;
+        applyRowBadges(row);
+      }
     }
   }
   const total = [...componentGroups.values()].reduce((n, l) => n + l.length, 0);
@@ -4193,6 +4246,7 @@ function makeNavRow(label, cat, targets, noun, lazy) {
       const s = document.createElement("div"); s.className = "isubitem"; s.textContent = t.display; s.title = t.display;
       const db = panelDexBadge(t.cls);
       if (db) s.prepend(db);
+      if (t.cls) { s.__clsDesc = t.cls; applySubitemBadges(s); }
       s.onclick = ev => { ev.stopPropagation(); navigateToClass(t.cls, t.hint); };
       sub.appendChild(s);
     }
