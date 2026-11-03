@@ -894,6 +894,10 @@ window.__DEXLLM_BUILD = "b1033c8-1";
       0 0 28px rgba(107,161,255,0.16);
   }
   #glowline.on { display:block; }
+  /* Same-name occurrences of the clicked identifier (CSS Custom Highlight API;
+     see markSameName). The clicked occurrence itself reads a step stronger. */
+  ::highlight(dx-same)     { background-color:rgba(107,161,255,0.20); }
+  ::highlight(dx-same-cur) { background-color:rgba(107,161,255,0.42); }
   /* Method tokens get a soft cursor + hover underline so they read as clickable.
      `.tk-fun` is the lowercase-name-followed-by-`(` class from highlight();
      clicks open a callers popup (declaration) or jump to the declaration (call).
@@ -6598,6 +6602,120 @@ function eventAnchor(e) {
 }
 const IS_KW = (t) => JAVA_KW.has(t) || KW_PRIM.has(t) || KW_LIT.has(t);
 
+// ── same-name highlight ─────────────────────────────────────────────────────
+// Clicking an identifier paints every same-named occurrence. Uses the CSS
+// Custom Highlight API — Ranges over the existing text nodes — so neither
+// render path is rebuilt and plain-large chunks (no per-token spans) work too.
+// Register-named locals/params (v1, p0, v0_1) are reused by every method, so
+// they match only inside the enclosing method body; any other name (fields,
+// methods, types) matches across the whole class. Occurrences inside string
+// literals and comments are skipped; clicking one of those clears instead.
+const SAME_HL = typeof Highlight === "function" && typeof CSS !== "undefined" && !!CSS.highlights;
+let codeText = "";              // the text renderCode last rendered (== codeLineCache.join("\n"))
+let _codeLineStarts = null;     // char offset of each codeLineCache line; lazy, reset per render
+let _codeNodeMap = null;        // { starts, nodes } text-node offsets; lazy, reset per render
+function clearSameName() {
+  if (!SAME_HL) return;
+  CSS.highlights.delete("dx-same");
+  CSS.highlights.delete("dx-same-cur");
+}
+function codeLineStarts() {
+  if (_codeLineStarts) return _codeLineStarts;
+  const s = new Array(codeLineCache.length);
+  for (let i = 0, off = 0; i < codeLineCache.length; i++) { s[i] = off; off += codeLineCache[i].length + 1; }
+  return (_codeLineStarts = s);
+}
+function codeNodeMap() {
+  if (_codeNodeMap) return _codeNodeMap;
+  const code = $("#code"), starts = [], nodes = [];
+  if (renderCode.plainLarge) {
+    // One text node per chunk, and no "\n" between chunks — anchor each node
+    // on its first line's offset instead of summing node lengths.
+    const ls = codeLineStarts();
+    let i = 0;
+    for (const ch of code.children) {
+      if (!ch.classList.contains("chunk")) continue;
+      if (ch.firstChild) { starts.push(ls[i * CHUNK_LINES]); nodes.push(ch.firstChild); }
+      i++;
+    }
+  } else {
+    const tw = document.createTreeWalker(code, NodeFilter.SHOW_TEXT);
+    for (let n = tw.nextNode(), off = 0; n; n = tw.nextNode()) { starts.push(off); nodes.push(n); off += n.length; }
+  }
+  return (_codeNodeMap = { starts, nodes });
+}
+function _nodeIdxAt(map, off) {                  // last node starting at or before off
+  let lo = 0, hi = map.starts.length - 1;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (map.starts[mid] <= off) lo = mid; else hi = mid - 1; }
+  return lo;
+}
+function codeRange(map, a, b) {
+  const i = _nodeIdxAt(map, a), j = _nodeIdxAt(map, b - 1);
+  const r = new Range();
+  r.setStart(map.nodes[i], a - map.starts[i]);
+  r.setEnd(map.nodes[j], b - map.starts[j]);
+  return r;
+}
+// Last line of the block opened at/after line `hdr` (brace depth back to 0),
+// or `hdr` itself for a body-less header (abstract / native / interface).
+function blockEndLine(hdr) {
+  let depth = 0, opened = false;
+  for (let i = hdr; i < codeLineCache.length; i++) {
+    const s = codeLineCache[i].replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\/\/.*$/g, "");
+    for (const c of s) {
+      if (c === "{") { depth++; opened = true; }
+      else if (c === "}" && --depth === 0 && opened) return i;
+    }
+    if (!opened && s.includes(";")) return i;
+  }
+  return codeLineCache.length - 1;
+}
+// [first, last] lines of the method body containing `lineIdx`. Walks back
+// over header candidates (same shape findEnclosingMethodName uses, plus
+// `static {`) and takes the first whose block actually contains the line —
+// a nearer header may belong to an anonymous class that already closed.
+function enclosingMethodSpan(lineIdx) {
+  for (let i = lineIdx; i >= 0; i--) {
+    const line = codeLineCache[i];
+    if (!line) continue;
+    const isHdr = /^\s*static\s*\{/.test(line) ||
+      (/^\s*(public|private|protected|static|final|abstract|synchronized|native)\b/.test(line) && line.includes("("));
+    if (!isHdr) continue;
+    const end = blockEndLine(i);
+    if (end >= lineIdx) return [i, end];
+  }
+  return null;
+}
+function markSameName(word) {
+  if (!SAME_HL) return;
+  clearSameName();
+  if (!word || IS_KW(word.name) || !codeLineCache.length) return;
+  let first = 0, last = codeLineCache.length - 1;
+  if (/^[vp]\d+(_\d+)?$/.test(word.name)) {
+    const sp = enclosingMethodSpan(word.idx);
+    if (sp) [first, last] = sp;
+  }
+  const ls = codeLineStarts();
+  const from = ls[first], to = ls[last] + codeLineCache[last].length;
+  const clicked = ls[word.idx] + word.start;
+  // Comments / strings are consumed whole (group 1) so names inside them
+  // never match; word boundaries follow WORD_CH ('-' for R8 synthetics).
+  const esc = word.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp('(//[^\\n]*|/\\*[\\s\\S]*?\\*/|"(?:\\\\.|[^"\\\\])*"|\'(?:\\\\.|[^\'\\\\])*\')' +
+    "|(?<![A-Za-z0-9_$-])" + esc + "(?![A-Za-z0-9_$-])", "g");
+  re.lastIndex = from;
+  const map = codeNodeMap(), hits = [];
+  let cur = null, m;
+  while ((m = re.exec(codeText)) && m.index < to) {
+    if (m[1]) continue;
+    const r = codeRange(map, m.index, m.index + word.name.length);
+    if (m.index === clicked) cur = r; else hits.push(r);
+  }
+  if (!cur) return;                              // clicked inside a string / comment
+  CSS.highlights.set("dx-same", new Highlight(...hits));
+  CSS.highlights.set("dx-same-cur", new Highlight(cur));
+}
+
 // Click delegation on #code: route to caller popup, callee navigation, or
 // constructor jump. Method + field xref resolve span-independently (see above);
 // string / type / constructor xref stay span-based (highlight mode only).
@@ -6616,6 +6734,9 @@ $("#code").addEventListener("click", (e) => {
   }
   // The clicked identifier, resolved from raw text + caret (span-independent).
   const word = codeWordAtEvent(e);
+  // Paint its same-name occurrences ALONGSIDE the dispatches below (a blank
+  // or string/comment click clears). A cross-class jump re-renders and clears.
+  markSameName(word);
 
   // ── method / constructor dispatch: an identifier immediately followed by '('
   //    Resolved from LINE CONTEXT (the `name(` shape), not the tokenizer's tk-*
@@ -6713,7 +6834,11 @@ document.addEventListener("click", (e) => {
   pop.classList.remove("show");
 }, true);
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") $("#callerpop").classList.remove("show");
+  if (e.key !== "Escape") return;
+  // First Escape closes the popup; with none open it clears the same-name marks.
+  const pop = $("#callerpop");
+  if (pop.classList.contains("show")) pop.classList.remove("show");
+  else clearSameName();
 });
 
 // ── Rename UX ───────────────────────────────────────────────────────────────
@@ -7134,7 +7259,7 @@ function selectClass(cls, el, hint) {
   // resolves — clear it here, or a same-class hint jump arriving while the
   // decompile is pending takes the early-return above and glows against the
   // old class's text (review finding).
-  if (cls !== currentClass) { clearAllSmaliCaches(); codeLineCache = []; }
+  if (cls !== currentClass) { clearAllSmaliCaches(); codeLineCache = []; clearSameName(); }
   currentClass = cls;
   pushNavState(hint);
   $("#vname").textContent = displayClassDesc(cls);
@@ -7207,6 +7332,8 @@ let codeLineCache = [];
 const CHUNK_LINES = 100;
 function renderCode(text) {
   const code = $("#code");
+  clearSameName();
+  codeText = text; _codeLineStarts = null; _codeNodeMap = null;
   codeLineCache = text.split("\n");
   const n = codeLineCache.length;
   // Two paths:
