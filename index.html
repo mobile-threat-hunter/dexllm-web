@@ -698,6 +698,7 @@ window.__DEXLLM_BUILD = "b1033c8-1";
   .permlvlchip.on { color:var(--fg); background:var(--bg-3); }
   .permlvlchip.on .dot { opacity:1; }
   .permlvlchip .lc { opacity:.6; font-weight:500; }
+  .permlvlchip.allchip { letter-spacing:.06em; }
   .permlvlhd {
     display:flex; align-items:center; gap:7px;
     padding:10px 16px 4px; font:700 10px/1.4 var(--f-ui);
@@ -1154,6 +1155,7 @@ window.__DEXLLM_BUILD = "b1033c8-1";
     <div id="rightcolResize" title="Drag to resize the panel column"></div>
     <div id="iocpanel" class="sidepanel empty">
       <div class="iocphd"><span id="iocphd">indicators</span><span class="copybtn" id="copyIoc" title="Copy all indicators (network + content providers) as text">⧉ copy</span></div>
+      <div id="ioccats" class="permlevels"></div>
       <input id="iocfilter" class="pfilter" placeholder="filter indicators…" autocomplete="off">
       <div id="iocpanelbody" class="pbody"></div>
     </div>
@@ -1326,6 +1328,9 @@ const statusEl = $("#status");
 // can jump to the callers. Kept last so its group renders below the network cats.
 const IOC_CATS = ["urls", "ips", "domains", "emails", "onion", "providers"];
 const CAT_LABEL = { providers: "content providers" };   // display override; others use the key
+// Dot colours for the IoC category chips — same hues as the .cat-* rules.
+const IOC_CAT_COLOR = { urls: "#ff6a63", ips: "#ffb070", domains: "#ecc960", emails: "#6ad8e5", onion: "#c8a8ff", providers: "#8fd66a" };
+let activeIocCats = new Set(IOC_CATS);
 const MAX_SCAN = 65536;            // per-string cap — bounds adversarial-blob cost
 // A fresh per-class indicator entry, keyed over every IOC_CATS bucket (so adding
 // a category can't leave `e[cat]` undefined at an `.add()` site).
@@ -2541,6 +2546,10 @@ async function processCurrentDk(label, loadMs, opts) {
     $("#code").innerHTML = '<div class="placeholder">Pick a class on the left to decompile it.' +
       (iocPending || (iocTotals && iocTotals.total) ? ' Classes that reference a network indicator are marked with a count badge, or click any indicator on the right to jump to it.' : "") + '</div>';
     $("#iocfilter").value = ""; $("#permfilter").value = "";
+    // Tag chips back to "all" for the new file (cap/comp sets are rebuilt by
+    // their own analysis passes).
+    activeIocCats = new Set(IOC_CATS);
+    activePermLevels = new Set(PERM_LEVELS.map(l => l.key));
     $("#search").value = "";
   }
   renderModeToggle();
@@ -3929,12 +3938,49 @@ function updateViewerDexBadge() {
   b.style.display = "";
 }
 
+// Tag chip row shared by the four evidence panels: a leading "all" chip (the
+// default) and one chip per tag that is EXCLUSIVE — clicking a tag shows only
+// that tag; clicking the sole active tag again, or "all", restores everything.
+// `active` is the panel's Set and is mutated IN PLACE: the isolated-tab caches
+// (iso.perm / iso.comp) hold the same object, so a revisit keeps the pick.
+// `chips` = [{ key, label, color, count, title }] for the tags currently on
+// screen (dex-filtered); `universe` = every key "all" re-enables. A pick whose
+// tag the dex filter just hid falls back to "all" rather than an empty list.
+// Call BEFORE filtering rows on `active` — the fallback mutates it.
+function renderTagChips(bar, active, chips, universe, allCount, rerender) {
+  bar.innerHTML = "";
+  if (!chips.length) return;
+  const picked = chips.filter(c => active.has(c.key));
+  const setAll = () => { active.clear(); for (const k of universe) active.add(k); };
+  if (!picked.length) setAll();
+  const isAll = !picked.length || picked.length === chips.length;
+  const all = document.createElement("span");
+  all.className = "permlvlchip allchip" + (isAll ? " on" : "");
+  all.title = "show every tag";
+  all.innerHTML = "all" + (allCount != null ? ` <span class="lc">${allCount}</span>` : "");
+  all.onclick = () => { setAll(); rerender(); };
+  bar.appendChild(all);
+  for (const c of chips) {
+    const on = !isAll && active.has(c.key);
+    const chip = document.createElement("span");
+    chip.className = "permlvlchip" + (on ? " on" : "");
+    chip.title = c.title + (on ? " · click to show all" : " · click to show only this");
+    chip.innerHTML = `<span class="dot" style="background:${c.color}"></span>${escAttr(c.label)} <span class="lc">${c.count}</span>`;
+    chip.onclick = () => {
+      if (on) setAll(); else { active.clear(); active.add(c.key); }
+      rerender();
+    };
+    bar.appendChild(chip);
+  }
+}
+
 // network indicators panel (top of the two right panels)
 function renderIocPanel() {
   hideEvTip();   // a rebuild under a stationary cursor would strand the card
   computePanelDexCtx();
   const panel = $("#iocpanel"), body = $("#iocpanelbody");
   if (!iocIndex.length) {
+    $("#ioccats").innerHTML = "";
     if (iocPending) {                        // scan still running — show progress
       panel.classList.remove("empty");
       $("#iocphd").textContent = "indicators";
@@ -3945,9 +3991,21 @@ function renderIocPanel() {
   }
   panel.classList.remove("empty");
   const picked = !!(panelDexCtx && panelDexCtx.picked);
+  // Category chips count the dex-filtered list before the text filter, like
+  // the permission-level chips.
+  const catCounts = new Map();
+  for (const x of iocIndex)
+    if (!picked || x.classes.some(inPickedDex)) catCounts.set(x.cat, (catCounts.get(x.cat) || 0) + 1);
+  const iocChips = IOC_CATS.filter(c => catCounts.get(c)).map(c => ({
+    key: c, label: CAT_LABEL[c] || c, color: IOC_CAT_COLOR[c] || "var(--brand)",
+    count: catCounts.get(c), title: `${CAT_LABEL[c] || c} indicators`,
+  }));
+  renderTagChips($("#ioccats"), activeIocCats, iocChips, IOC_CATS,
+    iocChips.reduce((n, c) => n + c.count, 0), renderIocPanel);
   const filt = ($("#iocfilter").value || "").toLowerCase().trim();
   body.innerHTML = ""; let shown = 0;
   for (const cat of IOC_CATS) {
+    if (!activeIocCats.has(cat)) continue;
     const items = iocIndex
       .filter(x => x.cat === cat && (!filt || x.value.toLowerCase().includes(filt)) &&
                    (!picked || x.classes.some(inPickedDex)))
@@ -3979,28 +4037,17 @@ function renderIocPanel() {
   if (!shown) { const d = document.createElement("div"); d.className = "iocgrp"; d.style.color = "var(--muted)"; d.textContent = "no match"; body.appendChild(d); }
 }
 
-// Header chips: one per protection level actually present, toggling
-// activePermLevels. Counts reflect mapped gated-API usages (pre text-filter).
+// Header chips: "all" + one per protection level actually present (see
+// renderTagChips). Counts reflect mapped gated-API usages (pre text-filter).
 function renderPermLevels(list = permIndex) {
-  const bar = $("#permlevels");
-  if (!list.length) { bar.innerHTML = ""; return; }
   const counts = new Map();
   for (const p of list) counts.set(p.level, (counts.get(p.level) || 0) + 1);
-  bar.innerHTML = "";
-  for (const lv of PERM_LEVELS) {
-    const n = counts.get(lv.key) || 0;
-    if (!n) continue;                          // hide levels with no hits
-    const chip = document.createElement("span");
-    chip.className = "permlvlchip" + (activePermLevels.has(lv.key) ? " on" : "");
-    chip.title = `${lv.label} permissions — click to toggle`;
-    chip.innerHTML = `<span class="dot" style="background:${lv.color}"></span>${lv.label} <span class="lc">${n}</span>`;
-    chip.onclick = () => {
-      if (activePermLevels.has(lv.key)) activePermLevels.delete(lv.key);
-      else activePermLevels.add(lv.key);
-      renderPermPanel();
-    };
-    bar.appendChild(chip);
-  }
+  const chips = PERM_LEVELS.filter(lv => counts.get(lv.key)).map(lv => ({   // hide levels with no hits
+    key: lv.key, label: lv.label, color: lv.color, count: counts.get(lv.key),
+    title: `${lv.label} permissions`,
+  }));
+  renderTagChips($("#permlevels"), activePermLevels, chips, PERM_LEVELS.map(l => l.key),
+    list.length, renderPermPanel);
 }
 
 // Category filter chips for the capabilities view. Unlike protection levels
@@ -4009,23 +4056,15 @@ function renderPermLevels(list = permIndex) {
 // from the dex-filtered hit list, so picking a dex drops tags with no caller
 // declared there instead of leaving them at a corpus-global count.
 function renderCapCats(tagTouches) {
-  const bar = $("#permlevels");
-  bar.innerHTML = "";
   // Both axes: categories (domain) + flags (orthogonal, e.g. IDENTIFIER). The
-  // vocabularies are disjoint, so one merged chip row is unambiguous.
-  const cats = [...tagTouches.entries()]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-  for (const [cat, n] of cats) {
-    const chip = document.createElement("span");
-    chip.className = "permlvlchip" + (activeCapCats.has(cat) ? " on" : "");
-    chip.title = `${cat} — ${n} touch${n === 1 ? "" : "es"} · click to toggle`;
-    chip.innerHTML = `<span class="dot" style="background:var(--brand)"></span>${escAttr(capLabel(cat))} <span class="lc">${n}</span>`;
-    chip.onclick = () => {
-      if (activeCapCats.has(cat)) activeCapCats.delete(cat); else activeCapCats.add(cat);
-      renderPermPanel();
-    };
-    bar.appendChild(chip);
-  }
+  // vocabularies are disjoint, so one merged chip row is unambiguous. "all"
+  // carries no count: one API can sit under several tags, so a sum over-counts.
+  const chips = [...tagTouches.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([cat, n]) => ({ key: cat, label: capLabel(cat), color: "var(--brand)", count: n,
+                          title: `${cat} — ${n} touch${n === 1 ? "" : "es"}` }));
+  const universe = capReport ? [...Object.keys(capReport.categories), ...Object.keys(capReport.flags)] : [];
+  renderTagChips($("#permlevels"), activeCapCats, chips, universe, null, renderPermPanel);
 }
 
 const capLabel = cat => cat.toLowerCase().replace(/_/g, " ");
@@ -4118,22 +4157,15 @@ function renderCapPanel(panel, body) {
 // most specific (and most interesting) kinds lead. Counts follow the dex
 // filter — a kind with no candidate declared in the picked dex is hidden.
 function renderCompKinds() {
-  const bar = $("#permlevels");
-  bar.innerHTML = "";
+  const chips = [];
   for (const entry of COMPONENT_BASES) {
     const list = (componentGroups.get(entry.kind) || []).filter(inPickedDex);
     if (!list.length) continue;
-    const chip = document.createElement("span");
-    chip.className = "permlvlchip" + (activeCompKinds.has(entry.kind) ? " on" : "");
-    chip.title = `${entry.kind} — extends ${descToJava(entry.base)} · click to toggle`;
-    chip.innerHTML = `<span class="dot" style="background:${entry.color}"></span>${escAttr(entry.kind)} <span class="lc">${list.length}</span>`;
-    chip.onclick = () => {
-      if (activeCompKinds.has(entry.kind)) activeCompKinds.delete(entry.kind);
-      else activeCompKinds.add(entry.kind);
-      renderPermPanel();
-    };
-    bar.appendChild(chip);
+    chips.push({ key: entry.kind, label: entry.kind, color: entry.color, count: list.length,
+                 title: `${entry.kind} — extends ${descToJava(entry.base)}` });
   }
+  renderTagChips($("#permlevels"), activeCompKinds, chips, [...componentGroups.keys()],
+    chips.reduce((n, c) => n + c.count, 0), renderPermPanel);
 }
 
 // The three views share one panel frame, and `.sidepanel.empty{display:none}`
