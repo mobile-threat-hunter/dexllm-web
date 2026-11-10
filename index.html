@@ -3941,25 +3941,34 @@ function updateViewerDexBadge() {
 // Tag chip row shared by the four evidence panels: a leading "all" chip (the
 // default) and one chip per tag that is EXCLUSIVE — clicking a tag shows only
 // that tag; clicking the sole active tag again, or "all", restores everything.
-// `active` is the panel's Set and is mutated IN PLACE: the isolated-tab caches
-// (iso.perm / iso.comp) hold the same object, so a revisit keeps the pick.
-// `chips` = [{ key, label, color, count, title }] for the tags currently on
-// screen (dex-filtered); `universe` = every key "all" re-enables. A pick whose
-// tag the dex filter just hid falls back to "all" rather than an empty list.
-// Call BEFORE filtering rows on `active` — the fallback mutates it.
+// `active` is the panel's Set and is mutated IN PLACE, only by clicks: the
+// isolated-tab caches (iso.perm / iso.comp) hold the same object, so a revisit
+// keeps the pick. `chips` = [{ key, label, color, count, title }] for the tags
+// currently on screen (dex-filtered); `universe` = every key "all" re-enables
+// (chip keys are folded into what "all" shows and restores).
+// "all" means `active` holds the whole universe — NOT "every visible chip is
+// on": with one visible chip, picking it must read as a pick, or a hidden
+// narrowing would resurface in a view with more tags (review finding).
+// Returns the Set rows should be filtered on. A pick whose tag the current dex
+// view hides renders and filters as "all" WITHOUT overwriting the pick, so it
+// is back when the tag is visible again (review finding).
 function renderTagChips(bar, active, chips, universe, allCount, rerender) {
   bar.innerHTML = "";
-  if (!chips.length) return;
-  const picked = chips.filter(c => active.has(c.key));
-  const setAll = () => { active.clear(); for (const k of universe) active.add(k); };
-  if (!picked.length) setAll();
-  const isAll = !picked.length || picked.length === chips.length;
-  const all = document.createElement("span");
-  all.className = "permlvlchip allchip" + (isAll ? " on" : "");
-  all.title = "show every tag";
-  all.innerHTML = "all" + (allCount != null ? ` <span class="lc">${allCount}</span>` : "");
-  all.onclick = () => { setAll(); rerender(); };
-  bar.appendChild(all);
+  const all = new Set(universe);
+  for (const c of chips) all.add(c.key);
+  const setAll = () => { active.clear(); for (const k of all) active.add(k); };
+  // Judged on the passed universe, not on `all`: a chip key the universe
+  // missed (engine tag absent from the summary) must not turn "all" into a
+  // phantom multi-pick.
+  const isAll = universe.every(k => active.has(k)) || !chips.some(c => active.has(c.key));
+  if (!chips.length) return isAll ? all : active;
+  const effective = isAll ? all : active;
+  const allChip = document.createElement("span");
+  allChip.className = "permlvlchip allchip" + (isAll ? " on" : "");
+  allChip.title = "show every tag";
+  allChip.innerHTML = "all" + (allCount != null ? ` <span class="lc">${allCount}</span>` : "");
+  allChip.onclick = () => { setAll(); rerender(); };
+  bar.appendChild(allChip);
   for (const c of chips) {
     const on = !isAll && active.has(c.key);
     const chip = document.createElement("span");
@@ -3972,6 +3981,7 @@ function renderTagChips(bar, active, chips, universe, allCount, rerender) {
     };
     bar.appendChild(chip);
   }
+  return effective;
 }
 
 // network indicators panel (top of the two right panels)
@@ -4000,12 +4010,12 @@ function renderIocPanel() {
     key: c, label: CAT_LABEL[c] || c, color: IOC_CAT_COLOR[c] || "var(--brand)",
     count: catCounts.get(c), title: `${CAT_LABEL[c] || c} indicators`,
   }));
-  renderTagChips($("#ioccats"), activeIocCats, iocChips, IOC_CATS,
+  const iocShow = renderTagChips($("#ioccats"), activeIocCats, iocChips, IOC_CATS,
     iocChips.reduce((n, c) => n + c.count, 0), renderIocPanel);
   const filt = ($("#iocfilter").value || "").toLowerCase().trim();
   body.innerHTML = ""; let shown = 0;
   for (const cat of IOC_CATS) {
-    if (!activeIocCats.has(cat)) continue;
+    if (!iocShow.has(cat)) continue;
     const items = iocIndex
       .filter(x => x.cat === cat && (!filt || x.value.toLowerCase().includes(filt)) &&
                    (!picked || x.classes.some(inPickedDex)))
@@ -4046,7 +4056,7 @@ function renderPermLevels(list = permIndex) {
     key: lv.key, label: lv.label, color: lv.color, count: counts.get(lv.key),
     title: `${lv.label} permissions`,
   }));
-  renderTagChips($("#permlevels"), activePermLevels, chips, PERM_LEVELS.map(l => l.key),
+  return renderTagChips($("#permlevels"), activePermLevels, chips, PERM_LEVELS.map(l => l.key),
     list.length, renderPermPanel);
 }
 
@@ -4064,7 +4074,7 @@ function renderCapCats(tagTouches) {
     .map(([cat, n]) => ({ key: cat, label: capLabel(cat), color: "var(--brand)", count: n,
                           title: `${cat} — ${n} touch${n === 1 ? "" : "es"}` }));
   const universe = capReport ? [...Object.keys(capReport.categories), ...Object.keys(capReport.flags)] : [];
-  renderTagChips($("#permlevels"), activeCapCats, chips, universe, null, renderPermPanel);
+  return renderTagChips($("#permlevels"), activeCapCats, chips, universe, null, renderPermPanel);
 }
 
 const capLabel = cat => cat.toLowerCase().replace(/_/g, " ");
@@ -4098,7 +4108,7 @@ function renderCapPanel(panel, body) {
   for (const h of srcHits)
     for (const cat of [...h.categories, ...(h.flags || [])])
       tagTouches.set(cat, (tagTouches.get(cat) || 0) + touchesOf(h));
-  renderCapCats(tagTouches);
+  const capShow = renderCapCats(tagTouches);
   const filt = ($("#permfilter").value || "").toLowerCase().trim();
   body.innerHTML = "";
   const byCat = new Map();
@@ -4108,7 +4118,7 @@ function renderCapPanel(panel, body) {
     if (filt && !hay.includes(filt) && !h.callers.some(c => c.toLowerCase().includes(filt))) continue;
     let any = false;
     for (const cat of [...h.categories, ...(h.flags || [])]) {
-      if (!activeCapCats.has(cat)) continue;
+      if (!capShow.has(cat)) continue;
       if (!byCat.has(cat)) byCat.set(cat, []);
       byCat.get(cat).push(h);
       any = true;
@@ -4164,7 +4174,7 @@ function renderCompKinds() {
     chips.push({ key: entry.kind, label: entry.kind, color: entry.color, count: list.length,
                  title: `${entry.kind} — extends ${descToJava(entry.base)}` });
   }
-  renderTagChips($("#permlevels"), activeCompKinds, chips, [...componentGroups.keys()],
+  return renderTagChips($("#permlevels"), activeCompKinds, chips, [...componentGroups.keys()],
     chips.reduce((n, c) => n + c.count, 0), renderPermPanel);
 }
 
@@ -4190,13 +4200,13 @@ function renderCompPanel(panel, body) {
     return;
   }
   panel.classList.remove("empty");
-  renderCompKinds();
+  const kindShow = renderCompKinds();
   const picked = !!(panelDexCtx && panelDexCtx.picked);
   const filt = ($("#permfilter").value || "").toLowerCase().trim();
   body.innerHTML = "";
   let shown = 0;
   for (const entry of COMPONENT_BASES) {
-    if (!activeCompKinds.has(entry.kind)) continue;
+    if (!kindShow.has(entry.kind)) continue;
     const all = componentGroups.get(entry.kind);
     if (!all) continue;
     const list = all.filter(d => (!filt || d.toLowerCase().includes(filt)) && inPickedDex(d));
@@ -4265,10 +4275,10 @@ function renderPermPanel() {
   const dexRows = picked
     ? permIndex.filter(p => p.callers.some(c => inPickedDex(classOfMethod(c))))
     : permIndex;
-  renderPermLevels(dexRows);
+  const levelShow = renderPermLevels(dexRows);
   const filt = ($("#permfilter").value || "").toLowerCase().trim();
   body.innerHTML = "";
-  const prows = dexRows.filter(p => activePermLevels.has(p.level) && (!filt ||
+  const prows = dexRows.filter(p => levelShow.has(p.level) && (!filt ||
     p.api.toLowerCase().includes(filt) || p.perm.toLowerCase().includes(filt) ||
     p.callers.some(c => c.toLowerCase().includes(filt))));
   $("#permhd2").innerHTML = picked
