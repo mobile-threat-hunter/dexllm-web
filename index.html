@@ -251,6 +251,14 @@ window.__DEXLLM_BUILD = "13c9dfd-1";
     transition:color 160ms var(--e-out), box-shadow 160ms var(--e-out);
   }
   #evsortBtn:hover { color:var(--fg); }
+  #countbar .tbtns { display:flex; gap:4px; flex:none; }
+  .treebtn {
+    flex:none; border:0; cursor:pointer; border-radius:999px; padding:2px 7px;
+    font:600 11px/1.45 var(--f-ui); color:var(--fg-3); background:var(--bg-1);
+    box-shadow:inset 0 0 0 1px var(--line-2);
+    transition:color 160ms var(--e-out), box-shadow 160ms var(--e-out);
+  }
+  .treebtn:hover { color:var(--fg); box-shadow:inset 0 0 0 1px var(--line-3); }
   #evsortBtn.on { color:var(--brand); box-shadow:inset 0 0 0 1px rgba(107,161,255,0.45); }
   /* header mode toggle — segmented Runtime / Isolated control, appears once
      an APK is loaded. Runtime is the packer-unpack workflow (aggregate +
@@ -467,8 +475,8 @@ window.__DEXLLM_BUILD = "13c9dfd-1";
     letter-spacing:0.06em; background:rgba(255,255,255,0.04);
     border:1px solid currentColor;
   }
-  /* Thin divider rows in the runtime dex-sorted view: the single class tree
-     splits into "declared in <dex>" / "other classes" — a label, not a panel. */
+  /* Thin divider row heading the runtime dex-filtered view ("declared in
+     <dex>") — a label, not a panel. */
   .dexdivider {
     display:flex; align-items:center; gap:10px;
     margin:6px 0 2px; padding:4px 16px;
@@ -1133,8 +1141,14 @@ window.__DEXLLM_BUILD = "13c9dfd-1";
     <input id="search" placeholder="filter classes…" autocomplete="off">
     <div id="countbar">
       <div id="count"></div>
+      <div class="tbtns">
+      <button id="treeCollapseBtn" class="treebtn" type="button"
+        title="Collapse every package (the class open in the viewer stays revealed)">⊟</button>
+      <button id="treeExpandBtn" class="treebtn" type="button"
+        title="Expand every package">⊞</button>
       <button id="evsortBtn" class="on" type="button"
         title="Sort classes with evidence to the top of each package — indicators, then permissions, then components, then capabilities, A–Z inside each group. Click to toggle plain A–Z.">⚑ evidence first</button>
+      </div>
     </div>
     <div id="classlist"></div>
   </div>
@@ -3529,6 +3543,42 @@ $("#evsortBtn").onclick = () => {
   resortTree();
 };
 
+// Whole-tree collapse / expand. Rows toggle through their own onclick (the
+// per-row closure owns the lazy build), so both work on whatever is built.
+// Collapse keeps the viewer's open class revealed — the tree must always mark
+// it (user mandate) — so only that one ancestor chain stays open.
+function collapseTree() {
+  for (const k of listEl.querySelectorAll(".kids"))
+    if (k.style.display !== "none") k.previousElementSibling.onclick();
+  if (selectedEl && selectedEl.isConnected) _reopenBuiltAncestors(selectedEl);
+}
+// Expand opens package rows breadth-first, one level per pass (opening a row
+// builds its children collapsed). Bounded by a row budget so a 100k-class
+// packer corpus can't freeze the tab building every row at once: past it the
+// remaining levels stay collapsed and the button says so.
+const TREE_EXPAND_ROW_BUDGET = 20000;
+function expandTree() {
+  let rows = listEl.querySelectorAll(".pkg, .cls").length;
+  for (;;) {
+    const closed = [...listEl.querySelectorAll(".kids")].filter(k => k.style.display === "none");
+    if (!closed.length) return true;
+    for (const k of closed) {
+      const n = k.previousElementSibling.__pkgNode;
+      const add = n ? n.children.size + n.classes.length : 0;
+      if (k.childElementCount === 0 && rows + add > TREE_EXPAND_ROW_BUDGET) return false;
+      if (k.childElementCount === 0) rows += add;
+      k.previousElementSibling.onclick();
+    }
+  }
+}
+$("#treeCollapseBtn").onclick = () => collapseTree();
+$("#treeExpandBtn").onclick = () => {
+  const b = $("#treeExpandBtn");
+  const done = expandTree();
+  b.title = done ? "Expand every package"
+    : `Expand every package — stopped at ${TREE_EXPAND_ROW_BUDGET.toLocaleString()} rows; filter the list or open packages by hand for the rest`;
+};
+
 // Plain-text summaries for badge tooltips.
 function iocTitle(cd) {
   const e = classIoc.get(cd); if (!e) return "";
@@ -3624,12 +3674,12 @@ function renderList(filter) {
   reattachTreeSelection();
 }
 
-// Dex-sorted render: ONE class panel, split in two by thin divider labels —
-// the picked dex's declarations on top, every other class below. Still the
-// deduped runtime universe: each class appears exactly once (in the top part
-// when the picked dex declares it, even if that copy LOST first-wins — those
-// rows carry the "→ winner" marker via secDex). No per-dex sections/panels:
-// the corpus can hold 1000+ dex files and the list must stay a single scroll.
+// Dex-filtered render: ONE class panel holding only the picked dex's
+// declarations under a thin divider label (classes declared elsewhere are not
+// listed — user request; they used to follow under an "other classes"
+// divider). Each class appears once; a declaration whose copy LOST first-wins
+// carries the "→ winner" marker via secDex. No per-dex sections/panels: the
+// corpus can hold 1000+ dex files and the list must stay a single scroll.
 function renderGroupedList(f) {
   const d = dexInfo.find(x => x.valid && !x.isolatedOnly && x.dex_id === runtimeGroupDex);
   if (!d) { runtimeGroupDex = "all"; renderList(f); return; }   // stale pick
@@ -3637,7 +3687,6 @@ function renderGroupedList(f) {
   const pred = f ? classMatcher(f) : null;
   const declaredSet = new Set(dexClasses.get(d.dex_id) || []);
   const top = pred ? [...declaredSet].filter(pred) : [...declaredSet];
-  const rest = allClasses.filter(c => !declaredSet.has(c) && (!pred || pred(c)));
 
   const mkDivider = (text, dump, tip) => {
     const div = document.createElement("div");
@@ -3656,16 +3705,9 @@ function renderGroupedList(f) {
       ". Dimmed rows lost the first-wins resolution — clicking shows the winner's copy."));
     appendChildren(buildTree(top), frag, 0, top.length <= 1500, d.dex_id);
   }
-  if (rest.length) {
-    frag.appendChild(mkDivider(`other classes (${rest.length})`, false,
-      "classes not declared in " + label));
-    // Asymmetric on purpose: the picked dex is what the user asked to see, so
-    // its half auto-expands; the rest only opens up under an active filter.
-    appendChildren(buildTree(rest), frag, 0, !!f && rest.length <= 1500);
-  }
   countEl.textContent = f
-    ? `${top.length + rest.length} / ${allClasses.length} classes · ${top.length} in ${label}`
-    : `${allClasses.length} classes · ${top.length} declared in ${label}`;
+    ? `${top.length} / ${declaredSet.size} in ${label}`
+    : `${declaredSet.size} in ${label}`;
   listEl.appendChild(frag);
   reattachTreeSelection();
 }
