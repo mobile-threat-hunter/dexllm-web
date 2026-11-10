@@ -488,6 +488,13 @@ window.__DEXLLM_BUILD = "13c9dfd-1";
   }
   .dexdivider::before { flex:0 0 12px; }
   .dexdivider.dump { color:#ff9a8c; }
+  /* The dex pick followed a navigation to another dex (followClassDex). */
+  .dextab.followed { animation:dexFollow 1.6s var(--e-out); }
+  @keyframes dexFollow {
+    0%, 35% { box-shadow:0 0 0 2px var(--brand), 0 0 18px var(--brand-glow); }
+    100%    { box-shadow:none; }
+  }
+  #count .follownote { color:var(--brand); text-transform:none; letter-spacing:0; }
   /* Scrollable dex-file picker dropdown (runtime bar). The dex list can run
      to 1000+ entries (packer dumps), so it's a filtered scroll list — never
      one tab per dex. */
@@ -2955,7 +2962,7 @@ function renderDexBar() {
           dump: !!(cur && cur.dump),
           sel: !!cur,
           onClick: () => toggleDexPicker(btn, validDexes, regroup),
-          title: "Pick a dex file to float its classes to the top of the tree and filter the " +
+          title: "Pick a dex file to list only its declared classes in the tree and filter the " +
                  "IoC / permission / capability / component panels to evidence from its declared classes. " +
                  "View only: clicking a class still decompiles the runtime (first-wins) copy.",
         });
@@ -7192,6 +7199,37 @@ function revealClassInTree(desc) {
   if (row) _reopenBuiltAncestors(row);
   return row;
 }
+// Runtime dex pick + navigation (xref, panel, palette, history) to a class the
+// picked dex does not declare: the tree lists only the picked dex (user
+// request), yet must always mark the open class (user mandate). Move the pick
+// to the dex that declares the class — its first-wins winner, which is the
+// copy the viewer decompiles — or back to "all" when no runtime dex declares
+// it. The count bar briefly says where the pick went and the dex tab pulses.
+const _declSets = new Map();     // dex_id -> { arr, set } (arr = identity check)
+function dexDeclares(id, cls) {
+  const arr = dexClasses.get(id);
+  if (!arr) return false;
+  let e = _declSets.get(id);
+  if (!e || e.arr !== arr) { e = { arr, set: new Set(arr) }; _declSets.set(id, e); }
+  return e.set.has(cls);
+}
+function followClassDex(cls) {
+  if (viewMode !== "runtime" || runtimeGroupDex === "all" || dexDeclares(runtimeGroupDex, cls)) return;
+  const dn = classDexNames.get(cls);
+  const to = dn && dn.length ? dn[0].id : "all";
+  runtimeGroupDex = to;
+  renderDexBar();
+  renderList($("#search").value || "");
+  renderPanels();   // evidence panels follow the picked dex
+  const where = to === "all" ? "all classes" : dn[0].label;
+  const note = document.createElement("span"); note.className = "follownote";
+  note.textContent = ` · ↪ ${where}`;
+  note.title = `the opened class isn't declared in the previously picked dex — the pick moved to ${where}`;
+  countEl.appendChild(note);
+  setTimeout(() => note.remove(), 4000);     // transient: later in-dex jumps must not read as switches
+  const tab = document.querySelector(`.dextab[data-key="${to === "all" ? "all" : "dexpick"}"]`);
+  if (tab) { tab.classList.remove("followed"); void tab.offsetWidth; tab.classList.add("followed"); }
+}
 function _reopenBuiltAncestors(row) {
   for (let k = row.parentElement; k && k !== listEl; k = k.parentElement) {
     if (k.classList.contains("kids") && k.style.display === "none" &&
@@ -7307,6 +7345,9 @@ function selectClass(cls, el, hint) {
   // Dismiss any open callers popup — its anchor token is about to be replaced.
   const pop = document.getElementById("callerpop");
   if (pop) pop.classList.remove("show");
+  // A runtime dex pick lists only that dex's classes, so a navigation to a
+  // class it doesn't declare would have no row to mark. Follow it first.
+  if (!el) followClassDex(cls);
   // Navigations that don't come from a tree click (code tokens, panels,
   // palette, history, xrefs) pass no row — reveal it so the class list ALWAYS
   // points at the class the viewer is showing, even when the user collapsed
